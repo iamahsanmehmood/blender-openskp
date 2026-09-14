@@ -58,8 +58,15 @@ Install manually:
 
 1. Download the zip from the [latest release](https://github.com/iamahsanmehmood/blender-openskp/releases/latest).
 2. In Blender: **Edit → Preferences → Get Extensions → (dropdown, top right) → Install from Disk**, and select the zip.
-3. **Install the addon's Python dependencies** (`mapbox_earcut`, `shapely`, `defusedxml` — not bundled with Blender, and a normal `pip install` won't reach Blender's embedded interpreter since it runs with user-site-packages disabled). See [CONTRIBUTING.md](CONTRIBUTING.md#getting-set-up) for the exact command — this step is not yet automated.
-4. Restart Blender, then **File → Import** or **File → Export → SketchUp (.skp)**.
+3. **File → Import** or **File → Export → SketchUp (.skp)**.
+
+That's it — no separate dependency step. `mapbox_earcut`, `shapely`, and
+`defusedxml` (not bundled with Blender itself) ship as
+[Python wheels](https://docs.blender.org/manual/en/latest/advanced/extensions/python_wheels.html)
+inside the extension package for Windows/macOS (Intel + Apple Silicon)/Linux
+x86_64, so Blender installs them automatically, offline, when you install
+the extension — verified directly: a fresh install with no manual `pip`
+step imports and runs correctly.
 
 ## Verification status, stated plainly
 
@@ -75,6 +82,12 @@ registered operator (`bpy.ops.import_scene.openskp(...)`):
 Export was round-tripped through OpenSKP's own independent reader (not
 this addon) — a 2m cube at a known world position exported and re-parsed
 with every vertex landing exactly on the expected inch-space bounding box.
+
+The wheel-bundled dependencies were verified the same way: the addon was
+fully uninstalled, its dependencies removed from Blender's own embedded
+interpreter, then reinstalled from a freshly-built `.zip` and imported
+against a real fixture with zero manual setup — not just "the manifest
+looks right."
 
 **Not yet measured:** performance on a large, real production file (the
 FreeCAD addon's README has real numbers for a 358K-face file; this one

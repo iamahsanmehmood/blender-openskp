@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "openskp_import_export"
-version = "0.1.0"
+version = "0.1.1"
 name = "OpenSKP Import/Export"
 tagline = "Native SketchUp (.skp) import and export, no SketchUp required"
 maintainer = "Ahsan Mehmood <mail.ahsanmehmood@gmail.com>"
@@ -16,5 +16,31 @@ license = [
   "SPDX:MIT",
 ]
 
+# Only the platforms actually covered by the bundled wheels below (Python
+# 3.11, matching Blender 4.2-4.5's own bundled interpreter) - declared
+# explicitly rather than left unset (which would advertise "all platforms"
+# and silently fail to import on any not covered here, e.g. Linux ARM).
+platforms = ["windows-x64", "macos-x64", "macos-arm64", "linux-x64"]
+
+# The vendored openskp package needs these to even import - mapbox_earcut
+# and numpy are eager imports in _core.py, defusedxml is imported at
+# parse time. numpy already ships with Blender itself; these three don't.
+# Bundled as wheels (rather than requiring a manual pip install into
+# Blender's own embedded interpreter, which - confirmed directly, not
+# assumed - runs with user-site-packages disabled, so a plain `pip
+# install` silently never reaches it) so the addon works standalone,
+# offline, right after installing the extension - no separate step.
+wheels = [
+  "./wheels/mapbox_earcut-2.1.0-cp311-cp311-win_amd64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_11_0_arm64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_10_13_x86_64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "./wheels/shapely-2.1.2-cp311-cp311-win_amd64.whl",
+  "./wheels/shapely-2.1.2-cp311-cp311-macosx_11_0_arm64.whl",
+  "./wheels/shapely-2.1.2-cp311-cp311-macosx_10_9_x86_64.whl",
+  "./wheels/shapely-2.1.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+  "./wheels/defusedxml-0.7.1-py2.py3-none-any.whl",
+]
+
 [permissions]
-files = "Read the .skp file being imported, write the .skp file being exported"
+files = "Read the imported .skp file, write the exported .skp file"

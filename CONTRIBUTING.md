@@ -21,8 +21,14 @@ git clone https://github.com/iamahsanmehmood/blender-openskp.git
 The `vendor/openskp/` directory is a vendored copy of the pure-Python
 [OpenSKP](https://github.com/iamahsanmehmood/openskp) package. It needs
 three small dependencies (`mapbox_earcut`, `shapely`, `defusedxml`) that
-aren't bundled with Blender - install them into Blender's own embedded
-interpreter, not your system Python:
+aren't bundled with Blender. A real end user gets these for free - they
+ship as [Python wheels](https://docs.blender.org/manual/en/latest/advanced/extensions/python_wheels.html)
+in `wheels/` and are declared in `blender_manifest.toml`, so Blender's own
+extension installer sets them up automatically. **That auto-install only
+happens for a properly *installed* extension**, though - running straight
+out of a git clone (as this section describes, for iterating on code)
+bypasses that, so install them into Blender's own embedded interpreter
+yourself, not your system Python:
 
 ```bash
 "<path to Blender>/<version>/python/bin/python.exe" -m pip install --target "<Blender addon-modules path>" mapbox_earcut shapely defusedxml
@@ -36,6 +42,16 @@ macOS. A plain `pip install` (no `--target`) will silently not work -
 Blender's embedded interpreter runs with user-site-packages disabled, so
 a normal user-site install is never on its `sys.path` (confirmed
 directly, not assumed - this cost real debugging time to track down).
+
+If you're adding a new wheel-bundled dependency rather than just
+iterating on code, see the
+[wheel-bundling guide](https://docs.blender.org/manual/en/latest/advanced/extensions/python_wheels.html) -
+`pip download <pkg>==<version> --no-deps --dest wheels --only-binary=:all: --python-version=3.11 --platform=<tag>`
+per platform in `platforms` in the manifest, all pinned to the *same*
+version (mixing versions across platforms silently happened here once,
+from an imprecise `--platform` string making pip fall back to an older
+release for some platforms - worth double-checking the downloaded
+filenames' version numbers match before committing them).
 
 ## Running tests
 
