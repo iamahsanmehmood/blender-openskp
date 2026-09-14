@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Extension zips have their manifest + code at the zip ROOT (not
+      # under a named subfolder, unlike FreeCAD's Mod/ convention) - see
+      # docs.blender.org/manual/en/latest/advanced/extensions/getting_started.html
+      - name: Build release zip
+        run: |
+          python3 - <<'PYEOF'
+          import zipfile, os
+
+          TAG = os.environ["GITHUB_REF_NAME"]
+          OUT = f"blender-openskp-{TAG}.zip"
+          EXCLUDE_DIRS = {".git", "tests", "__pycache__", ".github"}
+
+          with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                  for fn in files:
+                      full = os.path.join(root, fn)
+                      arcname = os.path.relpath(full, ".").replace("\\", "/")
+                      zf.write(full, arcname)
+          print("wrote", OUT)
+          PYEOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" "blender-openskp-${TAG}.zip" \
+            --title "$TAG" \
+            --generate-notes

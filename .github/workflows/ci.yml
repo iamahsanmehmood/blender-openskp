@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Blender isn't a pip package - tested against the real, official
+      # Linux build Blender itself publishes (a plain tar.xz, no AppImage/
+      # FUSE dance needed here, unlike FreeCAD). The extracted tree is
+      # cached (not just the download) so a cache hit skips extraction and
+      # the pip-install step below too.
+      - name: Cache extracted Blender
+        id: cache-blender
+        uses: actions/cache@v4
+        with:
+          path: blender-4.5.10-linux-x64
+          key: blender-4.5.10-linux-x64-extracted-v1
+
+      - name: Download and extract Blender
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o blender.tar.xz \
+            https://download.blender.org/release/Blender4.5/blender-4.5.10-linux-x64.tar.xz
+          tar xf blender.tar.xz
+          rm blender.tar.xz
+
+      - name: Locate blender and its bundled site-packages
+        id: locate
+        run: |
+          BLENDER=$(find blender-4.5.10-linux-x64 -maxdepth 1 -type f -name blender)
+          SITE_PACKAGES=$(find blender-4.5.10-linux-x64 -type d -name site-packages | head -1)
+          if [ -z "$BLENDER" ] || [ -z "$SITE_PACKAGES" ]; then
+            echo "::error::could not locate blender binary or its site-packages"
+            find blender-4.5.10-linux-x64 -maxdepth 4
+            exit 1
+          fi
+          echo "blender=$BLENDER" >> "$GITHUB_OUTPUT"
+          echo "site_packages=$SITE_PACKAGES" >> "$GITHUB_OUTPUT"
+
+      # Calls pip's own internal API from inside a script Blender runs,
+      # targeting Blender's bundled site-packages directly, rather than
+      # spawning `sys.executable -m pip` - confirmed on Windows that
+      # Blender's own bundled python.exe supports that, but this is a
+      # different OS and FreeCAD's own equivalent launcher turned out NOT
+      # to support "-m" at all, so this avoids repeating that same
+      # unverified assumption here. numpy already ships with Blender;
+      # mapbox_earcut/shapely/defusedxml don't.
+      - name: Install openskp's runtime dependencies
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          cat > _pip_install.py <<PYEOF
+          from pip._internal.cli.main import main as _pip_main
+          raise SystemExit(_pip_main([
+              "install", "--quiet", "--target", "${{ steps.locate.outputs.site_packages }}",
+              "mapbox_earcut", "shapely", "defusedxml",
+          ]))
+          PYEOF
+          ${{ steps.locate.outputs.blender }} --background --python _pip_install.py
+          rm _pip_install.py
+
+      - name: Run import tests
+        run: ${{ steps.locate.outputs.blender }} --background --python tests/test_import.py
+
+      - name: Run export tests
+        run: ${{ steps.locate.outputs.blender }} --background --python tests/test_export.py

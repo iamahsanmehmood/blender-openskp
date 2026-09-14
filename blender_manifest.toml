@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "openskp_import_export"
+version = "0.1.0"
+name = "OpenSKP Import/Export"
+tagline = "Native SketchUp (.skp) import and export, no SketchUp required"
+maintainer = "Ahsan Mehmood <mail.ahsanmehmood@gmail.com>"
+type = "add-on"
+
+website = "https://github.com/iamahsanmehmood/blender-openskp"
+tags = ["Import-Export"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:MIT",
+]
+
+[permissions]
+files = "Read the .skp file being imported, write the .skp file being exported"
