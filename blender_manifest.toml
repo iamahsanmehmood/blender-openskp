@@ -16,10 +16,10 @@ license = [
   "SPDX:MIT",
 ]
 
-# Only the platforms actually covered by the bundled wheels below (Python
-# 3.11, matching Blender 4.2-4.5's own bundled interpreter) - declared
-# explicitly rather than left unset (which would advertise "all platforms"
-# and silently fail to import on any not covered here, e.g. Linux ARM).
+# Only the platforms actually covered by the bundled wheels below -
+# declared explicitly rather than left unset (which would advertise "all
+# platforms" and silently fail to import on any not covered here, e.g.
+# Linux ARM).
 platforms = ["windows-x64", "macos-x64", "macos-arm64", "linux-x64"]
 
 # The vendored openskp package needs these to even import - mapbox_earcut
@@ -30,15 +30,33 @@ platforms = ["windows-x64", "macos-x64", "macos-arm64", "linux-x64"]
 # assumed - runs with user-site-packages disabled, so a plain `pip
 # install` silently never reaches it) so the addon works standalone,
 # offline, right after installing the extension - no separate step.
+#
+# Both cp311 AND cp313 builds of each wheel are listed - Blender's own
+# bundled Python version isn't fixed across its release line: 4.2-4.5
+# bundle 3.11, but 5.1+ (including the current 5.2 LTS) moved to 3.13.
+# Missing this the first time round produced a real, reported bug: a
+# user on Blender 5.2.1 got "This Python version (3.13) isn't compatible
+# with (3.11)" and the extension refused to install at all (github#1) -
+# Blender's installer picks whichever bundled wheel's tag matches its own
+# interpreter, so both need to be present, not just the one this was
+# developed against.
 wheels = [
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-win_amd64.whl",
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_11_0_arm64.whl",
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_10_13_x86_64.whl",
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp313-cp313-win_amd64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp313-cp313-macosx_11_0_arm64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp313-cp313-macosx_10_13_x86_64.whl",
+  "./wheels/mapbox_earcut-2.1.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   "./wheels/shapely-2.1.2-cp311-cp311-win_amd64.whl",
   "./wheels/shapely-2.1.2-cp311-cp311-macosx_11_0_arm64.whl",
   "./wheels/shapely-2.1.2-cp311-cp311-macosx_10_9_x86_64.whl",
   "./wheels/shapely-2.1.2-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+  "./wheels/shapely-2.1.2-cp313-cp313-win_amd64.whl",
+  "./wheels/shapely-2.1.2-cp313-cp313-macosx_11_0_arm64.whl",
+  "./wheels/shapely-2.1.2-cp313-cp313-macosx_10_13_x86_64.whl",
+  "./wheels/shapely-2.1.2-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
   "./wheels/defusedxml-0.7.1-py2.py3-none-any.whl",
 ]
 
