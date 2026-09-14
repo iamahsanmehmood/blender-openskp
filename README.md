@@ -54,11 +54,12 @@ staying standalone too.
 ## Installation
 
 Not yet published on the [Blender Extensions Platform](https://extensions.blender.org/).
-Install manually:
+Install manually, either way:
 
-1. Download the zip from the [latest release](https://github.com/iamahsanmehmood/blender-openskp/releases/latest).
-2. In Blender: **Edit → Preferences → Get Extensions → (dropdown, top right) → Install from Disk**, and select the zip.
-3. **File → Import** or **File → Export → SketchUp (.skp)**.
+- **Latest release**: download the zip from the [latest release](https://github.com/iamahsanmehmood/blender-openskp/releases/latest).
+- **Latest `main`, no release needed**: click the green **Code** button on this page → **Download ZIP** (no git required) — installs the same way, always up to date, useful when a fix has landed but hasn't made it into a packaged release yet. Verified directly: this repo's own zip download installs and runs correctly, no extraction or rebuilding needed.
+
+Then, in Blender: **Edit → Preferences → Get Extensions → (dropdown, top right) → Install from Disk**, and select whichever zip you downloaded. Finally, **File → Import** or **File → Export → SketchUp (.skp)**.
 
 That's it — no separate dependency step. `mapbox_earcut`, `shapely`, and
 `defusedxml` (not bundled with Blender itself) ship as
