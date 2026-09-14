@@ -30,6 +30,11 @@ jobs:
               for root, dirs, files in os.walk("."):
                   dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
                   for fn in files:
+                      # os.walk() picks up OUT itself mid-write (it lives in
+                      # the same directory being walked) without this -
+                      # caught by actually running this workflow, not guessed.
+                      if fn.endswith(".zip"):
+                          continue
                       full = os.path.join(root, fn)
                       arcname = os.path.relpath(full, ".").replace("\\", "/")
                       zf.write(full, arcname)
