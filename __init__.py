@@ -29,8 +29,10 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
 
         self.report(
             {"INFO"},
-            f"Imported {stats['unique_meshes']} unique meshes, "
-            f"{stats['placements']} instances placed",
+            f"Imported {stats['unique_meshes']} unique meshes "
+            f"({stats['placements']} placed), "
+            f"{stats['unique_curve_meshes']} loose-edge groups "
+            f"({stats['curve_placements']} placed)",
         )
         return {"FINISHED"}
 
