@@ -30,14 +30,17 @@ import bpy  # noqa: E402
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
 # (unique_meshes, placements, triangles, unique_curve_meshes, curve_placements,
-#  curve_runs, unique_layers, hidden_layers) per fixture. Both committed fixtures
-# happen to use only the default "Layer0" (unhidden) - real multi-layer/hidden-layer
-# grouping was verified separately against a real external structural-framing file
-# (13 layers, 2 genuinely hidden - see import_skp.py's module docstring and the
-# blender-openskp README) since no committed fixture exercises that.
+#  curve_runs, unique_layers, hidden_layers, textures_loaded) per fixture. Both
+# committed fixtures happen to use only the default "Layer0" (unhidden) - real
+# multi-layer/hidden-layer grouping was verified separately against a real
+# external structural-framing file (13 layers, 2 genuinely hidden - see
+# import_skp.py's module docstring and the blender-openskp README) since no
+# committed fixture exercises that. capilla_quiroz_v17.skp DOES carry 3 real
+# textures (glass/concrete/roofing materials from a SketchUp material library)
+# - a genuine, not synthetic, cross-check for texture import.
 EXPECTED = {
-    "SU_File.skp": (1, 1, 104, 0, 0, 0, 1, 0),
-    "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0),
+    "SU_File.skp": (1, 1, 104, 0, 0, 0, 1, 0, 0),
+    "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0, 3),
 }
 
 
@@ -58,7 +61,7 @@ def check(fixture_name):
     got = (
         stats["unique_meshes"], stats["placements"], stats["triangles"],
         stats["unique_curve_meshes"], stats["curve_placements"], stats["curve_runs"],
-        stats["unique_layers"], stats["hidden_layers"],
+        stats["unique_layers"], stats["hidden_layers"], stats["textures_loaded"],
     )
     print(f"{fixture_name}: {got}")
     expected = EXPECTED.get(fixture_name)
@@ -68,6 +71,7 @@ def check(fixture_name):
         check_source_geometry_is_discoverable_but_excluded(fixture_name)
         check_materials_match_gltf_materials(fixture_name, new_objects)
         check_layer_collection(fixture_name)
+        check_textures(fixture_name, new_objects)
     return got
 
 
@@ -220,6 +224,107 @@ def check_layer_collection(fixture_name):
     placement_empties = [o for o in layer0.objects if o.instance_type == "COLLECTION"]
     assert placement_empties, f"{fixture_name}: 'Layer0' collection has no placement Empties in it"
     print(f"{fixture_name}: {len(placement_empties)} placements grouped under visible 'Layer0' - OK")
+
+
+def check_textures(fixture_name, new_objects):
+    """Cross-validates textured-material import against openskp's own
+    InstancedScene.textures/gltf_materials, the same way
+    check_materials_match_gltf_materials does for solid colors: every
+    material with a pbrMetallicRoughness.baseColorTexture must have a
+    real Image Texture node in Blender, wired to an Image with the
+    correct pixel dimensions (decoded independently from the source
+    file's own raw bytes, not just "some image got created") - and the
+    same source texture shared by two different materials (a real case
+    in capilla_quiroz_v17.skp: the translucent-glass material appears on
+    both windows and the door) must load as the SAME Blender Image
+    datablock, not two separate copies. Also checks every mesh with a
+    textured material actually has a populated UV layer, since a texture
+    with no UVs would just look wrong, not fail outright."""
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    scene = openskp.SkpFile.open(path).build_instanced_scene()
+    textures = getattr(scene, "textures", None) or []
+    if not textures:
+        return
+
+    def expected_pixel_size(data):
+        # Minimal PNG/JPEG header dimension decode - avoids depending on
+        # PIL, which isn't guaranteed present in Blender's own bundled
+        # Python interpreter.
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            w = int.from_bytes(data[16:20], "big")
+            h = int.from_bytes(data[20:24], "big")
+            return (w, h)
+        if data[:2] == b"\xff\xd8":
+            i = 2
+            while i < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                    h = int.from_bytes(data[i + 5:i + 7], "big")
+                    w = int.from_bytes(data[i + 7:i + 9], "big")
+                    return (w, h)
+                seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+                i += 2 + seg_len
+        return None
+
+    new_objects_by_base_name = {
+        re.sub(r"\.\d{3}$", "", o.name): o for o in new_objects if o.type == "MESH" and o.data is not None
+    }
+
+    image_by_texture_index = {}
+    checked_any = False
+    for resource in scene.mesh_resources:
+        obj_name = resource.definition_name or resource.id
+        obj = new_objects_by_base_name.get(obj_name)
+        assert obj is not None, f"{fixture_name}: no newly-created Blender object named {obj_name!r}"
+
+        textured_material_indices = {
+            prim.material_index for prim in resource.primitives
+            if scene.gltf_materials[prim.material_index].get("pbrMetallicRoughness", {}).get("baseColorTexture")
+        }
+        if not textured_material_indices:
+            continue
+
+        assert obj.data.uv_layers, f"{fixture_name}/{obj_name}: has a textured material but no UV layer at all"
+        assert len(obj.data.uv_layers[0].data) == len(obj.data.loops), (
+            f"{fixture_name}/{obj_name}: UV layer doesn't cover every loop"
+        )
+
+        for material_index in textured_material_indices:
+            pbr = scene.gltf_materials[material_index]["pbrMetallicRoughness"]
+            texture_index = pbr["baseColorTexture"]["index"]
+            expected_size = expected_pixel_size(textures[texture_index].data)
+
+            bl_mat = bpy.data.materials.get(f"openskp_material_{material_index}")
+            assert bl_mat is not None, f"{fixture_name}: no Blender material named openskp_material_{material_index}"
+            tex_nodes = [n for n in bl_mat.node_tree.nodes if n.type == "TEX_IMAGE"]
+            assert len(tex_nodes) == 1, (
+                f"{fixture_name}/{bl_mat.name}: expected exactly 1 Image Texture node, got {len(tex_nodes)}"
+            )
+            image = tex_nodes[0].image
+            assert image is not None, f"{fixture_name}/{bl_mat.name}: Image Texture node has no image assigned"
+            assert tuple(image.size) == expected_size, (
+                f"{fixture_name}/{bl_mat.name}: image size {tuple(image.size)} != expected {expected_size}"
+            )
+
+            if texture_index in image_by_texture_index:
+                assert image is image_by_texture_index[texture_index], (
+                    f"{fixture_name}: texture {texture_index} loaded as two different Blender Images "
+                    "(should be deduplicated and shared across materials)"
+                )
+            else:
+                image_by_texture_index[texture_index] = image
+            checked_any = True
+
+    assert checked_any, f"{fixture_name}: has textures but no textured mesh resources to check against"
+    print(
+        f"{fixture_name}: {len(image_by_texture_index)} textures correctly wired "
+        f"(matching pixel sizes, deduplicated) - OK"
+    )
 
 
 def main():

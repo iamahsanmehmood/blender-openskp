@@ -73,10 +73,27 @@ material_index set to match - so a component with several differently
 colored faces keeps that per-face variation in Blender, not one flat
 color for the whole object. Import only for now; export does not write
 materials back out.
+
+Textured materials: each mesh's own UV coordinates (LocalPrimitive.uvs -
+already resolved by openskp per vertex, just never read by this addon
+before now) are written into a real UV layer, and a material whose
+gltf_materials entry carries a pbrMetallicRoughness.baseColorTexture
+gets a real Image Texture node wired into Base Color (and Alpha, for an
+image with its own alpha channel), built from InstancedScene.textures'
+raw image bytes (PNG/JPEG only - the same restriction glTF itself has)
+via a temp file + Image.pack() (embeds the bytes into the .blend itself,
+so the temp file isn't left as a dangling external reference) - cached
+by texture index in image_cache so the same source image shared by
+several materials/objects loads exactly once. A textured material's
+resolved solid baseColorFactor (SketchUp's own paint-bucket average
+color) is still what Solid-shading and material_cache dedup key off of;
+only the shader's actual Base Color input differs when a texture image
+is available.
 """
 from __future__ import annotations
 
 import os
+import tempfile
 import time
 
 import bpy
@@ -109,7 +126,51 @@ def _gltf_matrix_to_blender(m):
     )
 
 
-def _get_or_build_material(material_index, gltf_materials, material_cache):
+def _get_or_build_texture_image(texture_index, textures, image_cache):
+    """Returns the Blender Image for textures[texture_index], loading and
+    packing it exactly once and caching it for every later material that
+    references the same source image (a texture is routinely shared
+    across many materials/objects in a real file).
+
+    Blender has no "load an image straight from bytes" API - the bytes
+    are written to a real temp file, loaded from there, then Image.pack()
+    is called BEFORE the temp file is removed: pack() is what actually
+    forces Blender to read the file's bytes into the .blend's own data,
+    so the temp file has to still exist at that point (confirmed by
+    reading Blender's own docs on Image.pack(), not assumed) - after
+    pack() succeeds, the temp file is redundant and safe to delete."""
+    if texture_index in image_cache:
+        return image_cache[texture_index]
+    if textures is None or not (0 <= texture_index < len(textures)):
+        return None
+
+    tex = textures[texture_index]
+    ext = ".png" if tex.mime_type == "image/png" else ".jpg"
+    fd, path = tempfile.mkstemp(suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(tex.data)
+        image = bpy.data.images.load(path)
+        image.pack()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    # bpy.data.images.load() names the image after the temp file's own
+    # basename ("tmp17pryts4.jpg") - rename to the source file's own
+    # original filename when openskp recovered one, purely cosmetic
+    # (Outliner/Shader Editor readability) but a real improvement over a
+    # meaningless temp name.
+    source_name = os.path.basename(tex.filename) if tex.filename else ""
+    image.name = source_name or f"openskp_texture_{texture_index}"
+
+    image_cache[texture_index] = image
+    return image
+
+
+def _get_or_build_material(material_index, gltf_materials, material_cache, textures, image_cache):
     """Returns the Blender Material for gltf_materials[material_index],
     building it exactly once per unique index and caching it for every
     later mesh that references the same one - openskp's own
@@ -117,11 +178,12 @@ def _get_or_build_material(material_index, gltf_materials, material_cache):
     (color, double_sided, texture, transparency) within one file, so the
     index alone is a valid, stable cache key here.
 
-    Solid colors only for now (this project's v1 materials scope) -
-    baseColorTexture is read from the glTF dict but not applied; a
-    textured material still gets its correct solid baseColorFactor
-    (SketchUp's own paint-bucket color for a textured material, not
-    white), just not the image itself.
+    When the material has a baseColorTexture, a real Image Texture node
+    is wired into Base Color (and Alpha, for an image with its own alpha
+    channel) - see _get_or_build_texture_image and this module's own
+    "Textured materials" docstring section. Otherwise (or if the image
+    fails to load) falls back to the resolved solid baseColorFactor,
+    same as before textures existed.
     """
     if material_index in material_cache:
         return material_cache[material_index]
@@ -129,6 +191,7 @@ def _get_or_build_material(material_index, gltf_materials, material_cache):
     gltf_mat = gltf_materials[material_index] if 0 <= material_index < len(gltf_materials) else {}
     pbr = gltf_mat.get("pbrMetallicRoughness", {})
     r, g, b, a = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+    texture_ref = pbr.get("baseColorTexture")
 
     mat = bpy.data.materials.new(name=f"openskp_material_{material_index}")
     mat.use_nodes = True
@@ -137,7 +200,19 @@ def _get_or_build_material(material_index, gltf_materials, material_cache):
         mat.blend_method = "BLEND"
 
     bsdf = mat.node_tree.nodes.get("Principled BSDF")
-    if bsdf is not None:
+    image = None
+    if texture_ref is not None and bsdf is not None:
+        image = _get_or_build_texture_image(texture_ref.get("index"), textures, image_cache)
+
+    if image is not None:
+        tex_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        tex_node.image = image
+        tex_node.location = (bsdf.location.x - 300, bsdf.location.y)
+        mat.node_tree.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+        if "Alpha" in bsdf.inputs and image.depth in (32, 128):  # has its own alpha channel
+            mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+            mat.blend_method = "BLEND"
+    elif bsdf is not None:
         # Blender 4.x renamed the alpha-adjacent socket; "Base Color" is
         # stable across the versions this addon targets (4.2+).
         bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
@@ -151,7 +226,7 @@ def _get_or_build_material(material_index, gltf_materials, material_cache):
     return mat
 
 
-def _build_mesh_object(name, resource, gltf_materials, material_cache):
+def _build_mesh_object(name, resource, gltf_materials, material_cache, textures, image_cache):
     """Builds one Mesh Object (local space, at the origin) from an
     InstancedMeshResource's primitives - already-triangulated, so this is
     a direct from_pydata() with no triangulation of its own to do.
@@ -164,6 +239,7 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache):
     own per-face paint, not just one flat color for the whole object.
     """
     verts = []
+    vert_uvs = []
     tris = []
     tri_material_indices = []
     slot_by_material_index = {}
@@ -172,13 +248,18 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache):
     for prim in resource.primitives:
         if prim.material_index not in slot_by_material_index:
             slot_by_material_index[prim.material_index] = len(mesh_materials)
-            mesh_materials.append(_get_or_build_material(prim.material_index, gltf_materials, material_cache))
+            mesh_materials.append(
+                _get_or_build_material(prim.material_index, gltf_materials, material_cache, textures, image_cache)
+            )
         slot = slot_by_material_index[prim.material_index]
 
         base = len(verts)
         pos = prim.positions
+        uvs = prim.uvs
         for i in range(0, len(pos), 3):
             verts.append((pos[i], pos[i + 1], pos[i + 2]))
+        for i in range(0, len(uvs), 2):
+            vert_uvs.append((uvs[i], uvs[i + 1]))
         idx = prim.indices
         tri_count = len(idx) // 3
         for i in range(tri_count):
@@ -191,6 +272,15 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache):
         mesh.materials.append(mat)
     for poly, slot in zip(mesh.polygons, tri_material_indices):
         poly.material_index = slot
+
+    # UVs are per-LOOP (face-corner) in Blender, not per-vertex - each
+    # loop's own vertex_index looks back up into vert_uvs (built parallel
+    # to verts above, in the same per-primitive order) to find its UV.
+    if vert_uvs:
+        uv_layer = mesh.uv_layers.new(name="UVMap")
+        for loop in mesh.loops:
+            uv_layer.data[loop.index].uv = vert_uvs[loop.vertex_index]
+
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     return obj
@@ -214,7 +304,8 @@ def _get_or_build_layer_collection(layer_name, layer_collection_cache, root_coll
 
 
 def _get_or_build_collection(
-    resource_id, resources_by_id, collection_cache, sources_collection, gltf_materials, material_cache, stats
+    resource_id, resources_by_id, collection_cache, sources_collection, gltf_materials, material_cache,
+    textures, image_cache, stats,
 ):
     """Returns the Collection holding resource_id's mesh object, building
     it exactly once per unique id and caching it for every later
@@ -240,7 +331,9 @@ def _get_or_build_collection(
 
     resource = resources_by_id[resource_id]
     coll = bpy.data.collections.new(resource.definition_name or resource_id)
-    obj = _build_mesh_object(resource.definition_name or resource_id, resource, gltf_materials, material_cache)
+    obj = _build_mesh_object(
+        resource.definition_name or resource_id, resource, gltf_materials, material_cache, textures, image_cache
+    )
     coll.objects.link(obj)
     sources_collection.children.link(coll)
     collection_cache[resource_id] = coll
@@ -317,6 +410,8 @@ def _place_node(
     sources_collection,
     gltf_materials,
     material_cache,
+    textures,
+    image_cache,
     stats,
 ):
     """Walks one InstancedNode, placing an Empty (collection-instance) for
@@ -340,7 +435,7 @@ def _place_node(
     if node.mesh_resource_id is not None:
         coll = _get_or_build_collection(
             node.mesh_resource_id, resources_by_id, collection_cache, sources_collection,
-            gltf_materials, material_cache, stats
+            gltf_materials, material_cache, textures, image_cache, stats
         )
         empty = bpy.data.objects.new(node.name or node.mesh_resource_id, None)
         empty.instance_type = "COLLECTION"
@@ -375,6 +470,8 @@ def _place_node(
             sources_collection,
             gltf_materials,
             material_cache,
+            textures,
+            image_cache,
             stats,
         )
 
@@ -414,6 +511,8 @@ def import_skp(filepath, context=None):
     layer_hidden = getattr(scene, "layer_hidden", None) or {}
     gltf_materials = getattr(scene, "gltf_materials", None) or []
     material_cache = {}
+    textures = getattr(scene, "textures", None) or []
+    image_cache = {}
     stats = {
         "unique_meshes": 0,
         "placements": 0,
@@ -451,14 +550,17 @@ def import_skp(filepath, context=None):
         sources_collection,
         gltf_materials,
         material_cache,
+        textures,
+        image_cache,
         stats,
     )
+    stats["textures_loaded"] = len(image_cache)
     print(
         f"openskp: {stats['unique_meshes']} unique meshes "
         f"({stats['triangles']} triangles), {stats['placements']} instances placed; "
         f"{stats['unique_curve_meshes']} unique loose-edge groups "
         f"({stats['curve_runs']} runs), {stats['curve_placements']} placed; "
-        f"{len(layer_collection_cache)} layers "
+        f"{len(layer_collection_cache)} layers, {stats['textures_loaded']} textures "
         f"in {time.time() - t0:.1f}s"
     )
 

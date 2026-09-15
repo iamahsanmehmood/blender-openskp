@@ -65,6 +65,17 @@ object. Reuses OpenSKP's own glTF-style material resolution
 (`InstancedScene.gltf_materials` / `LocalPrimitive.material_index`) rather
 than reimplementing SketchUp's material-inheritance rules here.
 
+**Textured materials** (import only) carry over too: each mesh's own UV
+coordinates (already resolved by openskp per vertex, previously unread by
+this addon) land in a real UV layer, and a material with an image texture
+gets a real Image Texture node wired into Base Color (and Alpha, for an
+image with its own alpha channel) — built from the source file's own
+embedded image bytes, packed directly into the `.blend` so nothing
+depends on an external file path. The same source image shared by
+several materials loads once, not once per material. Export doesn't
+write texture images back out yet — a textured material exports as its
+resolved solid color only, same as materials export always has.
+
 **Layers** (SketchUp calls them "tags", import only) carry over too, as
 Collections: every placement lands in a Collection named for its own
 layer, one per distinct layer in the file, and a layer switched off in
@@ -78,16 +89,17 @@ imported hidden.
 
 **Not yet carried over:** no hole reconstruction on export (Blender's
 mesh polygons have no native "outer boundary + holes" concept to read
-one back from, unlike a real B-rep). Solid colors only for materials —
-texture images aren't carried over either. Both layer and material
-export are deliberately NOT wired through an imported file's own
-master/source objects (`<file> (source geometry)`) - those sit in one
-Collection per unique *definition*, not per layer, since the same
-definition can appear on several different tags (and, less often,
-several different material contexts) across different placements - so a
-straight reimport-then-reexport won't automatically carry a file's
-original tags/paint back out yet; that needs exporting via the placement
-Empties instead of their shared master mesh, future scope.
+one back from, unlike a real B-rep). Texture images are import-only - a
+textured material exports as its resolved solid color, not the image.
+Both layer and material export are deliberately NOT wired through an
+imported file's own master/source objects (`<file> (source geometry)`) -
+those sit in one Collection per unique *definition*, not per layer,
+since the same definition can appear on several different tags (and,
+less often, several different material contexts) across different
+placements - so a straight reimport-then-reexport won't automatically
+carry a file's original tags/paint back out yet; that needs exporting
+via the placement Empties instead of their shared master mesh, future
+scope.
 
 **Editing imported geometry:** what you see placed in the viewport is a
 Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
@@ -151,6 +163,14 @@ just "some material got created") — `capilla_quiroz_v17.skp` alone
 produces 13 distinct materials, including two translucent ones (alpha
 0.5/0.7), correctly assigned per-face rather than defaulting to one color
 for the whole object.
+
+Textured materials are cross-validated the same way, against a real (not
+synthetic) case: `capilla_quiroz_v17.skp` carries 3 real textures from a
+SketchUp material library (concrete, roofing tile, translucent glass),
+each checked for correct pixel dimensions (decoded independently from
+the source file's own raw image bytes) and correct deduplication - the
+translucent-glass texture used on both windows and the door loads as one
+shared Blender Image, not two copies.
 
 Layers: both committed fixtures only use SketchUp's default "Layer0", so
 the automated test only pins the mechanics (a "Layer0" Collection exists,
