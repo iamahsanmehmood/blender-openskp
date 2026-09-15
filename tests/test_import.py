@@ -29,10 +29,15 @@ import bpy  # noqa: E402
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
-# (unique_meshes, placements, triangles, unique_curve_meshes, curve_placements, curve_runs) per fixture.
+# (unique_meshes, placements, triangles, unique_curve_meshes, curve_placements,
+#  curve_runs, unique_layers, hidden_layers) per fixture. Both committed fixtures
+# happen to use only the default "Layer0" (unhidden) - real multi-layer/hidden-layer
+# grouping was verified separately against a real external structural-framing file
+# (13 layers, 2 genuinely hidden - see import_skp.py's module docstring and the
+# blender-openskp README) since no committed fixture exercises that.
 EXPECTED = {
-    "SU_File.skp": (1, 1, 104, 0, 0, 0),
-    "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20),
+    "SU_File.skp": (1, 1, 104, 0, 0, 0, 1, 0),
+    "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0),
 }
 
 
@@ -53,6 +58,7 @@ def check(fixture_name):
     got = (
         stats["unique_meshes"], stats["placements"], stats["triangles"],
         stats["unique_curve_meshes"], stats["curve_placements"], stats["curve_runs"],
+        stats["unique_layers"], stats["hidden_layers"],
     )
     print(f"{fixture_name}: {got}")
     expected = EXPECTED.get(fixture_name)
@@ -61,6 +67,7 @@ def check(fixture_name):
     if stats["unique_meshes"]:
         check_source_geometry_is_discoverable_but_excluded(fixture_name)
         check_materials_match_gltf_materials(fixture_name, new_objects)
+        check_layer_collection(fixture_name)
     return got
 
 
@@ -180,6 +187,39 @@ def check_materials_match_gltf_materials(fixture_name, new_objects):
 
     assert checked_any, f"{fixture_name}: has gltf_materials but no mesh resources to check against"
     print(f"{fixture_name}: materials match openskp's own gltf_materials - OK")
+
+
+def check_layer_collection(fixture_name):
+    """Both committed fixtures use only SketchUp's default "Layer0" - not
+    a real cross-file multi-layer test, but does verify the mechanics:
+    a "Layer0" Collection exists directly under the root Collection
+    (not inside sources_collection - a layer is a placement property,
+    not a definition property), holds every placement Empty, and isn't
+    hidden (matching layer_hidden's own "Layer0": False for these
+    files). Called from check() itself, same reason as the checks above."""
+    root_name = os.path.splitext(fixture_name)[0]
+    root_coll = bpy.data.collections.get(root_name)
+    assert root_coll is not None, f"{root_name}: root collection was never created"
+
+    # Same cross-fixture name-collision reason as check_materials_match_gltf_materials:
+    # a second fixture's own "Layer0" collection gets Blender-auto-suffixed
+    # ("Layer0.001") when an EARLIER fixture already created one in this same
+    # session - match by base name (suffix stripped) rather than requiring
+    # an exact "Layer0" (confirmed directly: this is exactly what happened
+    # here on SU_File.skp, processed after capilla_quiroz_v17.skp).
+    layer0 = None
+    for child in root_coll.children:
+        if re.sub(r"\.\d{3}$", "", child.name) == "Layer0":
+            layer0 = child
+            break
+    assert layer0 is not None, f"{fixture_name}: no 'Layer0' collection directly under {root_name!r}"
+    assert not layer0.hide_viewport and not layer0.hide_render, (
+        f"{fixture_name}: 'Layer0' should be visible (layer_hidden['Layer0'] is False in both fixtures)"
+    )
+
+    placement_empties = [o for o in layer0.objects if o.instance_type == "COLLECTION"]
+    assert placement_empties, f"{fixture_name}: 'Layer0' collection has no placement Empties in it"
+    print(f"{fixture_name}: {len(placement_empties)} placements grouped under visible 'Layer0' - OK")
 
 
 def main():

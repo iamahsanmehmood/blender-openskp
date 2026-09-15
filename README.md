@@ -46,11 +46,22 @@ object. Reuses OpenSKP's own glTF-style material resolution
 (`InstancedScene.gltf_materials` / `LocalPrimitive.material_index`) rather
 than reimplementing SketchUp's material-inheritance rules here.
 
-**Not yet carried over, either direction:** layers and layer visibility,
-material export (Blender → `.skp`), and no hole reconstruction on export
-(Blender's mesh polygons have no native "outer boundary + holes" concept
-to read one back from, unlike a real B-rep). Solid colors only for
-now — texture images aren't carried over either.
+**Layers** (SketchUp calls them "tags", import only) carry over too, as
+Collections: every placement lands in a Collection named for its own
+layer, one per distinct layer in the file, and a layer switched off in
+SketchUp (its own Tags panel) imports with that Collection's visibility
+(the same "eye"/camera icons a user can toggle in the Outliner) already
+switched off — not shown by default, but still a normal, working part of
+the scene, one click away from visible again. Verified against a real
+145-definition structural-framing production file: 13 distinct layers,
+2 genuinely hidden in the source file (cladding layers), both correctly
+imported hidden.
+
+**Not yet carried over, either direction:** layer export (Blender →
+`.skp`), material export, and no hole reconstruction on export (Blender's
+mesh polygons have no native "outer boundary + holes" concept to read one
+back from, unlike a real B-rep). Solid colors only for materials — texture
+images aren't carried over either.
 
 **Editing imported geometry:** what you see placed in the viewport is a
 Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
@@ -114,6 +125,13 @@ just "some material got created") — `capilla_quiroz_v17.skp` alone
 produces 13 distinct materials, including two translucent ones (alpha
 0.5/0.7), correctly assigned per-face rather than defaulting to one color
 for the whole object.
+
+Layers: both committed fixtures only use SketchUp's default "Layer0", so
+the automated test only pins the mechanics (a "Layer0" Collection exists,
+holds every placement, isn't hidden) - real multi-layer/hidden-layer
+grouping was verified separately against the same structural-framing
+production file mentioned above (13 layers, 2 hidden, matching the source
+file's own Tags panel state exactly).
 
 Export was round-tripped through OpenSKP's own independent reader (not
 this addon) — a 2m cube at a known world position exported and re-parsed

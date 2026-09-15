@@ -47,6 +47,20 @@ being no way to even select the right object in the first place (the
 source collections were entirely unlinked before this), not a limitation
 of Edit Mode itself.
 
+Layers (SketchUp calls them "tags"): every placement Empty is linked into
+a Collection named for its own resolved InstancedNode.layer, one per
+distinct layer in the file, all direct children of the root Collection
+(separate from sources_collection above - a layer is a property of a
+PLACEMENT, not of the definition it references, since the same
+definition can appear on different layers in different places, so
+per-layer grouping only makes sense at the placement level). A layer
+hidden in the source file (openskp's InstancedScene.layer_hidden, keyed
+by layer name) hides its Collection the same way - Collection.
+hide_viewport/hide_render, the ordinary Outliner eye/camera toggles - not
+the exclude-from-View-Layer mechanism sources_collection uses, since a
+hidden layer is still meant to be a normal, working part of the scene,
+just not shown right now.
+
 Materials: each mesh resource's per-triangle material_index (resolved by
 openskp's build_instanced_scene() into InstancedScene.gltf_materials, a
 glTF-style pbrMetallicRoughness list - the same resolution already used
@@ -182,6 +196,23 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache):
     return obj
 
 
+def _get_or_build_layer_collection(layer_name, layer_collection_cache, root_collection):
+    """Returns the Collection that placements on `layer_name` (SketchUp's
+    own term is "tag") get linked into, building it exactly once per
+    distinct layer and linking it directly under root_collection -
+    separate from sources_collection, since a layer is a property of a
+    PLACEMENT (InstancedNode.layer), not of a definition: the same
+    definition can appear on different layers in different places, so
+    grouping by layer only makes sense at the placement level."""
+    name = layer_name or "Layer0"
+    if name in layer_collection_cache:
+        return layer_collection_cache[name]
+    coll = bpy.data.collections.new(name)
+    root_collection.children.link(coll)
+    layer_collection_cache[name] = coll
+    return coll
+
+
 def _get_or_build_collection(
     resource_id, resources_by_id, collection_cache, sources_collection, gltf_materials, material_cache, stats
 ):
@@ -281,7 +312,8 @@ def _place_node(
     collection_cache,
     curve_resources_by_id,
     curve_collection_cache,
-    target_collection,
+    layer_collection_cache,
+    root_collection,
     sources_collection,
     gltf_materials,
     material_cache,
@@ -294,9 +326,16 @@ def _place_node(
     their new parent matrix - matrices are relative-to-parent in openskp's
     own model, composed here into world space for a flat, editable result
     rather than mirroring the source's exact nesting as Blender parent/
-    child objects."""
+    child objects.
+
+    Each placement Empty is linked into a Collection for its OWN
+    node.layer (SketchUp's "tag"), not a single fixed target - a layer is
+    a property of the placement, not of the definition it references (the
+    same definition can appear on different layers in different places),
+    so grouping by layer only makes sense here, at the placement level."""
     local_matrix = _gltf_matrix_to_blender(node.matrix)
     world_matrix = parent_matrix @ local_matrix
+    sketchup_layer_coll = _get_or_build_layer_collection(node.layer, layer_collection_cache, root_collection)
 
     if node.mesh_resource_id is not None:
         coll = _get_or_build_collection(
@@ -307,7 +346,7 @@ def _place_node(
         empty.instance_type = "COLLECTION"
         empty.instance_collection = coll
         empty.matrix_world = _YUP_TO_ZUP @ world_matrix
-        target_collection.objects.link(empty)
+        sketchup_layer_coll.objects.link(empty)
         stats["placements"] += 1
 
     if node.curve_resource_id is not None:
@@ -320,7 +359,7 @@ def _place_node(
         curve_empty.instance_type = "COLLECTION"
         curve_empty.instance_collection = curve_coll
         curve_empty.matrix_world = _YUP_TO_ZUP @ world_matrix
-        target_collection.objects.link(curve_empty)
+        sketchup_layer_coll.objects.link(curve_empty)
         stats["curve_placements"] += 1
 
     for child in node.children:
@@ -331,7 +370,8 @@ def _place_node(
             collection_cache,
             curve_resources_by_id,
             curve_collection_cache,
-            target_collection,
+            layer_collection_cache,
+            root_collection,
             sources_collection,
             gltf_materials,
             material_cache,
@@ -370,6 +410,8 @@ def import_skp(filepath, context=None):
     collection_cache = {}
     curve_resources_by_id = {r.id: r for r in getattr(scene, "curve_resources", None) or []}
     curve_collection_cache = {}
+    layer_collection_cache = {}
+    layer_hidden = getattr(scene, "layer_hidden", None) or {}
     gltf_materials = getattr(scene, "gltf_materials", None) or []
     material_cache = {}
     stats = {
@@ -404,6 +446,7 @@ def import_skp(filepath, context=None):
         collection_cache,
         curve_resources_by_id,
         curve_collection_cache,
+        layer_collection_cache,
         root_collection,
         sources_collection,
         gltf_materials,
@@ -414,9 +457,25 @@ def import_skp(filepath, context=None):
         f"openskp: {stats['unique_meshes']} unique meshes "
         f"({stats['triangles']} triangles), {stats['placements']} instances placed; "
         f"{stats['unique_curve_meshes']} unique loose-edge groups "
-        f"({stats['curve_runs']} runs), {stats['curve_placements']} placed "
+        f"({stats['curve_runs']} runs), {stats['curve_placements']} placed; "
+        f"{len(layer_collection_cache)} layers "
         f"in {time.time() - t0:.1f}s"
     )
+
+    # A layer hidden in the source file (SketchUp's own Tags panel
+    # visibility) hides its whole Collection here too - Collection-level
+    # hide_viewport/hide_render (the same "eye"/camera icons a user can
+    # toggle in the Outliner), not the exclude-from-View-Layer mechanism
+    # sources_collection uses below: a hidden layer is still meant to be a
+    # normal, working part of the scene (just not shown right now), unlike
+    # sources_collection's deliberately-excluded master geometry.
+    stats["unique_layers"] = len(layer_collection_cache)
+    stats["hidden_layers"] = 0
+    for name, coll in layer_collection_cache.items():
+        if layer_hidden.get(name, False):
+            coll.hide_viewport = True
+            coll.hide_render = True
+            stats["hidden_layers"] += 1
 
     layer_coll = _find_layer_collection(context.view_layer.layer_collection, sources_collection)
     if layer_coll is not None:
