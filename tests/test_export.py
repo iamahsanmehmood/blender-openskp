@@ -44,6 +44,7 @@ def main():
         "faces_skipped": 0,
         "objects_skipped": 0,
         "objects_exported": 1,
+        "materials_written": 0,
         "layers_written": 0,
     }, stats
 
@@ -115,7 +116,7 @@ def test_layer_export():
     print("layer export stats:", stats)
     assert stats == {
         "faces_written": 18, "faces_skipped": 0, "objects_skipped": 0,
-        "objects_exported": 3, "layers_written": 2,
+        "objects_exported": 3, "materials_written": 0, "layers_written": 2,
     }, stats
 
     import openskp
@@ -146,6 +147,79 @@ def test_layer_export():
     print(f"test_layer_export: OK ({layer_names}, 6 faces each, correctly split by Face.layer)")
 
 
+def test_material_export():
+    """Regression test for material export: a polygon's own material
+    slot (poly.material_index into obj.data.materials) becomes a
+    SketchUp material read from Material.diffuse_color. Two cubes, one
+    opaque red, one 50%-alpha translucent blue, sharing no materials -
+    plus a plain cube with no material at all, to confirm an unpainted
+    object still exports cleanly."""
+    # test_layer_export() (run just before this, in the same session)
+    # leaves the active layer collection pointed at "Plates" - reset it
+    # to the scene's own root, or these new cubes would silently land
+    # inside "Plates" too and inflate layers_written below.
+    bpy.context.view_layer.active_layer_collection = bpy.context.view_layer.layer_collection
+
+    red = bpy.data.materials.new(name="ExportRed")
+    red.diffuse_color = (1.0, 0.0, 0.0, 1.0)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(20, 0, 0))
+    red_obj = bpy.context.active_object
+    red_obj.name = "RedCube"
+    red_obj.data.materials.append(red)
+
+    blue = bpy.data.materials.new(name="ExportBlue")
+    blue.diffuse_color = (0.0, 0.0, 1.0, 0.5)
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(25, 0, 0))
+    blue_obj = bpy.context.active_object
+    blue_obj.name = "BlueCube"
+    blue_obj.data.materials.append(blue)
+
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(30, 0, 0))
+    plain_obj = bpy.context.active_object
+    plain_obj.name = "PlainCube"
+
+    for obj in (red_obj, blue_obj, plain_obj):
+        obj.select_set(True)
+
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_material_export_test.skp")
+    stats = export_skp.export_skp(out_path, bpy.context)
+    print("material export stats:", stats)
+    assert stats == {
+        "faces_written": 18, "faces_skipped": 0, "objects_skipped": 0,
+        "objects_exported": 3, "materials_written": 2, "layers_written": 0,
+    }, stats
+
+    import openskp
+
+    model = openskp.SkpFile.open(out_path).parse()
+    os.remove(out_path)
+
+    materials_by_name = {m.name: m for m in model.materials}
+    assert set(materials_by_name) == {"ExportRed", "ExportBlue"}, materials_by_name
+
+    red_mat = materials_by_name["ExportRed"]
+    assert red_mat.color[:3] == (255, 0, 0), red_mat.color
+    assert red_mat.transparency == 1.0, red_mat.transparency
+
+    blue_mat = materials_by_name["ExportBlue"]
+    assert blue_mat.color[:3] == (0, 0, 255), blue_mat.color
+    assert abs(blue_mat.transparency - 0.5) < 1e-3, blue_mat.transparency
+
+    # Cross-check per-face assignment, not just "the material records
+    # exist": faces split into 3 groups by material_id - red's, blue's,
+    # and the unpainted cube's `None` - 6 faces each.
+    by_material: dict = {}
+    for f in model.root.faces.values():
+        by_material.setdefault(f.material_id, 0)
+        by_material[f.material_id] += 1
+    assert len(by_material) == 3, f"expected 3 distinct Face.material_id groups, got {by_material}"
+    assert sorted(by_material.values()) == [6, 6, 6], by_material
+    assert by_material.get(None, 0) == 6, f"the unpainted cube's faces should carry no material_id: {by_material}"
+
+    print("test_material_export: OK (red opaque, blue 50% alpha, plain unpainted - all correctly split)")
+
+
 if __name__ == "__main__":
     main()
     test_layer_export()
+    test_material_export()

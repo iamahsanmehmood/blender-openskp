@@ -45,6 +45,16 @@ exporters already use). An object left in the default, unrenamed
 existed — organizing objects into named Collections is what opts them
 into a real tag on export.
 
+**Material export**: each polygon's own material slot
+(`poly.material_index` into `obj.data.materials`) becomes a real SketchUp
+material, read from the Material's `diffuse_color` (works whether or not
+the material has a node tree, unlike reading the Principled BSDF's Base
+Color directly). One SketchUp material per unique Blender `Material`
+datablock — the same material reused across several objects exports
+once, not once per object. A polygon with no material slot exports
+unpainted, same as before this existed. Solid colors only, matching
+import's own scope — no texture export.
+
 **Materials** (import only, for now) carry over too: each face's resolved
 color and opacity — SketchUp's per-face material, or its layer/definition
 default when a face has none set directly — becomes a real Blender
@@ -66,17 +76,18 @@ the scene, one click away from visible again. Verified against a real
 2 genuinely hidden in the source file (cladding layers), both correctly
 imported hidden.
 
-**Not yet carried over:** material export (Blender → `.skp`), and no hole
-reconstruction on export (Blender's mesh polygons have no native "outer
-boundary + holes" concept to read one back from, unlike a real B-rep).
-Solid colors only for materials — texture images aren't carried over
-either. Layer export is deliberately NOT wired through an imported file's
-own master/source objects (`<file> (source geometry)`) - those sit in one
+**Not yet carried over:** no hole reconstruction on export (Blender's
+mesh polygons have no native "outer boundary + holes" concept to read
+one back from, unlike a real B-rep). Solid colors only for materials —
+texture images aren't carried over either. Both layer and material
+export are deliberately NOT wired through an imported file's own
+master/source objects (`<file> (source geometry)`) - those sit in one
 Collection per unique *definition*, not per layer, since the same
-definition can appear on several different tags across different
-placements - so a straight reimport-then-reexport won't automatically
-carry a file's original tags back out yet; that needs exporting via the
-placement Empties instead of their shared master mesh, future scope.
+definition can appear on several different tags (and, less often,
+several different material contexts) across different placements - so a
+straight reimport-then-reexport won't automatically carry a file's
+original tags/paint back out yet; that needs exporting via the placement
+Empties instead of their shared master mesh, future scope.
 
 **Editing imported geometry:** what you see placed in the viewport is a
 Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
@@ -157,6 +168,13 @@ default Collection, one each in Collections named "Studs" and "Plates")
 exported and re-parsed, confirming exactly 3 distinct `Face.layer`
 groups of 6 faces each - real per-face assignment, not just "a layer
 record got written somewhere."
+
+Material export the same way again: an opaque red cube, a 50%-alpha
+translucent blue cube, and a plain unpainted cube, exported and
+re-parsed independently - the resulting `Material.color`/`transparency`
+values match exactly, and faces split into 3 distinct `Face.material_id`
+groups of 6 each (the unpainted cube's own faces correctly carrying no
+`material_id` at all, not a stray default).
 
 The wheel-bundled dependencies were verified the same way: the addon was
 fully uninstalled, its dependencies removed from Blender's own embedded

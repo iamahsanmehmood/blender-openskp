@@ -25,7 +25,22 @@ holds regardless of how the object is placed in the scene.
 
 No hole reconstruction (Blender's own mesh polygons have no native
 "outer boundary + holes" concept to read one back from, unlike a real
-B-rep), no material carry-over - geometry plus layers, for now.
+B-rep) - geometry plus materials plus layers now.
+
+Materials: each mesh polygon's own material slot (`poly.material_index`
+into `obj.data.materials`) becomes a SketchUp material - solid colors
+only (matching import's own "solid colors first" scope), read from the
+Material's `diffuse_color` (the same property Solid-shading uses, so it
+works whether or not the material has a node tree at all - unlike
+`Principled BSDF.inputs["Base Color"]`, which only exists once
+`use_nodes` is on). Registered once per unique Material datablock (not
+per-object, not per-polygon) via openskp's builder.add_material() -
+which, like add_layer(), must be called before any add_face call, and
+specifically BEFORE add_layer() too (openskp's own material/layer slot
+numbering both depend on the final material count - see
+SkpBuilder.add_material's own docstring). A polygon with no material
+slot (an object with an empty material list, or material_index out of
+range) exports unpainted, same as before this existed.
 
 Layers (SketchUp "tags"): each exported object's layer is its own
 Collection membership - the first Collection it's linked into other
@@ -112,7 +127,37 @@ def _object_layer_name(obj, scene_collection):
     return None
 
 
-def _export_object(builder, obj, stats, layer):
+def _material_rgba_opacity(mat):
+    """A Material's solid display color as openskp's writer wants it:
+    (r, g, b) ints 0-255, plus a separate 0.0-1.0 opacity (`None` when
+    fully opaque, matching add_material's own "untouched" default rather
+    than forcing every material through the transparency code path)."""
+    r, g, b, a = mat.diffuse_color
+    rgba = tuple(round(c * 255) for c in (r, g, b))
+    opacity = None if a >= 0.999 else float(a)
+    return rgba, opacity
+
+
+def _register_object_materials(obj, builder, material_handle_by_name):
+    """Registers every Material in obj.data.materials that hasn't been
+    seen yet (by name - the same Material datablock reused across many
+    objects registers exactly once) and returns the resulting list of
+    handles, indexed the same way as obj.data.materials itself so a
+    polygon's own material_index can look its handle up directly."""
+    handles = []
+    materials = obj.data.materials if obj.data else []
+    for mat in materials:
+        if mat is None:
+            handles.append(None)
+            continue
+        if mat.name not in material_handle_by_name:
+            rgba, opacity = _material_rgba_opacity(mat)
+            material_handle_by_name[mat.name] = builder.add_material(mat.name, rgba, opacity=opacity)
+        handles.append(material_handle_by_name[mat.name])
+    return handles
+
+
+def _export_object(builder, obj, stats, layer, material_handles):
     mesh = obj.to_mesh()
     try:
         mw = obj.matrix_world
@@ -120,12 +165,15 @@ def _export_object(builder, obj, stats, layer):
             poly.index for poly in mesh.polygons if not _is_planar(mesh, poly)
         ]
 
+        def material_for(index):
+            return material_handles[index] if 0 <= index < len(material_handles) else None
+
         for poly in mesh.polygons:
             if poly.index in needs_triangulation:
                 continue
             pts = [_world_point(mw, mesh.vertices[vi].co) for vi in poly.vertices]
             try:
-                builder.add_face(pts, layer=layer)
+                builder.add_face(pts, layer=layer, material=material_for(poly.material_index))
                 stats["faces_written"] += 1
             except Exception:
                 # A degenerate polygon (zero area, from pinched/duplicate
@@ -141,7 +189,7 @@ def _export_object(builder, obj, stats, layer):
                     continue
                 pts = [_world_point(mw, mesh.vertices[vi].co) for vi in tri.vertices]
                 try:
-                    builder.add_face(pts, layer=layer)
+                    builder.add_face(pts, layer=layer, material=material_for(tri.material_index))
                     stats["faces_written"] += 1
                 except Exception:
                     stats["faces_skipped"] += 1
@@ -160,10 +208,16 @@ def export_skp(filepath, context):
 
     builder = create()
 
-    # openskp's writer requires every layer to be registered before the
-    # first add_face call, so this resolves each object's layer name (see
-    # _object_layer_name) up front and registers each distinct one exactly
-    # once - a plain dedup, not a second export pass.
+    # openskp's writer requires materials, then layers, then faces, in
+    # that order - add_material must precede add_layer (both of their own
+    # slot numbering depends on the final material count), and both must
+    # precede the first add_face call. So this resolves and registers
+    # every object's materials first, then every object's layer name (see
+    # _object_layer_name), before any geometry is written - two dedup
+    # passes, not two export passes.
+    material_handle_by_name = {}
+    object_material_handles = {obj.name: _register_object_materials(obj, builder, material_handle_by_name) for obj in objs}
+
     scene_collection = context.scene.collection
     object_layer_names = {obj.name: _object_layer_name(obj, scene_collection) for obj in objs}
     layer_handle_by_name = {}
@@ -173,7 +227,7 @@ def export_skp(filepath, context):
 
     stats = {
         "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0, "objects_exported": 0,
-        "layers_written": len(layer_handle_by_name),
+        "materials_written": len(material_handle_by_name), "layers_written": len(layer_handle_by_name),
     }
 
     for obj in objs:
@@ -182,7 +236,7 @@ def export_skp(filepath, context):
             continue
         layer_name = object_layer_names[obj.name]
         layer = layer_handle_by_name.get(layer_name) if layer_name is not None else None
-        _export_object(builder, obj, stats, layer)
+        _export_object(builder, obj, stats, layer, object_material_handles[obj.name])
         stats["objects_exported"] += 1
 
     with open(filepath, "wb") as f:
@@ -191,6 +245,6 @@ def export_skp(filepath, context):
     print(
         f"openskp export: {stats['objects_exported']} objects, "
         f"{stats['faces_written']} faces written, {stats['faces_skipped']} skipped, "
-        f"{stats['layers_written']} layers"
+        f"{stats['materials_written']} materials, {stats['layers_written']} layers"
     )
     return stats
