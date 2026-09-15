@@ -44,6 +44,7 @@ def main():
         "faces_skipped": 0,
         "objects_skipped": 0,
         "objects_exported": 1,
+        "layers_written": 0,
     }, stats
 
     sys.path.insert(
@@ -75,5 +76,76 @@ def main():
     print("test_export: OK (6 faces, each a clean 4-vertex quad, coordinates exact)")
 
 
+def test_layer_export():
+    """Regression test for layer (SketchUp "tag") export: an object's
+    layer is whichever Collection it's linked into, other than the
+    scene's own default/root ones (see export_skp.py's
+    _object_layer_name docstring for the exact exclusion rules).
+    Selects only the three cubes this creates - explicitly, not "every
+    scene object" - since a background Blender session starts with its
+    own default Cube/Light/Camera already in the scene (confirmed
+    directly) that must NOT be swept into this export."""
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0))
+    default_obj = bpy.context.active_object
+    default_obj.name = "DefaultLayerCube"
+
+    studs_coll = bpy.data.collections.new("Studs")
+    bpy.context.scene.collection.children.link(studs_coll)
+    bpy.context.view_layer.active_layer_collection = (
+        bpy.context.view_layer.layer_collection.children["Studs"]
+    )
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(5, 0, 0))
+    studs_obj = bpy.context.active_object
+    studs_obj.name = "StudCube"
+
+    plates_coll = bpy.data.collections.new("Plates")
+    bpy.context.scene.collection.children.link(plates_coll)
+    bpy.context.view_layer.active_layer_collection = (
+        bpy.context.view_layer.layer_collection.children["Plates"]
+    )
+    bpy.ops.mesh.primitive_cube_add(size=1.0, location=(10, 0, 0))
+    plates_obj = bpy.context.active_object
+    plates_obj.name = "PlateCube"
+
+    for obj in (default_obj, studs_obj, plates_obj):
+        obj.select_set(True)
+
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_layer_export_test.skp")
+    stats = export_skp.export_skp(out_path, bpy.context)
+    print("layer export stats:", stats)
+    assert stats == {
+        "faces_written": 18, "faces_skipped": 0, "objects_skipped": 0,
+        "objects_exported": 3, "layers_written": 2,
+    }, stats
+
+    import openskp
+
+    model = openskp.SkpFile.open(out_path).parse()
+    os.remove(out_path)
+
+    layer_names = sorted(l.name for l in model.layers)
+    assert layer_names == ["Layer0", "Plates", "Studs"], layer_names
+
+    # Faces split into exactly 3 distinct Face.layer ids (SketchUp's own
+    # per-face layer field, `None` reading back as the implicit default)
+    # - one per object, 6 faces (one cube) each - not just "some layer
+    # got written," a real per-face assignment cross-check.
+    by_layer: dict = {}
+    for f in model.root.faces.values():
+        by_layer.setdefault(f.layer, 0)
+        by_layer[f.layer] += 1
+    assert len(by_layer) == 3, f"expected 3 distinct Face.layer groups, got {by_layer}"
+    assert sorted(by_layer.values()) == [6, 6, 6], by_layer
+    # openskp's writer encodes "no explicit layer" as a raw 0 (SketchUp's
+    # own default-layer sentinel, matching how a 0 material_id means "no
+    # material") - confirmed directly, not assumed from Face.layer's own
+    # docstring (which describes the READER's `None` convention for a
+    # face that never had the field touched at all, a different case).
+    assert by_layer.get(0, 0) == 6, f"the unorganized cube's faces should carry the default-layer sentinel: {by_layer}"
+
+    print(f"test_layer_export: OK ({layer_names}, 6 faces each, correctly split by Face.layer)")
+
+
 if __name__ == "__main__":
     main()
+    test_layer_export()

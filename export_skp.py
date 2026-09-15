@@ -25,8 +25,26 @@ holds regardless of how the object is placed in the scene.
 
 No hole reconstruction (Blender's own mesh polygons have no native
 "outer boundary + holes" concept to read one back from, unlike a real
-B-rep), no material/layer carry-over - geometry only, matching the scope
-of the FreeCAD addon's own exporter.
+B-rep), no material carry-over - geometry plus layers, for now.
+
+Layers (SketchUp "tags"): each exported object's layer is its own
+Collection membership - the first Collection it's linked into other
+than the scene's master Collection or a "(source geometry)" one (the
+same convention this addon's own import side already establishes:
+Blender's closest equivalent to a SketchUp tag is a named Collection,
+and organizing objects into named Collections to control the exported
+tag is the same pattern glTF/FBX/USD exporters already use for
+layers/collections). An object in no meaningful Collection of its own
+exports to SketchUp's default layer, same as before this existed.
+
+Deliberately NOT wired through the master/source objects an import
+leaves behind (`<file> (source geometry)`): those sit in one Collection
+per unique DEFINITION, not per layer - the same definition can appear
+on several different tags across different placements (see
+import_skp.py's own module docstring on this), so there is no single
+correct layer to read off a shared master object. Exporting placement
+Empties (each with its own well-defined, resolved layer) instead of
+flattening back to their master mesh is future scope, not this pass.
 """
 from __future__ import annotations
 
@@ -66,7 +84,35 @@ def _is_planar(mesh, polygon):
     return True
 
 
-def _export_object(builder, obj, stats):
+def _object_layer_name(obj, scene_collection):
+    """The Collection this object's export should be tagged with in
+    SketchUp - the first Collection it's linked into other than the
+    scene's own implicit root ("Scene Collection", `scene.collection`
+    itself - an object can be linked directly into it, bypassing every
+    named collection) or "Collection" (every new .blend's own
+    auto-created default collection, confirmed directly: it is a real,
+    separately-named CHILD of `scene.collection`, not `scene.collection`
+    itself, so an unmodified default scene's objects all resolve to it -
+    excluded by name specifically so a from-scratch export without any
+    deliberate organizing doesn't pick up a spurious "Collection" tag
+    nothing chose), or an addon-generated "(source geometry)" one (see
+    module docstring). None for SketchUp's own default layer when no
+    other Collection applies.
+
+    Compares by name, not `is` - Blender's Python API can hand back a
+    freshly-wrapped RNA proxy for the same underlying Collection on each
+    property access, so `coll is scene_collection` silently never matches
+    even where the names are identical (confirmed directly)."""
+    for coll in obj.users_collection:
+        if coll.name in (scene_collection.name, "Collection"):
+            continue
+        if coll.name.endswith("(source geometry)"):
+            continue
+        return coll.name
+    return None
+
+
+def _export_object(builder, obj, stats, layer):
     mesh = obj.to_mesh()
     try:
         mw = obj.matrix_world
@@ -79,7 +125,7 @@ def _export_object(builder, obj, stats):
                 continue
             pts = [_world_point(mw, mesh.vertices[vi].co) for vi in poly.vertices]
             try:
-                builder.add_face(pts)
+                builder.add_face(pts, layer=layer)
                 stats["faces_written"] += 1
             except Exception:
                 # A degenerate polygon (zero area, from pinched/duplicate
@@ -95,7 +141,7 @@ def _export_object(builder, obj, stats):
                     continue
                 pts = [_world_point(mw, mesh.vertices[vi].co) for vi in tri.vertices]
                 try:
-                    builder.add_face(pts)
+                    builder.add_face(pts, layer=layer)
                     stats["faces_written"] += 1
                 except Exception:
                     stats["faces_skipped"] += 1
@@ -113,13 +159,30 @@ def export_skp(filepath, context):
         objs = [o for o in context.scene.objects if o.type == "MESH" and o.visible_get()]
 
     builder = create()
-    stats = {"faces_written": 0, "faces_skipped": 0, "objects_skipped": 0, "objects_exported": 0}
+
+    # openskp's writer requires every layer to be registered before the
+    # first add_face call, so this resolves each object's layer name (see
+    # _object_layer_name) up front and registers each distinct one exactly
+    # once - a plain dedup, not a second export pass.
+    scene_collection = context.scene.collection
+    object_layer_names = {obj.name: _object_layer_name(obj, scene_collection) for obj in objs}
+    layer_handle_by_name = {}
+    for name in object_layer_names.values():
+        if name is not None and name not in layer_handle_by_name:
+            layer_handle_by_name[name] = builder.add_layer(name)
+
+    stats = {
+        "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0, "objects_exported": 0,
+        "layers_written": len(layer_handle_by_name),
+    }
 
     for obj in objs:
         if obj.data is None or len(obj.data.polygons) == 0:
             stats["objects_skipped"] += 1
             continue
-        _export_object(builder, obj, stats)
+        layer_name = object_layer_names[obj.name]
+        layer = layer_handle_by_name.get(layer_name) if layer_name is not None else None
+        _export_object(builder, obj, stats, layer)
         stats["objects_exported"] += 1
 
     with open(filepath, "wb") as f:
@@ -127,6 +190,7 @@ def export_skp(filepath, context):
 
     print(
         f"openskp export: {stats['objects_exported']} objects, "
-        f"{stats['faces_written']} faces written, {stats['faces_skipped']} skipped"
+        f"{stats['faces_written']} faces written, {stats['faces_skipped']} skipped, "
+        f"{stats['layers_written']} layers"
     )
     return stats

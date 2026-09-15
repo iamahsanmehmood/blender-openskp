@@ -36,6 +36,15 @@ raw n-gons, since nothing in Blender enforces that an edited mesh's faces
 stay planar. Round-trip-verified: exported coordinates match the original
 geometry exactly (see `tests/test_export.py`).
 
+**Layer export**: each exported object's own Collection becomes its
+SketchUp layer/tag — the first Collection it's linked into other than the
+scene's own default ones (Blender has no native "tag" concept; a named
+Collection is its closest equivalent, and the same convention glTF/FBX/USD
+exporters already use). An object left in the default, unrenamed
+`Collection` exports to SketchUp's own default layer, same as before this
+existed — organizing objects into named Collections is what opts them
+into a real tag on export.
+
 **Materials** (import only, for now) carry over too: each face's resolved
 color and opacity — SketchUp's per-face material, or its layer/definition
 default when a face has none set directly — becomes a real Blender
@@ -57,11 +66,17 @@ the scene, one click away from visible again. Verified against a real
 2 genuinely hidden in the source file (cladding layers), both correctly
 imported hidden.
 
-**Not yet carried over, either direction:** layer export (Blender →
-`.skp`), material export, and no hole reconstruction on export (Blender's
-mesh polygons have no native "outer boundary + holes" concept to read one
-back from, unlike a real B-rep). Solid colors only for materials — texture
-images aren't carried over either.
+**Not yet carried over:** material export (Blender → `.skp`), and no hole
+reconstruction on export (Blender's mesh polygons have no native "outer
+boundary + holes" concept to read one back from, unlike a real B-rep).
+Solid colors only for materials — texture images aren't carried over
+either. Layer export is deliberately NOT wired through an imported file's
+own master/source objects (`<file> (source geometry)`) - those sit in one
+Collection per unique *definition*, not per layer, since the same
+definition can appear on several different tags across different
+placements - so a straight reimport-then-reexport won't automatically
+carry a file's original tags back out yet; that needs exporting via the
+placement Empties instead of their shared master mesh, future scope.
 
 **Editing imported geometry:** what you see placed in the viewport is a
 Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
@@ -136,6 +151,12 @@ file's own Tags panel state exactly).
 Export was round-tripped through OpenSKP's own independent reader (not
 this addon) — a 2m cube at a known world position exported and re-parsed
 with every vertex landing exactly on the expected inch-space bounding box.
+
+Layer export was checked the same way: three cubes (one left in the
+default Collection, one each in Collections named "Studs" and "Plates")
+exported and re-parsed, confirming exactly 3 distinct `Face.layer`
+groups of 6 faces each - real per-face assignment, not just "a layer
+record got written somewhere."
 
 The wheel-bundled dependencies were verified the same way: the addon was
 fully uninstalled, its dependencies removed from Blender's own embedded
