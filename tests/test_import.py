@@ -17,6 +17,7 @@ contributed nothing to the import at all before openskp's
 build_instanced_scene() gained curve-resource support.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,7 +38,18 @@ EXPECTED = {
 
 def check(fixture_name):
     path = os.path.join(FIXTURES_DIR, fixture_name)
+    # Several fixtures share a generic definition name ("ROOT_MODEL", for
+    # a root that has no real name of its own) - a plain bpy.data.objects
+    # lookup by that name would silently find an EARLIER fixture's
+    # leftover object once a later one gets auto-suffixed ".001" by
+    # Blender (confirmed directly: this is exactly what happened before
+    # the objects-created-by-THIS-import filter below was added). So
+    # every check below that looks an object up by name is restricted to
+    # objects that didn't exist prior to this specific import call.
+    objects_before = set(bpy.data.objects)
     stats = import_skp.import_skp(path)
+    new_objects = set(bpy.data.objects) - objects_before
+
     got = (
         stats["unique_meshes"], stats["placements"], stats["triangles"],
         stats["unique_curve_meshes"], stats["curve_placements"], stats["curve_runs"],
@@ -48,6 +60,7 @@ def check(fixture_name):
         assert got == expected, f"{fixture_name}: expected {expected}, got {got}"
     if stats["unique_meshes"]:
         check_source_geometry_is_discoverable_but_excluded(fixture_name)
+        check_materials_match_gltf_materials(fixture_name, new_objects)
     return got
 
 
@@ -91,6 +104,82 @@ def check_source_geometry_is_discoverable_but_excluded(fixture_name):
         f"(would render duplicated at the origin): {all_source_objects & evaluated}"
     )
     print(f"{fixture_name}: {len(all_source_objects)} source objects discoverable and excluded - OK")
+
+
+def check_materials_match_gltf_materials(fixture_name, new_objects):
+    """Cross-validates the Blender materials/per-polygon assignment
+    against openskp's own (already-tested) InstancedScene.gltf_materials
+    + LocalPrimitive.material_index - the source of truth this addon
+    reads from, rather than asserting a color in isolation. Called from
+    check() itself (not re-importing), same reason as the discoverability
+    check above.
+
+    `new_objects` restricts the by-name lookup below to objects created
+    by THIS fixture's own import call. Several fixtures share a generic
+    definition name ("ROOT_MODEL", used when a definition has no real
+    name of its own) - a plain bpy.data.objects.get(name) lookup would
+    silently match an earlier fixture's leftover object once this
+    fixture's own object gets auto-suffixed ".001" by Blender for
+    colliding with it (confirmed directly: this is exactly what happened
+    before new_objects was threaded through here)."""
+    vendor_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor")
+    if vendor_dir not in sys.path:
+        sys.path.insert(0, vendor_dir)
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    scene = openskp.SkpFile.open(path).build_instanced_scene()
+    if not scene.gltf_materials:
+        return
+
+    # Blender auto-suffixes a colliding name ("ROOT_MODEL" -> "ROOT_MODEL.001")
+    # rather than erroring - and a generic definition name like "ROOT_MODEL"
+    # (used when a definition has no real name of its own) is common enough
+    # to collide with an EARLIER fixture's own object in this same session
+    # (confirmed directly: this is exactly what SU_File.skp's "ROOT_MODEL"
+    # does against capilla_quiroz_v17.skp's own "ROOT_MODEL"). So match by
+    # base name (suffix stripped) within this fixture's own new_objects
+    # only, rather than requiring an exact, unsuffixed name - but restrict
+    # this to actual mesh data-objects (the master/source objects this
+    # test cares about), since placement Empties of the same collection
+    # get auto-suffixed the same way and would otherwise collide with -
+    # and, depending on dict insertion order, silently shadow - the real
+    # mesh object in this lookup (confirmed directly: without the type
+    # filter this failed with "'NoneType' object has no attribute
+    # 'materials'", i.e. it had matched an Empty instead).
+    new_objects_by_base_name = {
+        re.sub(r"\.\d{3}$", "", o.name): o for o in new_objects if o.type == "MESH" and o.data is not None
+    }
+
+    checked_any = False
+    for resource in scene.mesh_resources:
+        obj_name = resource.definition_name or resource.id
+        obj = new_objects_by_base_name.get(obj_name)
+        assert obj is not None, (
+            f"{fixture_name}: no newly-created Blender object named {obj_name!r} "
+            f"(created this import: {sorted(o.name for o in new_objects)})"
+        )
+
+        expected_colors = []
+        expected_indices = []
+        for prim in resource.primitives:
+            pbr = scene.gltf_materials[prim.material_index].get("pbrMetallicRoughness", {})
+            color = tuple(round(c, 3) for c in pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0]))
+            expected_colors.append(color)
+            expected_indices.extend([len(expected_colors) - 1] * (len(prim.indices) // 3))
+
+        got_colors = [tuple(round(c, 3) for c in mat.diffuse_color) for mat in obj.data.materials]
+        assert got_colors == expected_colors, (
+            f"{fixture_name}/{obj_name}: material colors {got_colors} != expected {expected_colors}"
+        )
+        got_indices = [p.material_index for p in obj.data.polygons]
+        assert got_indices == expected_indices, (
+            f"{fixture_name}/{obj_name}: per-polygon material assignment doesn't match source primitives"
+        )
+        checked_any = True
+
+    assert checked_any, f"{fixture_name}: has gltf_materials but no mesh resources to check against"
+    print(f"{fixture_name}: materials match openskp's own gltf_materials - OK")
 
 
 def main():

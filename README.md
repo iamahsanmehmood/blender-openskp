@@ -36,10 +36,21 @@ raw n-gons, since nothing in Blender enforces that an edited mesh's faces
 stay planar. Round-trip-verified: exported coordinates match the original
 geometry exactly (see `tests/test_export.py`).
 
-**Not yet carried over, either direction:** materials, layers, and layer
-visibility, and no hole reconstruction on export (Blender's mesh polygons
-have no native "outer boundary + holes" concept to read one back from,
-unlike a real B-rep). Geometry only, for now.
+**Materials** (import only, for now) carry over too: each face's resolved
+color and opacity — SketchUp's per-face material, or its layer/definition
+default when a face has none set directly — becomes a real Blender
+Material (Principled BSDF, transparency enabled when the source material
+has alpha < 1), assigned per-polygon on the mesh so a multi-colored
+component keeps its per-face colors, not one flat color for the whole
+object. Reuses OpenSKP's own glTF-style material resolution
+(`InstancedScene.gltf_materials` / `LocalPrimitive.material_index`) rather
+than reimplementing SketchUp's material-inheritance rules here.
+
+**Not yet carried over, either direction:** layers and layer visibility,
+material export (Blender → `.skp`), and no hole reconstruction on export
+(Blender's mesh polygons have no native "outer boundary + holes" concept
+to read one back from, unlike a real B-rep). Solid colors only for
+now — texture images aren't carried over either.
 
 **Editing imported geometry:** what you see placed in the viewport is a
 Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
@@ -95,6 +106,14 @@ registered operator (`bpy.ops.import_scene.openskp(...)`):
 |---|---|---|---|---|
 | `SU_File.skp` | 1 | 1 | 104 | matches expected exactly |
 | `capilla_quiroz_v17.skp` | 3 | 4 | 871 | matches expected exactly |
+
+Materials are cross-validated the same way: each fixture's resulting
+Blender materials and per-polygon `material_index` assignment are checked
+against an independently-reparsed `InstancedScene.gltf_materials` (not
+just "some material got created") — `capilla_quiroz_v17.skp` alone
+produces 13 distinct materials, including two translucent ones (alpha
+0.5/0.7), correctly assigned per-face rather than defaulting to one color
+for the whole object.
 
 Export was round-tripped through OpenSKP's own independent reader (not
 this addon) — a 2m cube at a known world position exported and re-parsed

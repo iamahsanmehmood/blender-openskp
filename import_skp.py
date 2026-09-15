@@ -46,6 +46,19 @@ user reported as "cannot access Edit Mode" (github#3), traced to there
 being no way to even select the right object in the first place (the
 source collections were entirely unlinked before this), not a limitation
 of Edit Mode itself.
+
+Materials: each mesh resource's per-triangle material_index (resolved by
+openskp's build_instanced_scene() into InstancedScene.gltf_materials, a
+glTF-style pbrMetallicRoughness list - the same resolution already used
+for openskp's other glTF-shaped exports, just never consumed by this
+addon before now) becomes a real Blender Material per unique color/alpha
+combination (Principled BSDF Base Color + Alpha, cached in
+material_cache so repeated colors across definitions share one Material
+datablock), assigned as a mesh material slot with per-polygon
+material_index set to match - so a component with several differently
+colored faces keeps that per-face variation in Blender, not one flat
+color for the whole object. Import only for now; export does not write
+materials back out.
 """
 from __future__ import annotations
 
@@ -82,29 +95,96 @@ def _gltf_matrix_to_blender(m):
     )
 
 
-def _build_mesh_object(name, resource):
+def _get_or_build_material(material_index, gltf_materials, material_cache):
+    """Returns the Blender Material for gltf_materials[material_index],
+    building it exactly once per unique index and caching it for every
+    later mesh that references the same one - openskp's own
+    get_material_index() (instanced_scene.py) already deduplicates by
+    (color, double_sided, texture, transparency) within one file, so the
+    index alone is a valid, stable cache key here.
+
+    Solid colors only for now (this project's v1 materials scope) -
+    baseColorTexture is read from the glTF dict but not applied; a
+    textured material still gets its correct solid baseColorFactor
+    (SketchUp's own paint-bucket color for a textured material, not
+    white), just not the image itself.
+    """
+    if material_index in material_cache:
+        return material_cache[material_index]
+
+    gltf_mat = gltf_materials[material_index] if 0 <= material_index < len(gltf_materials) else {}
+    pbr = gltf_mat.get("pbrMetallicRoughness", {})
+    r, g, b, a = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+
+    mat = bpy.data.materials.new(name=f"openskp_material_{material_index}")
+    mat.use_nodes = True
+    mat.diffuse_color = (r, g, b, a)  # Solid viewport shading / thumbnails
+    if a < 1.0:
+        mat.blend_method = "BLEND"
+
+    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+    if bsdf is not None:
+        # Blender 4.x renamed the alpha-adjacent socket; "Base Color" is
+        # stable across the versions this addon targets (4.2+).
+        bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+        if "Alpha" in bsdf.inputs:
+            bsdf.inputs["Alpha"].default_value = a
+
+    if gltf_mat.get("doubleSided"):
+        mat.use_backface_culling = False
+
+    material_cache[material_index] = mat
+    return mat
+
+
+def _build_mesh_object(name, resource, gltf_materials, material_cache):
     """Builds one Mesh Object (local space, at the origin) from an
     InstancedMeshResource's primitives - already-triangulated, so this is
-    a direct from_pydata() with no triangulation of its own to do."""
+    a direct from_pydata() with no triangulation of its own to do.
+
+    Each primitive is already grouped by a single resolved material (see
+    openskp.instanced_scene.mesh_resource_for's own docstring) - its
+    material_index is used both to pick/build the right Blender Material
+    and to set each of its triangles' own polygon.material_index, so the
+    mesh's material slots and per-face assignment match the source file's
+    own per-face paint, not just one flat color for the whole object.
+    """
     verts = []
     tris = []
+    tri_material_indices = []
+    slot_by_material_index = {}
+    mesh_materials = []
+
     for prim in resource.primitives:
+        if prim.material_index not in slot_by_material_index:
+            slot_by_material_index[prim.material_index] = len(mesh_materials)
+            mesh_materials.append(_get_or_build_material(prim.material_index, gltf_materials, material_cache))
+        slot = slot_by_material_index[prim.material_index]
+
         base = len(verts)
         pos = prim.positions
         for i in range(0, len(pos), 3):
             verts.append((pos[i], pos[i + 1], pos[i + 2]))
         idx = prim.indices
-        for i in range(0, len(idx), 3):
-            tris.append((base + idx[i], base + idx[i + 1], base + idx[i + 2]))
+        tri_count = len(idx) // 3
+        for i in range(tri_count):
+            tris.append((base + idx[i * 3], base + idx[i * 3 + 1], base + idx[i * 3 + 2]))
+            tri_material_indices.append(slot)
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(verts, [], tris)
+    for mat in mesh_materials:
+        mesh.materials.append(mat)
+    for poly, slot in zip(mesh.polygons, tri_material_indices):
+        poly.material_index = slot
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
     return obj
 
 
-def _get_or_build_collection(resource_id, resources_by_id, collection_cache, sources_collection, stats):
+def _get_or_build_collection(
+    resource_id, resources_by_id, collection_cache, sources_collection, gltf_materials, material_cache, stats
+):
     """Returns the Collection holding resource_id's mesh object, building
     it exactly once per unique id and caching it for every later
     placement - the whole point of using build_instanced_scene() over
@@ -129,7 +209,7 @@ def _get_or_build_collection(resource_id, resources_by_id, collection_cache, sou
 
     resource = resources_by_id[resource_id]
     coll = bpy.data.collections.new(resource.definition_name or resource_id)
-    obj = _build_mesh_object(resource.definition_name or resource_id, resource)
+    obj = _build_mesh_object(resource.definition_name or resource_id, resource, gltf_materials, material_cache)
     coll.objects.link(obj)
     sources_collection.children.link(coll)
     collection_cache[resource_id] = coll
@@ -203,6 +283,8 @@ def _place_node(
     curve_collection_cache,
     target_collection,
     sources_collection,
+    gltf_materials,
+    material_cache,
     stats,
 ):
     """Walks one InstancedNode, placing an Empty (collection-instance) for
@@ -218,7 +300,8 @@ def _place_node(
 
     if node.mesh_resource_id is not None:
         coll = _get_or_build_collection(
-            node.mesh_resource_id, resources_by_id, collection_cache, sources_collection, stats
+            node.mesh_resource_id, resources_by_id, collection_cache, sources_collection,
+            gltf_materials, material_cache, stats
         )
         empty = bpy.data.objects.new(node.name or node.mesh_resource_id, None)
         empty.instance_type = "COLLECTION"
@@ -250,6 +333,8 @@ def _place_node(
             curve_collection_cache,
             target_collection,
             sources_collection,
+            gltf_materials,
+            material_cache,
             stats,
         )
 
@@ -285,6 +370,8 @@ def import_skp(filepath, context=None):
     collection_cache = {}
     curve_resources_by_id = {r.id: r for r in getattr(scene, "curve_resources", None) or []}
     curve_collection_cache = {}
+    gltf_materials = getattr(scene, "gltf_materials", None) or []
+    material_cache = {}
     stats = {
         "unique_meshes": 0,
         "placements": 0,
@@ -319,6 +406,8 @@ def import_skp(filepath, context=None):
         curve_collection_cache,
         root_collection,
         sources_collection,
+        gltf_materials,
+        material_cache,
         stats,
     )
     print(
