@@ -1,6 +1,6 @@
 # OpenSKP Import/Export for Blender
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3+-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.html)
 [![Latest release](https://img.shields.io/github/v/release/iamahsanmehmood/blender-openskp?label=release)](https://github.com/iamahsanmehmood/blender-openskp/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/iamahsanmehmood/blender-openskp/total?label=downloads)](https://github.com/iamahsanmehmood/blender-openskp/releases)
 [![GitHub Stars](https://img.shields.io/github/stars/iamahsanmehmood/blender-openskp?style=social)](https://github.com/iamahsanmehmood/blender-openskp)
@@ -12,6 +12,16 @@ installation — pure Python, vendored directly into this addon. Built as a
 standalone [Extension](https://docs.blender.org/manual/en/latest/advanced/extensions/getting_started.html)
 (Blender 4.2+), independent of any one BIM add-on's own codebase — see
 [Why standalone](#why-standalone) below.
+
+This addon's own integration code is GPL-3.0-or-later (required for
+every add-on on the [Blender Extensions Platform](https://extensions.blender.org/)
+- confirmed directly against a real upload, not assumed from the docs
+alone: MIT is rejected outright, no permissive-license option exists for
+an add-on using the `bpy` API). The vendored OpenSKP core underneath
+stays MIT - a permissive license can always be incorporated into a GPL
+project, just not the other way around, so this doesn't affect OpenSKP
+itself or the [FreeCAD addon](https://github.com/iamahsanmehmood/freecad-openskp),
+which both remain MIT.
 
 ## What it does
 
@@ -217,4 +227,7 @@ the PR process. This project follows the
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0-or-later — see [LICENSE](LICENSE). (The vendored OpenSKP core
+under `vendor/openskp/` stays MIT-licensed; see
+[its own repository](https://github.com/iamahsanmehmood/openskp) for
+that license text.)
