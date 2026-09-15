@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "openskp_import_export"
-version = "0.2.2"
+version = "0.2.3"
 name = "OpenSKP Import/Export"
 tagline = "Native SketchUp (.skp) import and export, no SketchUp required"
 maintainer = "Ahsan Mehmood <mail.ahsanmehmood@gmail.com>"
