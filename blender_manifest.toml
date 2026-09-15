@@ -12,8 +12,16 @@ tags = ["Import-Export"]
 
 blender_version_min = "4.2.0"
 
+# The Blender Extensions Platform requires every add-on using the bpy
+# API to be GPL-3.0-or-later specifically, with no exception for a
+# permissive license - confirmed directly against a real upload attempt
+# ("Manifest value error: license for add-ons must be GPL v3.0 or
+# later"), not assumed from the docs alone. This only affects this
+# addon's own thin integration code (import_skp.py/export_skp.py) - the
+# vendored openskp core stays MIT, which GPL-3.0 can freely incorporate
+# (permissive-into-copyleft is one-directional, not the reverse).
 license = [
-  "SPDX:MIT",
+  "SPDX:GPL-3.0-or-later",
 ]
 
 # Only the platforms actually covered by the bundled wheels below -
