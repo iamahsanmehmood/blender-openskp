@@ -18,8 +18,10 @@ found here first. A cube's six faces must each come back as a single
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import export_skp  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _load_addon import _load_module  # noqa: E402
+
+export_skp = _load_module("export_skp")
 
 import bpy  # noqa: E402
 

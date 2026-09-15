@@ -19,8 +19,12 @@ build_instanced_scene() gained curve-resource support.
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import import_skp  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _load_addon import _load_module  # noqa: E402
+
+import_skp = _load_module("import_skp")
+
+import bpy  # noqa: E402
 
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 
@@ -42,7 +46,51 @@ def check(fixture_name):
     expected = EXPECTED.get(fixture_name)
     if expected is not None:
         assert got == expected, f"{fixture_name}: expected {expected}, got {got}"
+    if stats["unique_meshes"]:
+        check_source_geometry_is_discoverable_but_excluded(fixture_name)
     return got
+
+
+def _find_layer_collection(layer_collection, target_collection):
+    if layer_collection.collection == target_collection:
+        return layer_collection
+    for child in layer_collection.children:
+        found = _find_layer_collection(child, target_collection)
+        if found is not None:
+            return found
+    return None
+
+
+def check_source_geometry_is_discoverable_but_excluded(fixture_name):
+    """Regression test for github#3: a placement Empty has no mesh data
+    of its own, so before this fix there was no way to even find - let
+    alone select and Tab-edit - the real master mesh object, since its
+    Collection was never linked anywhere. Checks the fix's two halves:
+    discoverable (linked into the Outliner) but excluded (no duplicate
+    render at the origin) by default. Called from check() itself (not
+    re-importing) - collection names aren't unique across repeat imports
+    of the same file, so a second import here would silently look up a
+    ".001"-suffixed collection instead."""
+    root_name = os.path.splitext(fixture_name)[0]
+    sources_name = f"{root_name} (source geometry)"
+    sources_coll = bpy.data.collections.get(sources_name)
+    assert sources_coll is not None, f"{sources_name} was never created/linked"
+
+    layer_coll = _find_layer_collection(bpy.context.view_layer.layer_collection, sources_coll)
+    assert layer_coll is not None, f"{sources_name} is not reachable from the View Layer at all"
+    assert layer_coll.exclude, f"{sources_name} should be excluded by default"
+
+    # Every master object should be inside it (directly or via a nested
+    # per-definition collection), reachable via Outliner navigation, and
+    # NOT part of the active view layer's evaluated set while excluded.
+    all_source_objects = {o.name for c in sources_coll.children for o in c.objects}
+    assert all_source_objects, f"{sources_name} has no source objects at all"
+    evaluated = {o.name for o in bpy.context.view_layer.objects}
+    assert not (all_source_objects & evaluated), (
+        "source objects must not be part of the evaluated view layer while excluded "
+        f"(would render duplicated at the origin): {all_source_objects & evaluated}"
+    )
+    print(f"{fixture_name}: {len(all_source_objects)} source objects discoverable and excluded - OK")
 
 
 def main():
@@ -54,7 +102,7 @@ def main():
     assert checked == len(EXPECTED), (
         f"expected to check {len(EXPECTED)} fixtures, found {checked} .skp files in {FIXTURES_DIR}"
     )
-    print("test_import: all fixtures OK")
+    print("test_import: all fixtures OK (including source-geometry discoverability)")
 
 
 if __name__ == "__main__":

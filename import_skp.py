@@ -27,19 +27,33 @@ curve_resource_id at once. Found missing by testing this importer against
 a real structural-framing file (93 of 145 definitions were entirely or
 partly loose-edge, silently invisible before openskp gained
 InstancedCurveResource support).
+
+Editing the source geometry: every unique definition's master mesh/curve
+object lives in its own Collection, all gathered under one
+"<filename> (source geometry)" Collection which is excluded from the View
+Layer (Collection.children + a LayerCollection.exclude = True, found via
+_find_layer_collection) - kept out of the viewport/render at its
+local-space origin, where it would otherwise show up duplicated on top of
+the real, placed instances, while staying visible and selectable in the
+Outliner. This is the same pattern Blender's own manual recommends for a
+source/library collection feeding instances. To edit one: find it under
+that collection in the Outliner, enable its checkbox (un-excluding it),
+select the object, Tab into Edit Mode as normal - the edit affects every
+placement at once, matching how SketchUp's own components behave.
+Selecting a visible placement Empty and pressing Tab does nothing on its
+own (an Empty has no mesh data of its own to edit) - this is what a real
+user reported as "cannot access Edit Mode" (github#3), traced to there
+being no way to even select the right object in the first place (the
+source collections were entirely unlinked before this), not a limitation
+of Edit Mode itself.
 """
 from __future__ import annotations
 
 import os
-import sys
 import time
 
 import bpy
 import mathutils
-
-_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-if _VENDOR_DIR not in sys.path:
-    sys.path.insert(0, _VENDOR_DIR)
 
 # glTF Y-up -> Blender Z-up: (x, y, z) -> (x, -z, y). Same convention
 # openskp's own scene.py/instanced_scene.py already document for their
@@ -90,11 +104,26 @@ def _build_mesh_object(name, resource):
     return obj
 
 
-def _get_or_build_collection(resource_id, resources_by_id, collection_cache, stats):
+def _get_or_build_collection(resource_id, resources_by_id, collection_cache, sources_collection, stats):
     """Returns the Collection holding resource_id's mesh object, building
     it exactly once per unique id and caching it for every later
     placement - the whole point of using build_instanced_scene() over
-    build_scene()."""
+    build_scene().
+
+    Linked as a child of sources_collection - which import_skp() excludes
+    from the View Layer - rather than left unlinked. An unlinked
+    Collection is invisible to Blender's own Outliner in its default View
+    Layer display mode, so the master mesh object (the only thing with
+    real, editable geometry - every visible placement is a Collection-
+    Instance Empty, which has none) was undiscoverable through the normal
+    workflow entirely: found reported as "selecting an object doesn't
+    allow Edit Mode" (github#3), traced to there being no way to even
+    select the right object in the first place, not a limitation of Edit
+    Mode itself. Excluding rather than fully linking keeps the source
+    geometry out of the viewport/render at its local-space origin (where
+    it would otherwise show up duplicated), while keeping it selectable
+    in the Outliner - the same pattern Blender's own manual recommends
+    for library/source collections feeding instances."""
     if resource_id in collection_cache:
         return collection_cache[resource_id]
 
@@ -102,6 +131,7 @@ def _get_or_build_collection(resource_id, resources_by_id, collection_cache, sta
     coll = bpy.data.collections.new(resource.definition_name or resource_id)
     obj = _build_mesh_object(resource.definition_name or resource_id, resource)
     coll.objects.link(obj)
+    sources_collection.children.link(coll)
     collection_cache[resource_id] = coll
     stats["unique_meshes"] += 1
     stats["triangles"] += sum(len(p.indices) // 3 for p in resource.primitives)
@@ -140,12 +170,15 @@ def _build_curve_object(name, resource):
     return obj
 
 
-def _get_or_build_curve_collection(resource_id, curve_resources_by_id, curve_collection_cache, stats):
+def _get_or_build_curve_collection(
+    resource_id, curve_resources_by_id, curve_collection_cache, sources_collection, stats
+):
     """Returns the Collection holding resource_id's loose-edge object,
     building it exactly once per unique id - same caching strategy as
-    _get_or_build_collection, independent cache/id space since a node can
-    carry a mesh_resource_id, a curve_resource_id, or both (a definition
-    can have faces AND loose edges at once)."""
+    _get_or_build_collection (including linking into sources_collection
+    for the same Outliner-discoverability reason), independent cache/id
+    space since a node can carry a mesh_resource_id, a curve_resource_id,
+    or both (a definition can have faces AND loose edges at once)."""
     if resource_id in curve_collection_cache:
         return curve_collection_cache[resource_id]
 
@@ -154,6 +187,7 @@ def _get_or_build_curve_collection(resource_id, curve_resources_by_id, curve_col
     coll = bpy.data.collections.new(name)
     obj = _build_curve_object(name, resource)
     coll.objects.link(obj)
+    sources_collection.children.link(coll)
     curve_collection_cache[resource_id] = coll
     stats["unique_curve_meshes"] += 1
     stats["curve_runs"] += len(resource.curves)
@@ -168,6 +202,7 @@ def _place_node(
     curve_resources_by_id,
     curve_collection_cache,
     target_collection,
+    sources_collection,
     stats,
 ):
     """Walks one InstancedNode, placing an Empty (collection-instance) for
@@ -182,7 +217,9 @@ def _place_node(
     world_matrix = parent_matrix @ local_matrix
 
     if node.mesh_resource_id is not None:
-        coll = _get_or_build_collection(node.mesh_resource_id, resources_by_id, collection_cache, stats)
+        coll = _get_or_build_collection(
+            node.mesh_resource_id, resources_by_id, collection_cache, sources_collection, stats
+        )
         empty = bpy.data.objects.new(node.name or node.mesh_resource_id, None)
         empty.instance_type = "COLLECTION"
         empty.instance_collection = coll
@@ -192,7 +229,7 @@ def _place_node(
 
     if node.curve_resource_id is not None:
         curve_coll = _get_or_build_curve_collection(
-            node.curve_resource_id, curve_resources_by_id, curve_collection_cache, stats
+            node.curve_resource_id, curve_resources_by_id, curve_collection_cache, sources_collection, stats
         )
         curve_empty = bpy.data.objects.new(
             (node.name or node.curve_resource_id) + " (lines)", None
@@ -212,14 +249,29 @@ def _place_node(
             curve_resources_by_id,
             curve_collection_cache,
             target_collection,
+            sources_collection,
             stats,
         )
+
+
+def _find_layer_collection(layer_collection, target_collection):
+    """Finds the LayerCollection wrapping target_collection, searching
+    from layer_collection downward - needed to set .exclude on a
+    just-linked Collection, since that flag lives on the View Layer's own
+    parallel LayerCollection tree, not on the Collection datablock itself."""
+    if layer_collection.collection == target_collection:
+        return layer_collection
+    for child in layer_collection.children:
+        found = _find_layer_collection(child, target_collection)
+        if found is not None:
+            return found
+    return None
 
 
 def import_skp(filepath, context=None):
     """Imports a .skp file into the current (or given) Blender context's
     scene, returning a stats dict."""
-    import openskp
+    from .vendor import openskp
 
     context = context or bpy.context
 
@@ -246,6 +298,17 @@ def import_skp(filepath, context=None):
     root_collection = bpy.data.collections.new(root_name)
     context.scene.collection.children.link(root_collection)
 
+    # Every unique definition's master mesh/curve object lives in its own
+    # Collection here, not directly in the viewport - each is linked as a
+    # child of THIS collection, which is then excluded from the View
+    # Layer (see _find_layer_collection below): kept out of the
+    # viewport/render at its local-space origin (where it would otherwise
+    # show up duplicated alongside the real, placed instances), while
+    # staying visible and selectable in the Outliner - the standard
+    # Blender pattern for a source/library collection feeding instances.
+    sources_collection = bpy.data.collections.new(f"{root_name} (source geometry)")
+    root_collection.children.link(sources_collection)
+
     t0 = time.time()
     _place_node(
         scene.scene_hierarchy,
@@ -255,6 +318,7 @@ def import_skp(filepath, context=None):
         curve_resources_by_id,
         curve_collection_cache,
         root_collection,
+        sources_collection,
         stats,
     )
     print(
@@ -264,4 +328,9 @@ def import_skp(filepath, context=None):
         f"({stats['curve_runs']} runs), {stats['curve_placements']} placed "
         f"in {time.time() - t0:.1f}s"
     )
+
+    layer_coll = _find_layer_collection(context.view_layer.layer_collection, sources_collection)
+    if layer_coll is not None:
+        layer_coll.exclude = True
+
     return stats

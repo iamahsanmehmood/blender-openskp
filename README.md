@@ -41,6 +41,22 @@ visibility, and no hole reconstruction on export (Blender's mesh polygons
 have no native "outer boundary + holes" concept to read one back from,
 unlike a real B-rep). Geometry only, for now.
 
+**Editing imported geometry:** what you see placed in the viewport is a
+Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
+on its own (an Empty has no mesh data of its own to edit). The real,
+editable master mesh for every unique definition lives in the Outliner
+under **`<filename> (source geometry)`**, deliberately excluded from the
+View Layer (so it doesn't render duplicated at the origin) — enable that
+collection's checkbox, select the object inside it, then Tab as normal.
+Editing it updates every placement at once, matching how SketchUp's own
+components behave.
+
+**Exporting imported geometry back out:** select the *master* objects
+under `<filename> (source geometry)` (not the placement Empties, which
+`export_skp.py`'s `type == 'MESH'` filter skips) — otherwise the export
+operator falls back to "every visible mesh in the scene," which won't be
+what you expect.
+
 ## Why standalone
 
 Raised directly in [IfcOpenShell/IfcOpenShell#9481](https://github.com/IfcOpenShell/IfcOpenShell/issues/9481)

@@ -30,13 +30,6 @@ of the FreeCAD addon's own exporter.
 """
 from __future__ import annotations
 
-import os
-import sys
-
-_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-if _VENDOR_DIR not in sys.path:
-    sys.path.insert(0, _VENDOR_DIR)
-
 # 1 inch = 0.0254 m exactly - SketchUp's native unit is inches, Blender's is
 # metres (both are Z-up, so no axis swap is needed here - only the import
 # side's glTF-Y-up InstancedScene API needed one).
@@ -113,7 +106,7 @@ def _export_object(builder, obj, stats):
 def export_skp(filepath, context):
     """Exports selected (or all visible) mesh objects to a new .skp file
     at filepath, returning a stats dict."""
-    from openskp import create
+    from .vendor.openskp import create
 
     objs = [o for o in context.selected_objects if o.type == "MESH"]
     if not objs:
