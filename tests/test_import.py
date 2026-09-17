@@ -21,8 +21,9 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _load_addon import _load_module  # noqa: E402
+from _load_addon import _load_module, ensure_openskp_importable  # noqa: E402
 
+ensure_openskp_importable()
 import_skp = _load_module("import_skp")
 
 import bpy  # noqa: E402
@@ -133,9 +134,7 @@ def check_materials_match_gltf_materials(fixture_name, new_objects):
     fixture's own object gets auto-suffixed ".001" by Blender for
     colliding with it (confirmed directly: this is exactly what happened
     before new_objects was threaded through here)."""
-    vendor_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor")
-    if vendor_dir not in sys.path:
-        sys.path.insert(0, vendor_dir)
+    ensure_openskp_importable()
     import openskp
 
     path = os.path.join(FIXTURES_DIR, fixture_name)

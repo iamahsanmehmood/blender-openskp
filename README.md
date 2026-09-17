@@ -8,8 +8,8 @@
 Native SketchUp (`.skp`) import **and export** for Blender — built on
 [OpenSKP](https://github.com/iamahsanmehmood/openskp), an MIT-licensed,
 from-scratch `.skp` reader/writer. No Trimble SDK, no SketchUp
-installation — pure Python, vendored directly into this addon. Built as a
-standalone [Extension](https://docs.blender.org/manual/en/latest/advanced/extensions/getting_started.html)
+installation — pure Python, bundled as a wheel directly into this addon.
+Built as a standalone [Extension](https://docs.blender.org/manual/en/latest/advanced/extensions/getting_started.html)
 (Blender 4.2+), independent of any one BIM add-on's own codebase — see
 [Why standalone](#why-standalone) below.
 
@@ -17,7 +17,7 @@ This addon's own integration code is GPL-3.0-or-later (required for
 every add-on on the [Blender Extensions Platform](https://extensions.blender.org/)
 - confirmed directly against a real upload, not assumed from the docs
 alone: MIT is rejected outright, no permissive-license option exists for
-an add-on using the `bpy` API). The vendored OpenSKP core underneath
+an add-on using the `bpy` API). The bundled OpenSKP wheel underneath
 stays MIT - a permissive license can always be incorporated into a GPL
 project, just not the other way around, so this doesn't affect OpenSKP
 itself or the [FreeCAD addon](https://github.com/iamahsanmehmood/freecad-openskp),
@@ -227,7 +227,7 @@ the PR process. This project follows the
 
 ## License
 
-GPL-3.0-or-later — see [LICENSE](LICENSE). (The vendored OpenSKP core
-under `vendor/openskp/` stays MIT-licensed; see
+GPL-3.0-or-later — see [LICENSE](LICENSE). (The bundled OpenSKP wheel
+under `wheels/` stays MIT-licensed; see
 [its own repository](https://github.com/iamahsanmehmood/openskp) for
 that license text.)
