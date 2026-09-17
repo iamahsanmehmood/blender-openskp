@@ -493,7 +493,7 @@ def _find_layer_collection(layer_collection, target_collection):
 def import_skp(filepath, context=None):
     """Imports a .skp file into the current (or given) Blender context's
     scene, returning a stats dict."""
-    from .vendor import openskp
+    import openskp
 
     context = context or bpy.context
 

@@ -18,11 +18,11 @@ APIs and can only be exercised inside Blender's own Python environment.
 git clone https://github.com/iamahsanmehmood/blender-openskp.git
 ```
 
-The `vendor/openskp/` directory is a vendored copy of the pure-Python
-[OpenSKP](https://github.com/iamahsanmehmood/openskp) package. It needs
-three small dependencies (`mapbox_earcut`, `shapely`, `defusedxml`) that
-aren't bundled with Blender. A real end user gets these for free - they
-ship as [Python wheels](https://docs.blender.org/manual/en/latest/advanced/extensions/python_wheels.html)
+This addon is built on the pure-Python
+[OpenSKP](https://github.com/iamahsanmehmood/openskp) package, plus three
+small dependencies of its own (`mapbox_earcut`, `shapely`, `defusedxml`)
+that aren't bundled with Blender. A real end user gets all of these for
+free - they ship as [Python wheels](https://docs.blender.org/manual/en/latest/advanced/extensions/python_wheels.html)
 in `wheels/` and are declared in `blender_manifest.toml`, so Blender's own
 extension installer sets them up automatically. **That auto-install only
 happens for a properly *installed* extension**, though - running straight
@@ -31,7 +31,7 @@ bypasses that, so install them into Blender's own embedded interpreter
 yourself, not your system Python:
 
 ```bash
-"<path to Blender>/<version>/python/bin/python.exe" -m pip install --target "<Blender addon-modules path>" mapbox_earcut shapely defusedxml
+"<path to Blender>/<version>/python/bin/python.exe" -m pip install --target "<Blender addon-modules path>" openskp mapbox_earcut shapely defusedxml
 ```
 
 Where the addon-modules path is the one Blender itself already has on

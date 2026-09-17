@@ -18,7 +18,7 @@ blender_version_min = "4.2.0"
 # ("Manifest value error: license for add-ons must be GPL v3.0 or
 # later"), not assumed from the docs alone. This only affects this
 # addon's own thin integration code (import_skp.py/export_skp.py) - the
-# vendored openskp core stays MIT, which GPL-3.0 can freely incorporate
+# bundled openskp wheel stays MIT, which GPL-3.0 can freely incorporate
 # (permissive-into-copyleft is one-directional, not the reverse).
 license = [
   "SPDX:GPL-3.0-or-later",
@@ -30,25 +30,30 @@ license = [
 # Linux ARM).
 platforms = ["windows-x64", "macos-x64", "macos-arm64", "linux-x64"]
 
-# The vendored openskp package needs these to even import - mapbox_earcut
-# and numpy are eager imports in _core.py, defusedxml is imported at
-# parse time. numpy already ships with Blender itself; these three don't.
-# Bundled as wheels (rather than requiring a manual pip install into
-# Blender's own embedded interpreter, which - confirmed directly, not
-# assumed - runs with user-site-packages disabled, so a plain `pip
+# openskp itself, plus the libraries it needs to even import -
+# mapbox_earcut and numpy are eager imports in _core.py, defusedxml is
+# imported at parse time. numpy already ships with Blender itself; these
+# don't. Bundled as wheels (rather than requiring a manual pip install
+# into Blender's own embedded interpreter, which - confirmed directly,
+# not assumed - runs with user-site-packages disabled, so a plain `pip
 # install` silently never reaches it) so the addon works standalone,
 # offline, right after installing the extension - no separate step.
+# openskp is pure Python, so it only needs a single universal wheel
+# (py3-none-any), same as defusedxml below - unlike mapbox_earcut and
+# shapely, which compile native extensions and need one wheel per
+# Python ABI/OS combination.
 #
-# Both cp311 AND cp313 builds of each wheel are listed - Blender's own
-# bundled Python version isn't fixed across its release line: 4.2-4.5
-# bundle 3.11, but 5.1+ (including the current 5.2 LTS) moved to 3.13.
-# Missing this the first time round produced a real, reported bug: a
-# user on Blender 5.2.1 got "This Python version (3.13) isn't compatible
-# with (3.11)" and the extension refused to install at all (github#1) -
-# Blender's installer picks whichever bundled wheel's tag matches its own
-# interpreter, so both need to be present, not just the one this was
-# developed against.
+# Both cp311 AND cp313 builds of each compiled wheel are listed -
+# Blender's own bundled Python version isn't fixed across its release
+# line: 4.2-4.5 bundle 3.11, but 5.1+ (including the current 5.2 LTS)
+# moved to 3.13. Missing this the first time round produced a real,
+# reported bug: a user on Blender 5.2.1 got "This Python version (3.13)
+# isn't compatible with (3.11)" and the extension refused to install at
+# all (github#1) - Blender's installer picks whichever bundled wheel's
+# tag matches its own interpreter, so both need to be present, not just
+# the one this was developed against.
 wheels = [
+  "./wheels/openskp-1.3.0-py3-none-any.whl",
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-win_amd64.whl",
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_11_0_arm64.whl",
   "./wheels/mapbox_earcut-2.1.0-cp311-cp311-macosx_10_13_x86_64.whl",
@@ -70,3 +75,19 @@ wheels = [
 
 [permissions]
 files = "Read the imported .skp file, write the exported .skp file"
+
+# Only files the add-on needs at runtime should ship in the built
+# package - development-only content (tests, screenshots used in
+# docs/PR descriptions, stray local build output) is excluded here
+# rather than relying on manual copying before zipping.
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".git",
+  "*.zip",
+  "tests/",
+  ".screenshots/",
+  "*.md",
+  ".github/",
+  ".gitignore",
+]

@@ -19,8 +19,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _load_addon import _load_module  # noqa: E402
+from _load_addon import _load_module, ensure_openskp_importable  # noqa: E402
 
+ensure_openskp_importable()
 export_skp = _load_module("export_skp")
 
 import bpy  # noqa: E402
@@ -48,9 +49,7 @@ def main():
         "layers_written": 0,
     }, stats
 
-    sys.path.insert(
-        0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor")
-    )
+    ensure_openskp_importable()
     import openskp
 
     model = openskp.SkpFile.open(out_path).parse()

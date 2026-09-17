@@ -200,7 +200,7 @@ def _export_object(builder, obj, stats, layer, material_handles):
 def export_skp(filepath, context):
     """Exports selected (or all visible) mesh objects to a new .skp file
     at filepath, returning a stats dict."""
-    from .vendor.openskp import create
+    from openskp import create
 
     objs = [o for o in context.selected_objects if o.type == "MESH"]
     if not objs:
