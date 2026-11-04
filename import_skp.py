@@ -92,6 +92,7 @@ is available.
 """
 from __future__ import annotations
 
+import importlib
 import os
 import tempfile
 import time
@@ -490,9 +491,35 @@ def _find_layer_collection(layer_collection, target_collection):
     return None
 
 
+# Libraries openskp needs that ship as wheels inside this extension. Blender 4.2.0 to
+# 4.2.3 can install the wrong build of them (see blender_manifest.toml), and openskp
+# only prints a warning and falls back to fan triangulation without mapbox_earcut,
+# which silently fills in every hole and cut-out of a face.
+_BUNDLED_LIBRARIES = ("mapbox_earcut", "shapely")
+
+
+def check_bundled_libraries():
+    """Raises RuntimeError, with something the user can act on, when a library
+    bundled with this extension cannot be imported."""
+    failed = []
+    for name in _BUNDLED_LIBRARIES:
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            failed.append(f"{name} ({exc})")
+    if failed:
+        raise RuntimeError(
+            "a library bundled with this add-on could not be loaded: "
+            + "; ".join(failed)
+            + ". This usually means Blender is older than 4.2.4, which installs the wrong "
+            "build of bundled libraries: update Blender, then reinstall the add-on."
+        )
+
+
 def import_skp(filepath, context=None):
     """Imports a .skp file into the current (or given) Blender context's
     scene, returning a stats dict."""
+    check_bundled_libraries()
     import openskp
 
     context = context or bpy.context

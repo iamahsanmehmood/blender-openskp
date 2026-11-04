@@ -326,7 +326,35 @@ def check_textures(fixture_name, new_objects):
     )
 
 
+def check_missing_bundled_library_is_a_clear_error():
+    """A bundled library that cannot be imported (what Blender 4.2.0-4.2.3 causes by
+    installing the cp313 wheel into Python 3.11) stops the import with an actionable
+    message, instead of openskp falling back to fan triangulation and importing
+    meshes with their holes filled in."""
+    import_skp.check_bundled_libraries()  # fine when everything loads
+    saved = sys.modules.get("mapbox_earcut")
+    sys.modules["mapbox_earcut"] = None  # makes `import mapbox_earcut` raise ImportError
+    try:
+        for call in (
+            import_skp.check_bundled_libraries,
+            lambda: import_skp.import_skp(os.path.join(FIXTURES_DIR, "SU_File.skp")),
+        ):
+            try:
+                call()
+            except RuntimeError as exc:
+                assert "mapbox_earcut" in str(exc) and "4.2.4" in str(exc), str(exc)
+            else:
+                raise AssertionError("expected a RuntimeError naming mapbox_earcut and Blender 4.2.4")
+    finally:
+        if saved is None:
+            del sys.modules["mapbox_earcut"]
+        else:
+            sys.modules["mapbox_earcut"] = saved
+    print("missing bundled library: clear error naming it and Blender 4.2.4 - OK")
+
+
 def main():
+    check_missing_bundled_library_is_a_clear_error()
     checked = 0
     for name in os.listdir(FIXTURES_DIR):
         if name.endswith(".skp"):

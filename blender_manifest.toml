@@ -10,7 +10,13 @@ type = "add-on"
 website = "https://github.com/iamahsanmehmood/blender-openskp"
 tags = ["Import-Export"]
 
-blender_version_min = "4.2.0"
+# 4.2.4, not 4.2.0: Blender 4.2.0 to 4.2.3 do not filter bundled wheels by Python
+# version (added in 4.2.4, Blender's cfc10b023), and de-duplicate wheels by package
+# name keeping the lexicographically LAST file name. With both a cp311 and a cp313
+# build of mapbox_earcut and shapely listed below, they keep the cp313 builds, which
+# Python 3.11 cannot import: "No module named 'mapbox_earcut._core'", and a mesh with
+# no holes cut (github#9). Blender 4.2.4 and every later release install the right one.
+blender_version_min = "4.2.4"
 
 # The Blender Extensions Platform requires every add-on using the bpy
 # API to be GPL-3.0-or-later specifically, with no exception for a

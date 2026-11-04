@@ -10,7 +10,7 @@ Native SketchUp (`.skp`) import **and export** for Blender — built on
 from-scratch `.skp` reader/writer. No Trimble SDK, no SketchUp
 installation — pure Python, bundled as a wheel directly into this addon.
 Built as a standalone [Extension](https://docs.blender.org/manual/en/latest/advanced/extensions/getting_started.html)
-(Blender 4.2+), independent of any one BIM add-on's own codebase — see
+(Blender 4.2.4+), independent of any one BIM add-on's own codebase — see
 [Why standalone](#why-standalone) below.
 
 This addon's own integration code is GPL-3.0-or-later (required for
