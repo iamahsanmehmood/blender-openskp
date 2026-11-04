@@ -75,6 +75,30 @@ object. Reuses OpenSKP's own glTF-style material resolution
 (`InstancedScene.gltf_materials` / `LocalPrimitive.material_index`) rather
 than reimplementing SketchUp's material-inheritance rules here.
 
+- **Names**: each Blender material is named after its SketchUp material
+  (with OpenSKP 1.6+; older versions give `openskp_material_N`).
+- **Colours** are converted from SketchUp's sRGB to Blender's scene-linear
+  values (and back on export), so a grey looks the same grey as in
+  SketchUp instead of much lighter.
+- **Front and back paint**: a face painted differently on its two sides
+  is imported as two single-sided copies, each invisible from behind
+  (backface culling in the viewport and EEVEE, a Backfacing mix for
+  Cycles), so the side you look at shows its own paint — not whichever
+  copy happened to win on the shared plane.
+- **Colorized textures** (SketchUp's `[Name]1` copies of a texture
+  recoloured in the Materials panel) are re-tinted toward their colour
+  with a Mix node labelled "SketchUp colorize" — an approximation of
+  SketchUp's own hue shift / tint, close on wood and fabric.
+
+**Hierarchy**: with *Keep SketchUp Hierarchy* (on by default in the import
+dialog), SketchUp's own groups and components are kept as a tree of
+parented Empties named after them, so the Outliner shows SketchUp's tree:
+selecting, moving or hiding (Shift-click the eye) a whole sofa or person is
+one step instead of one per part. Each placement also carries its
+definition name (`sketchup_definition`) and instance GUID
+(`sketchup_guid`) as custom properties. Switch it off for the previous
+flat result, every placement at the top level.
+
 **Textured materials** (import only) carry over too: each mesh's own UV
 coordinates (already resolved by openskp per vertex, previously unread by
 this addon) land in a real UV layer, and a material with an image texture

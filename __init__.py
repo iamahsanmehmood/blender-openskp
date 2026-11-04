@@ -5,7 +5,7 @@ Registers File > Import > SketchUp (.skp) and File > Export > SketchUp
 this file only wires them into Blender's operator/menu system.
 """
 import bpy
-from bpy.props import StringProperty
+from bpy.props import BoolProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 
@@ -17,12 +17,20 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".skp"
     filter_glob: StringProperty(default="*.skp", options={"HIDDEN"})
+    keep_hierarchy: BoolProperty(
+        name="Keep SketchUp Hierarchy",
+        description=(
+            "Keep SketchUp's groups and components as a tree of parented Empties, "
+            "instead of placing every part at the top level"
+        ),
+        default=True,
+    )
 
     def execute(self, context):
         from . import import_skp
 
         try:
-            stats = import_skp.import_skp(self.filepath, context)
+            stats = import_skp.import_skp(self.filepath, context, keep_hierarchy=self.keep_hierarchy)
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             self.report({"ERROR"}, f"OpenSKP import failed: {exc}")
             return {"CANCELLED"}
