@@ -127,13 +127,19 @@ def _object_layer_name(obj, scene_collection):
     return None
 
 
+def _linear_to_srgb(c):
+    return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+
+
 def _material_rgba_opacity(mat):
     """A Material's solid display color as openskp's writer wants it:
     (r, g, b) ints 0-255, plus a separate 0.0-1.0 opacity (`None` when
     fully opaque, matching add_material's own "untouched" default rather
-    than forcing every material through the transparency code path)."""
+    than forcing every material through the transparency code path).
+    ``diffuse_color`` is scene-linear and SketchUp colours are sRGB, so it
+    is converted on the way out (the importer converts the other way)."""
     r, g, b, a = mat.diffuse_color
-    rgba = tuple(round(c * 255) for c in (r, g, b))
+    rgba = tuple(round(_linear_to_srgb(min(max(c, 0.0), 1.0)) * 255) for c in (r, g, b))
     opacity = None if a >= 0.999 else float(a)
     return rgba, opacity
 

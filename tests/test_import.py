@@ -73,6 +73,7 @@ def check(fixture_name):
         check_materials_match_gltf_materials(fixture_name, new_objects)
         check_layer_collection(fixture_name)
         check_textures(fixture_name, new_objects)
+        check_material_names_and_sides(fixture_name, new_objects)
     return got
 
 
@@ -174,7 +175,8 @@ def check_materials_match_gltf_materials(fixture_name, new_objects):
         expected_indices = []
         for prim in resource.primitives:
             pbr = scene.gltf_materials[prim.material_index].get("pbrMetallicRoughness", {})
-            color = tuple(round(c, 3) for c in pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0]))
+            r, g, b, a = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+            color = tuple(round(c, 3) for c in (*import_skp.srgb_to_linear((r, g, b)), a))
             expected_colors.append(color)
             expected_indices.extend([len(expected_colors) - 1] * (len(prim.indices) // 3))
 
@@ -298,8 +300,8 @@ def check_textures(fixture_name, new_objects):
             texture_index = pbr["baseColorTexture"]["index"]
             expected_size = expected_pixel_size(textures[texture_index].data)
 
-            bl_mat = bpy.data.materials.get(f"openskp_material_{material_index}")
-            assert bl_mat is not None, f"{fixture_name}: no Blender material named openskp_material_{material_index}"
+            bl_mat = _material_for_index(obj, material_index)
+            assert bl_mat is not None, f"{fixture_name}/{obj_name}: no Blender material for gltf material {material_index}"
             tex_nodes = [n for n in bl_mat.node_tree.nodes if n.type == "TEX_IMAGE"]
             assert len(tex_nodes) == 1, (
                 f"{fixture_name}/{bl_mat.name}: expected exactly 1 Image Texture node, got {len(tex_nodes)}"
@@ -324,6 +326,80 @@ def check_textures(fixture_name, new_objects):
         f"{fixture_name}: {len(image_by_texture_index)} textures correctly wired "
         f"(matching pixel sizes, deduplicated) - OK"
     )
+
+
+def _material_for_index(obj, material_index):
+    return next(
+        (m for m in obj.data.materials if m.get("openskp_material_index") == material_index), None
+    )
+
+
+def check_material_names_and_sides(fixture_name, new_objects):
+    """Every Blender material is named after its SketchUp material when
+    openskp provides one (openskp 1.6+), and a single-sided material - one
+    side of a face whose two sides are painted differently, emitted twice on
+    the same plane - is invisible from behind, so the other side's copy is
+    the one that shows (backface culling for the viewport/EEVEE, a
+    Backfacing mix for Cycles). Double-sided materials stay visible from
+    both sides."""
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    scene = openskp.SkpFile.open(path).build_instanced_scene()
+    seen = {}
+    for obj in new_objects:
+        if obj.type != "MESH" or obj.data is None:
+            continue
+        for mat in obj.data.materials:
+            seen[mat.get("openskp_material_index")] = mat
+    assert seen, f"{fixture_name}: no imported materials"
+    named = 0
+    for index, mat in seen.items():
+        gltf = scene.gltf_materials[index]
+        base_name = re.sub(r"\.\d{3}$", "", mat.name)
+        assert base_name == (gltf.get("name") or f"openskp_material_{index}"), (
+            f"{fixture_name}: material {index} named {mat.name!r}, expected {gltf.get('name')!r}"
+        )
+        named += bool(gltf.get("name"))
+        hides_back = any(n.type == "NEW_GEOMETRY" for n in mat.node_tree.nodes)
+        if gltf.get("doubleSided"):
+            assert not mat.use_backface_culling and not hides_back, f"{fixture_name}/{mat.name}: double-sided"
+        else:
+            assert mat.use_backface_culling and hides_back, f"{fixture_name}/{mat.name}: back side not hidden"
+            out = next(n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL")
+            assert out.inputs["Surface"].links[0].from_node.type == "MIX_SHADER"
+    print(f"{fixture_name}: {len(seen)} materials ({named} with SketchUp names), back sides correct - OK")
+
+
+def check_colorized_texture_is_tinted():
+    """A colorized material (SketchUp's "[Name]1" copy, openskp's
+    extras.sketchup.colorized) re-tints the shared image toward its own
+    colour, instead of showing the untinted source image."""
+    import openskp
+
+    scene = openskp.SkpFile.open(os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp")).build_instanced_scene()
+    textures = scene.textures
+    gltf_materials = [
+        {
+            "name": f"[Veneer]1 type {colorize_type}",
+            "pbrMetallicRoughness": {"baseColorFactor": [68 / 255, 40 / 255, 21 / 255, 1.0],
+                                     "baseColorTexture": {"index": 0}},
+            "extras": {"sketchup": {"colorized": True, "colorize_type": colorize_type}},
+            "doubleSided": True,
+        }
+        for colorize_type in (0, 1)
+    ]
+    for index, colorize_type in enumerate((0, 1)):
+        mat = import_skp._get_or_build_material(index, gltf_materials, {}, textures, {})
+        nodes = mat.node_tree.nodes
+        bsdf = nodes["Principled BSDF"]
+        tint = bsdf.inputs["Base Color"].links[0].from_node
+        assert tint.type == "MIX" and tint.blend_type == "MULTIPLY", f"{mat.name}: Base Color isn't tinted"
+        feeds = {link.from_node.type for s in tint.inputs if s.type == "RGBA" for link in s.links}
+        assert feeds == ({"TEX_IMAGE"} if colorize_type == 0 else {"RGBTOBW"}), f"{mat.name}: {feeds}"
+        scale = next(s for s in tint.inputs if s.name == "B" and s.type == "RGBA").default_value
+        assert scale[0] > scale[1] > scale[2], f"{mat.name}: tint {tuple(scale)} isn't toward the brown colour"
+    print("colorized texture: re-tinted toward its colour (shift and tint) - OK")
 
 
 def check_missing_bundled_library_is_a_clear_error():
@@ -363,6 +439,7 @@ def main():
     assert checked == len(EXPECTED), (
         f"expected to check {len(EXPECTED)} fixtures, found {checked} .skp files in {FIXTURES_DIR}"
     )
+    check_colorized_texture_is_tinted()
     print("test_import: all fixtures OK (including source-geometry discoverability)")
 
 

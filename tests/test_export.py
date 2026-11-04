@@ -218,7 +218,21 @@ def test_material_export():
     print("test_material_export: OK (red opaque, blue 50% alpha, plain unpainted - all correctly split)")
 
 
+def test_material_colour_round_trips():
+    """Blender colours are scene-linear and SketchUp's are sRGB: the importer
+    converts SketchUp's colour to linear, so the exporter must convert it
+    back - SketchUp's grey (126, 127, 127) leaves Blender as the same grey,
+    not as the much darker (52, 53, 53) a straight *255 gives."""
+    import_skp = _load_module("import_skp")
+    grey = bpy.data.materials.new("Grey")
+    grey.diffuse_color = (*import_skp.srgb_to_linear((126 / 255, 127 / 255, 127 / 255)), 1.0)
+    rgba, opacity = export_skp._material_rgba_opacity(grey)
+    assert rgba == (126, 127, 127) and opacity is None, rgba
+    print("test_material_colour_round_trips: OK (SketchUp grey survives import and export)")
+
+
 if __name__ == "__main__":
     main()
     test_layer_export()
     test_material_export()
+    test_material_colour_round_trips()
