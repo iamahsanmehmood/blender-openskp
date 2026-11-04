@@ -535,15 +535,25 @@ def _place_node(
     textures,
     image_cache,
     stats,
+    keep_hierarchy=False,
+    parent_object=None,
+    is_root=False,
 ):
     """Walks one InstancedNode, placing an Empty (collection-instance) for
     its own mesh_resource_id and/or curve_resource_id (a definition can
     have both - faces AND loose edges at once) at the composed world
     matrix, then recurses into children with that same world matrix as
     their new parent matrix - matrices are relative-to-parent in openskp's
-    own model, composed here into world space for a flat, editable result
-    rather than mirroring the source's exact nesting as Blender parent/
-    child objects.
+    own model, composed here into world space.
+
+    With ``keep_hierarchy`` off, every placement is a top-level object (a
+    flat result). With it on, SketchUp's own group/component nesting is
+    kept as Blender parenting: a group with children becomes an Empty named
+    after it, its own geometry and its child groups parented under it, so
+    the Outliner shows SketchUp's tree and moving, selecting (Select
+    Hierarchy) or hiding (Shift-click the eye) a whole sofa or person is one
+    step, not one per part. A group without children doesn't get an extra
+    Empty: its geometry's placement is parented directly.
 
     Each placement Empty is linked into a Collection for its OWN
     node.layer (SketchUp's "tag"), not a single fixed target - a layer is
@@ -552,7 +562,36 @@ def _place_node(
     so grouping by layer only makes sense here, at the placement level."""
     local_matrix = _gltf_matrix_to_blender(node.matrix)
     world_matrix = parent_matrix @ local_matrix
+    world_bl = _YUP_TO_ZUP @ world_matrix
     sketchup_layer_coll = _get_or_build_layer_collection(node.layer, layer_collection_cache, root_collection)
+
+    def place(obj, parent):
+        """``parent`` is ``(object, its world matrix)`` or None."""
+        sketchup_layer_coll.objects.link(obj)
+        if keep_hierarchy and parent is not None:
+            # matrix_basis is stored as loc/rot/scale and can't hold shear (a
+            # rotated child inside a non-uniformly scaled component); whatever
+            # it drops goes into the parent inverse so the world matrix is exact.
+            local = parent[1].inverted_safe() @ world_bl
+            obj.parent = parent[0]
+            obj.matrix_basis = local
+            obj.matrix_parent_inverse = local @ obj.matrix_basis.inverted_safe()
+        else:
+            obj.matrix_world = world_bl
+        if keep_hierarchy:
+            if node.definition_name:
+                obj["sketchup_definition"] = node.definition_name
+            if getattr(node, "guid", ""):
+                obj["sketchup_guid"] = node.guid
+
+    own_parent = parent_object
+    if keep_hierarchy and node.children and not is_root:
+        group = bpy.data.objects.new(node.name or node.definition_name or "Group", None)
+        group.empty_display_type = "PLAIN_AXES"
+        group.empty_display_size = 0.1
+        place(group, parent_object)
+        own_parent = (group, world_bl)
+        stats["groups"] += 1
 
     if node.mesh_resource_id is not None:
         coll = _get_or_build_collection(
@@ -562,8 +601,7 @@ def _place_node(
         empty = bpy.data.objects.new(node.name or node.mesh_resource_id, None)
         empty.instance_type = "COLLECTION"
         empty.instance_collection = coll
-        empty.matrix_world = _YUP_TO_ZUP @ world_matrix
-        sketchup_layer_coll.objects.link(empty)
+        place(empty, own_parent)
         stats["placements"] += 1
 
     if node.curve_resource_id is not None:
@@ -575,8 +613,7 @@ def _place_node(
         )
         curve_empty.instance_type = "COLLECTION"
         curve_empty.instance_collection = curve_coll
-        curve_empty.matrix_world = _YUP_TO_ZUP @ world_matrix
-        sketchup_layer_coll.objects.link(curve_empty)
+        place(curve_empty, own_parent)
         stats["curve_placements"] += 1
 
     for child in node.children:
@@ -595,6 +632,8 @@ def _place_node(
             textures,
             image_cache,
             stats,
+            keep_hierarchy,
+            own_parent,
         )
 
 
@@ -637,9 +676,10 @@ def check_bundled_libraries():
         )
 
 
-def import_skp(filepath, context=None):
+def import_skp(filepath, context=None, keep_hierarchy=False):
     """Imports a .skp file into the current (or given) Blender context's
-    scene, returning a stats dict."""
+    scene, returning a stats dict. ``keep_hierarchy`` keeps SketchUp's
+    group/component nesting as parented Empties (see _place_node)."""
     check_bundled_libraries()
     import openskp
 
@@ -668,6 +708,7 @@ def import_skp(filepath, context=None):
         "unique_curve_meshes": 0,
         "curve_placements": 0,
         "curve_runs": 0,
+        "groups": 0,
     }
 
     root_name = os.path.splitext(os.path.basename(filepath))[0]
@@ -701,6 +742,8 @@ def import_skp(filepath, context=None):
         textures,
         image_cache,
         stats,
+        keep_hierarchy,
+        is_root=True,
     )
     stats["textures_loaded"] = len(image_cache)
     print(

@@ -90,6 +90,15 @@ than reimplementing SketchUp's material-inheritance rules here.
   with a Mix node labelled "SketchUp colorize" — an approximation of
   SketchUp's own hue shift / tint, close on wood and fabric.
 
+**Hierarchy**: with *Keep SketchUp Hierarchy* (on by default in the import
+dialog), SketchUp's own groups and components are kept as a tree of
+parented Empties named after them, so the Outliner shows SketchUp's tree:
+selecting, moving or hiding (Shift-click the eye) a whole sofa or person is
+one step instead of one per part. Each placement also carries its
+definition name (`sketchup_definition`) and instance GUID
+(`sketchup_guid`) as custom properties. Switch it off for the previous
+flat result, every placement at the top level.
+
 **Textured materials** (import only) carry over too: each mesh's own UV
 coordinates (already resolved by openskp per vertex, previously unread by
 this addon) land in a real UV layer, and a material with an image texture

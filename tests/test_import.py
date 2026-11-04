@@ -42,6 +42,8 @@ FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture
 EXPECTED = {
     "SU_File.skp": (1, 1, 104, 0, 0, 0, 1, 0, 0),
     "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0, 3),
+    # OpenSKP's own nesting fixture: groups Outer > Shelf > Inner, each with faces.
+    "nesting_2021.skp": (3, 3, 6, 0, 0, 0, 1, 0, 0),
 }
 
 
@@ -402,6 +404,54 @@ def check_colorized_texture_is_tinted():
     print("colorized texture: re-tinted toward its colour (shift and tint) - OK")
 
 
+def _world_matrices(objects):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    return sorted(
+        tuple(round(v, 4) for row in o.evaluated_get(depsgraph).matrix_world for v in row)
+        for o in objects if o.instance_type == "COLLECTION"
+    )
+
+
+def check_hierarchy(fixture_name, expected_groups):
+    """keep_hierarchy keeps SketchUp's nesting as parented Empties without
+    moving anything: the same placements end up at the same world matrices
+    as the flat import, and every placement inside a group is parented
+    under it."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    before = set(bpy.data.objects)
+    flat_stats = import_skp.import_skp(path)
+    flat = set(bpy.data.objects) - before
+    before = set(bpy.data.objects)
+    stats = import_skp.import_skp(path, keep_hierarchy=True)
+    nested = set(bpy.data.objects) - before
+
+    assert stats["placements"] == flat_stats["placements"]
+    assert stats["groups"] == expected_groups, f"{fixture_name}: {stats['groups']} groups, expected {expected_groups}"
+    assert _world_matrices(nested) == _world_matrices(flat), f"{fixture_name}: hierarchy moved placements"
+    parented = [o for o in nested if o.parent is not None]
+    if expected_groups:
+        assert parented, f"{fixture_name}: nothing parented"
+        assert all(o.parent in nested and o.parent.instance_type == "NONE" for o in parented)
+    print(f"{fixture_name}: hierarchy kept ({stats['groups']} groups, {len(parented)} parented), "
+          "same world placements as flat - OK")
+    return nested
+
+
+def check_nesting_tree():
+    """nesting_2021.skp: groups Outer > Shelf > Inner, each with its own faces."""
+    nested = check_hierarchy("nesting_2021.skp", expected_groups=2)
+    by_name = {re.sub(r"\.\d{3}$", "", o.name): o for o in nested if o.type == "EMPTY"}
+    groups = [o for o in nested if o.type == "EMPTY" and o.instance_type == "NONE"]
+    outer_group = next(o for o in groups if o.parent is None)
+    shelf_group = next(o for o in groups if o.parent == outer_group)
+    assert re.sub(r"\.\d{3}$", "", outer_group.name) == "Outer"
+    assert re.sub(r"\.\d{3}$", "", shelf_group.name) == "Shelf"
+    inner = by_name["Inner"]
+    assert inner.parent == shelf_group and inner.instance_type == "COLLECTION"
+    assert inner["sketchup_definition"] == "Group"
+    print("nesting_2021.skp: Outliner tree is Outer > Shelf > Inner - OK")
+
+
 def check_missing_bundled_library_is_a_clear_error():
     """A bundled library that cannot be imported (what Blender 4.2.0-4.2.3 causes by
     installing the cp313 wheel into Python 3.11) stops the import with an actionable
@@ -440,6 +490,8 @@ def main():
         f"expected to check {len(EXPECTED)} fixtures, found {checked} .skp files in {FIXTURES_DIR}"
     )
     check_colorized_texture_is_tinted()
+    check_hierarchy("capilla_quiroz_v17.skp", expected_groups=0)
+    check_nesting_tree()
     print("test_import: all fixtures OK (including source-geometry discoverability)")
 
 
