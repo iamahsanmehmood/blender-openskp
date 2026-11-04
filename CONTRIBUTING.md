@@ -9,7 +9,7 @@ This project follows the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md).
 
 ## Getting set up
 
-You need a real Blender install (4.2 or newer - this addon uses the
+You need a real Blender install (4.2.4 or newer - this addon uses the
 current Extension manifest, not the legacy `bl_info` system) - the
 importer/exporter is built against Blender's own `bpy`/`bmesh`/`mathutils`
 APIs and can only be exercised inside Blender's own Python environment.
