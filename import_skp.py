@@ -71,8 +71,11 @@ material_cache so repeated colors across definitions share one Material
 datablock), assigned as a mesh material slot with per-polygon
 material_index set to match - so a component with several differently
 colored faces keeps that per-face variation in Blender, not one flat
-color for the whole object. Import only for now; export does not write
-materials back out.
+color for the whole object. Materials are named after their SketchUp
+material when openskp provides the name, their colour is converted from
+SketchUp's sRGB to Blender's scene-linear values (srgb_to_linear), a
+single-sided material hides its back side (_hide_back_side), and a
+colorized texture is re-tinted toward its colour (_add_colorize_tint).
 
 Textured materials: each mesh's own UV coordinates (LocalPrimitive.uvs -
 already resolved by openskp per vertex, just never read by this addon
@@ -171,6 +174,17 @@ def _get_or_build_texture_image(texture_index, textures, image_cache):
     return image
 
 
+def _srgb_to_linear(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def srgb_to_linear(rgb):
+    """openskp's baseColorFactor is SketchUp's 0-255 sRGB colour divided by
+    255; Blender colour sockets and Material.diffuse_color take scene-linear
+    values, so used as-is every colour renders lighter than in SketchUp."""
+    return tuple(_srgb_to_linear(c) for c in rgb)
+
+
 def _get_or_build_material(material_index, gltf_materials, material_cache, textures, image_cache):
     """Returns the Blender Material for gltf_materials[material_index],
     building it exactly once per unique index and caching it for every
@@ -194,9 +208,13 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
     r, g, b, a = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
     texture_ref = pbr.get("baseColorTexture")
 
-    mat = bpy.data.materials.new(name=f"openskp_material_{material_index}")
+    # openskp 1.6+ carries the SketchUp material's own name; older wheels
+    # (and unpainted faces drawn in their layer colour) have none.
+    mat = bpy.data.materials.new(name=gltf_mat.get("name") or f"openskp_material_{material_index}")
+    mat["openskp_material_index"] = material_index
     mat.use_nodes = True
-    mat.diffuse_color = (r, g, b, a)  # Solid viewport shading / thumbnails
+    lr, lg, lb = srgb_to_linear((r, g, b))
+    mat.diffuse_color = (lr, lg, lb, a)  # Solid viewport shading / thumbnails
     if a < 1.0:
         mat.blend_method = "BLEND"
 
@@ -209,22 +227,125 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
         tex_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
         tex_node.image = image
         tex_node.location = (bsdf.location.x - 300, bsdf.location.y)
-        mat.node_tree.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+        colorize = (gltf_mat.get("extras") or {}).get("sketchup") or {}
+        if colorize.get("colorized"):
+            _add_colorize_tint(mat, tex_node, bsdf, image, (r, g, b), colorize.get("colorize_type", 0))
+        else:
+            mat.node_tree.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
         if "Alpha" in bsdf.inputs and image.depth in (32, 128):  # has its own alpha channel
             mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
             mat.blend_method = "BLEND"
+        elif "Alpha" in bsdf.inputs:
+            # A translucent textured material (SketchUp's library glass)
+            # with an opaque image still has the material's own opacity.
+            bsdf.inputs["Alpha"].default_value = a
     elif bsdf is not None:
         # Blender 4.x renamed the alpha-adjacent socket; "Base Color" is
         # stable across the versions this addon targets (4.2+).
-        bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+        bsdf.inputs["Base Color"].default_value = (lr, lg, lb, 1.0)
         if "Alpha" in bsdf.inputs:
             bsdf.inputs["Alpha"].default_value = a
 
     if gltf_mat.get("doubleSided"):
         mat.use_backface_culling = False
+    else:
+        _hide_back_side(mat)
 
     material_cache[material_index] = mat
     return mat
+
+
+def _hide_back_side(mat):
+    """A single-sided openskp material is one side of a face whose two
+    sides are painted differently: openskp emits that face twice, on the
+    same plane, once per side with opposite winding. Unless each copy is
+    invisible from behind, both render on top of each other and the wrong
+    side's paint shows through (a record wall's grey front covering its
+    painted back, seen on a real file). Backface culling covers the
+    viewport and EEVEE; the Backfacing mix covers Cycles, which ignores
+    the culling flag."""
+    mat.use_backface_culling = True
+    nt = mat.node_tree
+    out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if out is None or not out.inputs["Surface"].links:
+        return
+    surface = out.inputs["Surface"].links[0].from_socket
+    geometry = nt.nodes.new("ShaderNodeNewGeometry")
+    transparent = nt.nodes.new("ShaderNodeBsdfTransparent")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    mix.label = "Hide back side"
+    geometry.location = (out.location.x - 200, out.location.y + 250)
+    transparent.location = (out.location.x - 200, out.location.y - 150)
+    mix.location = (out.location.x, out.location.y + 150)
+    out.location.x += 200
+    nt.links.new(geometry.outputs["Backfacing"], mix.inputs["Fac"])
+    nt.links.new(surface, mix.inputs[1])
+    nt.links.new(transparent.outputs["BSDF"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+
+
+def _image_average_rgb(image):
+    """Mean linear RGB of an image's pixels, or None when it can't be read.
+    ``Image.pixels`` holds a byte image's values as stored (sRGB), so the
+    mean is converted the same way the Image Texture node converts them."""
+    try:
+        import numpy as np
+
+        w, h = image.size
+        if not w or not h or image.channels < 3:
+            return None
+        pixels = np.empty(w * h * image.channels, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        rgb = pixels.reshape(-1, image.channels)[:, :3]
+        mean = (float(c) for c in rgb.mean(axis=0))
+        return tuple(mean) if image.is_float else tuple(_srgb_to_linear(c) for c in mean)
+    except Exception:  # noqa: BLE001 - tinting is cosmetic, never fail the import over it
+        return None
+
+
+def _input(node, name, socket_type):
+    """``ShaderNodeMix`` has one "A"/"B"/"Result" socket per data type."""
+    return next(s for s in node.inputs if s.name == name and s.type == socket_type)
+
+
+def _output(node, name, socket_type):
+    return next(s for s in node.outputs if s.name == name and s.type == socket_type)
+
+
+def _add_colorize_tint(mat, tex_node, bsdf, image, color, colorize_type):
+    """Re-tints a colorized material's shared image toward its own colour,
+    as SketchUp does for its "[Name]1" copies: openskp gives the untinted
+    source image plus the target colour (baseColorFactor, sRGB).
+
+    Approximated by scaling the image so its average lands on the target
+    colour - colorize_type 0 (shift) scales the colour image, 1 (tint)
+    greyscales it first. Without this, a darkened wood veneer imports with
+    the original, much lighter image."""
+    nt = mat.node_tree
+    target = srgb_to_linear(color)
+    average = _image_average_rgb(image)
+    source = tex_node.outputs["Color"]
+    if colorize_type == 1:
+        bw = nt.nodes.new("ShaderNodeRGBToBW")
+        bw.location = (tex_node.location.x + 200, tex_node.location.y - 150)
+        nt.links.new(source, bw.inputs["Color"])
+        source = bw.outputs["Val"]
+        if average is not None:
+            luminance = 0.2126 * average[0] + 0.7152 * average[1] + 0.0722 * average[2]
+            average = (luminance,) * 3
+    scale = tuple(t / max(avg, 1e-4) for t, avg in zip(target, average)) if average else target
+
+    tint = nt.nodes.new("ShaderNodeMix")
+    tint.data_type = "RGBA"
+    tint.blend_type = "MULTIPLY"
+    tint.clamp_result = True
+    tint.label = "SketchUp colorize"
+    tint.location = (tex_node.location.x + 400, tex_node.location.y)
+    _input(tint, "Factor", "VALUE").default_value = 1.0
+    _input(tint, "B", "RGBA").default_value = (*scale, 1.0)
+    nt.links.new(source, _input(tint, "A", "RGBA"))
+    nt.links.new(_output(tint, "Result", "RGBA"), bsdf.inputs["Base Color"])
+    tex_node.location.x -= 200
 
 
 def _build_mesh_object(name, resource, gltf_materials, material_cache, textures, image_cache):
