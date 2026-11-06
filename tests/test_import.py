@@ -171,6 +171,11 @@ def check_materials_match_gltf_materials(fixture_name, new_objects):
             f"(created this import: {sorted(o.name for o in new_objects)})"
         )
 
+        if _twin_pairs(_source_triangles(resource)):
+            check_front_back_pairs(fixture_name, scene, resource, obj)
+            checked_any = True
+            continue
+
         expected_colors = []
         expected_indices = []
         for prim in resource.primitives:
@@ -192,6 +197,136 @@ def check_materials_match_gltf_materials(fixture_name, new_objects):
 
     assert checked_any, f"{fixture_name}: has gltf_materials but no mesh resources to check against"
     print(f"{fixture_name}: materials match openskp's own gltf_materials - OK")
+
+
+def _rounded(point):
+    return tuple(round(c, 4) for c in point)
+
+
+def _source_triangles(resource):
+    """[(rounded position set, winding, material index)] for a resource's
+    triangles, in primitive order. Winding is the parity of the corner
+    order against sorted order: rotating the corners keeps it, reversing
+    them flips it. Written independently of import_skp's own twin search
+    (which compares positions after rotating to the smallest corner)."""
+    out = []
+    for prim in resource.primitives:
+        pos, idx = prim.positions, prim.indices
+        for i in range(0, len(idx), 3):
+            corners = [_rounded(pos[3 * k:3 * k + 3]) for k in idx[i:i + 3]]
+            winding = sum(corners[a] > corners[b] for a in range(3) for b in range(a + 1, 3)) % 2
+            out.append((frozenset(corners), winding, prim.material_index, len(set(corners)) == 3))
+    return out
+
+
+def _twin_pairs(source):
+    """[(front, back) source indices]: the same face seen from its two
+    sides (same corners, opposite winding) painted with different materials."""
+    first_of = {}
+    pairs = []
+    paired = set()
+    for t, (shape, winding, material, proper) in enumerate(source):
+        if not proper:
+            continue
+        for other in first_of.get(shape, []):
+            if other not in paired and source[other][1] != winding and source[other][2] != material:
+                pairs.append((other, t))
+                paired.update((other, t))
+                break
+        else:
+            first_of.setdefault(shape, []).append(t)
+    return pairs
+
+
+def check_front_back_pairs(fixture_name, scene, resource, obj):
+    """A face painted differently on its two sides arrives as two
+    single-sided copies on the same plane, wound opposite ways. The import
+    keeps ONE polygon per such pair, with a material that mixes the two
+    paints on Geometry > Backfacing; the twin is gone, so nothing overlaps
+    and Solid shading, EEVEE and Cycles all agree."""
+    source = _source_triangles(resource)
+    pairs = _twin_pairs(source)
+    mesh = obj.data
+    label = f"{fixture_name}/{obj.name}"
+
+    assert len(mesh.polygons) == len(source) - len(pairs), (
+        f"{label}: {len(mesh.polygons)} polygons, expected {len(source)} source triangles - {len(pairs)} pairs"
+    )
+
+    by_shape = {}
+    for t, (shape, winding, material, proper) in enumerate(source):
+        by_shape.setdefault(shape, []).append((winding, material, t))
+    paired_materials = {}  # shape -> {winding: material} for the pairs
+    for front, back in pairs:
+        shape = source[front][0]
+        paired_materials[shape] = {source[front][1]: source[front][2], source[back][1]: source[back][2]}
+
+    seen = {}  # shape -> (winding, material) of the lone polygons, for the leftover check
+    paired_polygons = 0
+    for poly in mesh.polygons:
+        corners = [_rounded(tuple(mesh.vertices[v].co)) for v in poly.vertices]
+        shape = frozenset(corners)
+        winding = sum(corners[a] > corners[b] for a in range(3) for b in range(a + 1, 3)) % 2
+        mat = mesh.materials[poly.material_index]
+        front_index = mat["openskp_material_index"]
+        back_index = mat.get("openskp_back_material_index")
+        if back_index is not None:
+            paired_polygons += 1
+            assert shape in paired_materials, f"{label}: a front/back material on a face that has no twin"
+            sides = paired_materials[shape]
+            assert {front_index, back_index} == set(sides.values()), (
+                f"{label}: paired face has materials {front_index}/{back_index}, source has {sorted(sides.values())}"
+            )
+            assert sides[winding] == front_index, (
+                f"{label}: the polygon's front paint {front_index} is not the copy wound like it ({sides[winding]})"
+            )
+        else:
+            # A shape can also keep a lone copy (a same-paint duplicate stacked on a pair).
+            assert any(w == winding and m == front_index for w, m, _ in by_shape[shape]), (
+                f"{label}: polygon material {front_index} matches no source triangle with that winding"
+            )
+        if back_index is None:
+            seen.setdefault(shape, []).append((winding, front_index))
+    assert paired_polygons == len(pairs), f"{label}: {paired_polygons} paired polygons, expected {len(pairs)}"
+
+    # Nothing that could have been paired is left over: no two lone copies of
+    # a shape with opposite winding and different paints.
+    for shape, kept in seen.items():
+        for i, (w1, m1) in enumerate(kept):
+            for w2, m2 in kept[i + 1:]:
+                assert not (w1 != w2 and m1 != m2), f"{label}: two opposite-wound copies with different paints remain"
+
+    pair_materials = [m for m in mesh.materials if m.get("openskp_back_material_index") is not None]
+    assert pair_materials, f"{label}: pairs found but no front/back material"
+    for mat in pair_materials:
+        front_gltf = scene.gltf_materials[mat["openskp_material_index"]]
+        back_gltf = scene.gltf_materials[mat["openskp_back_material_index"]]
+        nodes = mat.node_tree.nodes
+        assert not mat.use_backface_culling, f"{label}/{mat.name}: both sides must be drawn"
+        assert sum(n.type == "BSDF_PRINCIPLED" for n in nodes) == 2, f"{label}/{mat.name}: expected two surfaces"
+        mix = next(n for n in nodes if n.type == "MIX_SHADER")
+        assert mix.inputs["Fac"].links[0].from_socket.name == "Backfacing", f"{label}/{mat.name}: mix not on Backfacing"
+        out = next(n for n in nodes if n.type == "OUTPUT_MATERIAL")
+        assert out.inputs["Surface"].links[0].from_node.name == mix.name
+        front_in = mix.inputs[1].links[0].from_node
+        back_in = mix.inputs[2].links[0].from_node
+        assert front_in.name != back_in.name and front_in.type == back_in.type == "BSDF_PRINCIPLED"
+        r, g, b, a = front_gltf.get("pbrMetallicRoughness", {}).get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+        expected = tuple(round(c, 3) for c in (*import_skp.srgb_to_linear((r, g, b)), a))
+        assert tuple(round(c, 3) for c in mat.diffuse_color) == expected, (
+            f"{label}/{mat.name}: Solid shading should show the front paint"
+        )
+        if back_gltf.get("pbrMetallicRoughness", {}).get("baseColorTexture"):
+            assert import_skp._BACK_UV_LAYER in mesh.uv_layers, f"{label}: textured back paint but no back UV layer"
+            back_tex = next(n for n in nodes if n.type == "TEX_IMAGE" and n.inputs["Vector"].links)
+            uv_node = back_tex.inputs["Vector"].links[0].from_node
+            assert uv_node.type == "UVMAP" and uv_node.uv_map == import_skp._BACK_UV_LAYER, (
+                f"{label}/{mat.name}: back texture must read {import_skp._BACK_UV_LAYER}"
+            )
+    print(
+        f"{label}: {len(pairs)} front/back pairs kept as one polygon each, "
+        f"{len(pair_materials)} front/back materials, no overlapping copies - OK"
+    )
 
 
 def check_layer_collection(fixture_name):
@@ -283,9 +418,11 @@ def check_textures(fixture_name, new_objects):
         obj = new_objects_by_base_name.get(obj_name)
         assert obj is not None, f"{fixture_name}: no newly-created Blender object named {obj_name!r}"
 
+        def is_textured(index):
+            return bool(scene.gltf_materials[index].get("pbrMetallicRoughness", {}).get("baseColorTexture"))
+
         textured_material_indices = {
-            prim.material_index for prim in resource.primitives
-            if scene.gltf_materials[prim.material_index].get("pbrMetallicRoughness", {}).get("baseColorTexture")
+            prim.material_index for prim in resource.primitives if is_textured(prim.material_index)
         }
         if not textured_material_indices:
             continue
@@ -295,31 +432,43 @@ def check_textures(fixture_name, new_objects):
             f"{fixture_name}/{obj_name}: UV layer doesn't cover every loop"
         )
 
-        for material_index in textured_material_indices:
-            pbr = scene.gltf_materials[material_index]["pbrMetallicRoughness"]
-            texture_index = pbr["baseColorTexture"]["index"]
-            expected_size = expected_pixel_size(textures[texture_index].data)
-
-            bl_mat = _material_for_index(obj, material_index)
-            assert bl_mat is not None, f"{fixture_name}/{obj_name}: no Blender material for gltf material {material_index}"
+        # Every Blender material of this mesh: a single paint (one surface) or
+        # a front/back pair (two surfaces; the back one reads UVMap_back).
+        seen_materials = set()
+        for bl_mat in obj.data.materials:
+            front_index = bl_mat["openskp_material_index"]
+            back_index = bl_mat.get("openskp_back_material_index")
+            roles = [(front_index, False)] + ([(back_index, True)] if back_index is not None else [])
+            textured_roles = [(index, is_back) for index, is_back in roles if is_textured(index)]
             tex_nodes = [n for n in bl_mat.node_tree.nodes if n.type == "TEX_IMAGE"]
-            assert len(tex_nodes) == 1, (
-                f"{fixture_name}/{bl_mat.name}: expected exactly 1 Image Texture node, got {len(tex_nodes)}"
+            assert len(tex_nodes) == len(textured_roles), (
+                f"{fixture_name}/{bl_mat.name}: expected {len(textured_roles)} Image Texture node(s), "
+                f"got {len(tex_nodes)}"
             )
-            image = tex_nodes[0].image
-            assert image is not None, f"{fixture_name}/{bl_mat.name}: Image Texture node has no image assigned"
-            assert tuple(image.size) == expected_size, (
-                f"{fixture_name}/{bl_mat.name}: image size {tuple(image.size)} != expected {expected_size}"
-            )
-
-            if texture_index in image_by_texture_index:
-                assert image is image_by_texture_index[texture_index], (
-                    f"{fixture_name}: texture {texture_index} loaded as two different Blender Images "
-                    "(should be deduplicated and shared across materials)"
+            for index, is_back in textured_roles:
+                seen_materials.add(index)
+                texture_index = scene.gltf_materials[index]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
+                expected_size = expected_pixel_size(textures[texture_index].data)
+                # The back paint's texture is the one fed by a UV Map node.
+                tex_node = next(n for n in tex_nodes if bool(n.inputs["Vector"].links) == is_back)
+                image = tex_node.image
+                assert image is not None, f"{fixture_name}/{bl_mat.name}: Image Texture node has no image assigned"
+                assert tuple(image.size) == expected_size, (
+                    f"{fixture_name}/{bl_mat.name}: image size {tuple(image.size)} != expected {expected_size}"
                 )
-            else:
-                image_by_texture_index[texture_index] = image
-            checked_any = True
+
+                if texture_index in image_by_texture_index:
+                    assert image is image_by_texture_index[texture_index], (
+                        f"{fixture_name}: texture {texture_index} loaded as two different Blender Images "
+                        "(should be deduplicated and shared across materials)"
+                    )
+                else:
+                    image_by_texture_index[texture_index] = image
+                checked_any = True
+        assert textured_material_indices <= seen_materials, (
+            f"{fixture_name}/{obj_name}: textured materials {sorted(textured_material_indices - seen_materials)} "
+            "have no Image Texture in any Blender material"
+        )
 
     assert checked_any, f"{fixture_name}: has textures but no textured mesh resources to check against"
     print(
@@ -347,12 +496,25 @@ def check_material_names_and_sides(fixture_name, new_objects):
     path = os.path.join(FIXTURES_DIR, fixture_name)
     scene = openskp.SkpFile.open(path).build_instanced_scene()
     seen = {}
+    pairs = {}
     for obj in new_objects:
         if obj.type != "MESH" or obj.data is None:
             continue
         for mat in obj.data.materials:
-            seen[mat.get("openskp_material_index")] = mat
-    assert seen, f"{fixture_name}: no imported materials"
+            if mat.get("openskp_back_material_index") is not None:
+                pairs[(mat["openskp_material_index"], mat["openskp_back_material_index"])] = mat
+            else:
+                seen[mat.get("openskp_material_index")] = mat
+    assert seen or pairs, f"{fixture_name}: no imported materials"
+    for (front, back), mat in pairs.items():
+        def label(i):
+            return scene.gltf_materials[i].get("name") or f"openskp_material_{i}"
+
+        assert re.sub(r"\.\d{3}$", "", mat.name) == f"{label(front)} | {label(back)}", (
+            f"{fixture_name}: front/back material named {mat.name!r}"
+        )
+        assert not mat.use_backface_culling, f"{fixture_name}/{mat.name}: both sides must be drawn"
+        assert any(n.type == "NEW_GEOMETRY" for n in mat.node_tree.nodes), f"{fixture_name}/{mat.name}: no Backfacing"
     named = 0
     for index, mat in seen.items():
         gltf = scene.gltf_materials[index]
@@ -368,7 +530,10 @@ def check_material_names_and_sides(fixture_name, new_objects):
             assert mat.use_backface_culling and hides_back, f"{fixture_name}/{mat.name}: back side not hidden"
             out = next(n for n in mat.node_tree.nodes if n.type == "OUTPUT_MATERIAL")
             assert out.inputs["Surface"].links[0].from_node.type == "MIX_SHADER"
-    print(f"{fixture_name}: {len(seen)} materials ({named} with SketchUp names), back sides correct - OK")
+    print(
+        f"{fixture_name}: {len(seen)} materials ({named} with SketchUp names) and "
+        f"{len(pairs)} front/back materials, back sides correct - OK"
+    )
 
 
 def check_colorized_texture_is_tinted():
