@@ -251,12 +251,17 @@ def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
     """Fills `bsdf` (a Principled BSDF in `mat`'s node tree) from one
     openskp material: its texture, tint and alpha, or its solid colour.
     `uv_map` names a UV layer for the texture to read instead of the active
-    one (the back side of a pair, see _get_or_build_pair_material)."""
+    one (the back side of a pair, see _get_or_build_pair_material).
+
+    Returns True when the surface takes its transparency from the texture's
+    own alpha channel (a fence, a leaf, a cut-out sign): the material is then
+    set to the Dithered render method (see _use_dithered_alpha)."""
     r, g, b, a = _base_color(gltf_mat)
+    texture_alpha = False
     texture_ref = gltf_mat.get("pbrMetallicRoughness", {}).get("baseColorTexture")
     lr, lg, lb = srgb_to_linear((r, g, b))
     if a < 1.0:
-        mat.blend_method = "BLEND"
+        mat.surface_render_method = "BLENDED"
 
     image = None
     if texture_ref is not None and bsdf is not None:
@@ -278,7 +283,8 @@ def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
             mat.node_tree.links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
         if "Alpha" in bsdf.inputs and image.depth in (32, 128):  # has its own alpha channel
             mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
-            mat.blend_method = "BLEND"
+            texture_alpha = True
+            _use_dithered_alpha(mat)
         elif "Alpha" in bsdf.inputs:
             # A translucent textured material (SketchUp's library glass)
             # with an opaque image still has the material's own opacity.
@@ -289,6 +295,20 @@ def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
         bsdf.inputs["Base Color"].default_value = (lr, lg, lb, 1.0)
         if "Alpha" in bsdf.inputs:
             bsdf.inputs["Alpha"].default_value = a
+    return texture_alpha
+
+
+def _use_dithered_alpha(mat):
+    """EEVEE's Dithered render method (Material > Settings > Render Method)
+    draws a cut-out texture without sorting it against other faces, so the
+    holes of a fence or lattice show what is behind them from any angle.
+    The Blended method sorts per object, and a mesh of many cut-out faces
+    shows the wrong ones in front. Dithered is Blender's own default for a
+    new material; it is set explicitly so a surface whose opacity is a flat
+    value (SketchUp's glass, below) can use Blended, which is smooth where
+    Dithered is grainy, without changing this one. Cycles ignores the
+    setting and always renders alpha correctly."""
+    mat.surface_render_method = "DITHERED"
 
 
 _BACK_UV_LAYER = "UVMap_back"
@@ -326,10 +346,12 @@ def _get_or_build_pair_material(front_index, back_index, gltf_materials, materia
     front_bsdf = nt.nodes.get("Principled BSDF")
     back_bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
     back_bsdf.location = (front_bsdf.location.x, front_bsdf.location.y - 700)
-    _populate_surface(mat, front_bsdf, front, textures, image_cache)
-    _populate_surface(
+    front_alpha = _populate_surface(mat, front_bsdf, front, textures, image_cache)
+    back_alpha = _populate_surface(
         mat, back_bsdf, back, textures, image_cache, uv_map=_BACK_UV_LAYER if _has_texture(back) else None
     )
+    if front_alpha or back_alpha:
+        _use_dithered_alpha(mat)  # one render method serves both paints: cut-outs win over flat glass
 
     out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
     geometry = nt.nodes.new("ShaderNodeNewGeometry")

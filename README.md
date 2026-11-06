@@ -98,7 +98,11 @@ this addon) land in a real UV layer, and a material with an image texture
 gets a real Image Texture node wired into Base Color (and Alpha, for an
 image with its own alpha channel) — built from the source file's own
 embedded image bytes, packed directly into the `.blend` so nothing
-depends on an external file path. The same source image shared by
+depends on an external file path. A texture with its own alpha channel
+(a fence, a lattice, a leaf) gets EEVEE's **Dithered** render method, so
+its holes show what is behind them from every angle; flat translucent
+colours such as glass stay **Blended**, which is smooth where Dithered is
+grainy. Cycles ignores the setting. The same source image shared by
 several materials loads once, not once per material. Export doesn't
 write texture images back out yet — a textured material exports as its
 resolved solid color only, same as materials export always has.
