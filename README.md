@@ -81,10 +81,12 @@ than reimplementing SketchUp's material-inheritance rules here.
   values (and back on export), so a grey looks the same grey as in
   SketchUp instead of much lighter.
 - **Front and back paint**: a face painted differently on its two sides
-  is imported as two single-sided copies, each invisible from behind
-  (backface culling in the viewport and EEVEE, a Backfacing mix for
-  Cycles), so the side you look at shows its own paint — not whichever
-  copy happened to win on the shared plane.
+  is imported as one polygon whose material mixes the two paints on
+  Geometry > Backfacing (named `Front | Back`), so EEVEE and Cycles show
+  each side's own paint and nothing overlaps. Solid shading cannot read
+  node trees, so it shows the front paint on both sides. A texture on the
+  back side is read from a second UV layer, `UVMap_back`. Export writes the
+  front paint only; the back paint is not exported yet.
 - **Colorized textures** (SketchUp's `[Name]1` copies of a texture
   recoloured in the Materials panel) are re-tinted toward their colour
   with a Mix node labelled "SketchUp colorize" — an approximation of

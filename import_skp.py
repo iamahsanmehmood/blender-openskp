@@ -77,6 +77,19 @@ SketchUp's sRGB to Blender's scene-linear values (srgb_to_linear), a
 single-sided material hides its back side (_hide_back_side), and a
 colorized texture is re-tinted toward its colour (_add_colorize_tint).
 
+Front and back paint: a SketchUp face whose two sides are painted
+differently comes from openskp as two single-sided copies on the same
+plane, one wound each way. Drawn as they are, the copies overlap, and which
+one shows depends on the view (Solid shading ignores node trees and the
+culling flag, so it shows whichever copy wins the depth test, usually the
+wrong side's paint on the outside). _build_mesh_object pairs each copy with
+its exact twin and keeps ONE polygon per pair, shaded by a material that
+mixes the two paints on the Backfacing input
+(_get_or_build_pair_material): the front paint where the polygon faces the
+camera, the back paint where it faces away. A texture on the back side is
+read from a second UV layer (UVMap_back), since the two sides can map the
+image differently.
+
 Textured materials: each mesh's own UV coordinates (LocalPrimitive.uvs -
 already resolved by openskp per vertex, just never read by this addon
 before now) are written into a real UV layer, and a material whose
@@ -204,9 +217,7 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
         return material_cache[material_index]
 
     gltf_mat = gltf_materials[material_index] if 0 <= material_index < len(gltf_materials) else {}
-    pbr = gltf_mat.get("pbrMetallicRoughness", {})
-    r, g, b, a = pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
-    texture_ref = pbr.get("baseColorTexture")
+    r, g, b, a = _base_color(gltf_mat)
 
     # openskp 1.6+ carries the SketchUp material's own name; older wheels
     # (and unpainted faces drawn in their layer colour) have none.
@@ -215,10 +226,38 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
     mat.use_nodes = True
     lr, lg, lb = srgb_to_linear((r, g, b))
     mat.diffuse_color = (lr, lg, lb, a)  # Solid viewport shading / thumbnails
+
+    _populate_surface(mat, mat.node_tree.nodes.get("Principled BSDF"), gltf_mat, textures, image_cache)
+
+    if gltf_mat.get("doubleSided"):
+        mat.use_backface_culling = False
+    else:
+        _hide_back_side(mat)
+
+    material_cache[material_index] = mat
+    return mat
+
+
+def _base_color(gltf_mat):
+    pbr = gltf_mat.get("pbrMetallicRoughness", {})
+    return pbr.get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+
+
+def _has_texture(gltf_mat):
+    return gltf_mat.get("pbrMetallicRoughness", {}).get("baseColorTexture") is not None
+
+
+def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
+    """Fills `bsdf` (a Principled BSDF in `mat`'s node tree) from one
+    openskp material: its texture, tint and alpha, or its solid colour.
+    `uv_map` names a UV layer for the texture to read instead of the active
+    one (the back side of a pair, see _get_or_build_pair_material)."""
+    r, g, b, a = _base_color(gltf_mat)
+    texture_ref = gltf_mat.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+    lr, lg, lb = srgb_to_linear((r, g, b))
     if a < 1.0:
         mat.blend_method = "BLEND"
 
-    bsdf = mat.node_tree.nodes.get("Principled BSDF")
     image = None
     if texture_ref is not None and bsdf is not None:
         image = _get_or_build_texture_image(texture_ref.get("index"), textures, image_cache)
@@ -232,6 +271,11 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
             _add_colorize_tint(mat, tex_node, bsdf, image, (r, g, b), colorize.get("colorize_type", 0))
         else:
             mat.node_tree.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+        if uv_map is not None:
+            uv_node = mat.node_tree.nodes.new("ShaderNodeUVMap")
+            uv_node.uv_map = uv_map
+            uv_node.location = (tex_node.location.x - 220, tex_node.location.y)
+            mat.node_tree.links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
         if "Alpha" in bsdf.inputs and image.depth in (32, 128):  # has its own alpha channel
             mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
             mat.blend_method = "BLEND"
@@ -246,12 +290,61 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
         if "Alpha" in bsdf.inputs:
             bsdf.inputs["Alpha"].default_value = a
 
-    if gltf_mat.get("doubleSided"):
-        mat.use_backface_culling = False
-    else:
-        _hide_back_side(mat)
 
-    material_cache[material_index] = mat
+_BACK_UV_LAYER = "UVMap_back"
+
+
+def _get_or_build_pair_material(front_index, back_index, gltf_materials, material_cache, textures, image_cache):
+    """The Blender Material for a polygon with one paint on its front and
+    another on its back: both surfaces live in one node tree and a Mix
+    Shader driven by Geometry > Backfacing picks between them, so the
+    polygon is visible, and correct, from both sides in every render engine
+    (and Solid shading shows the front paint, with no overlapping copy to
+    fight it). The back surface reads its texture from the UVMap_back
+    layer. Cached per (front, back) pair of openskp material indices."""
+    key = (front_index, back_index)
+    if key in material_cache:
+        return material_cache[key]
+
+    def entry(index):
+        return gltf_materials[index] if 0 <= index < len(gltf_materials) else {}
+
+    front, back = entry(front_index), entry(back_index)
+
+    def label(gltf_mat, index):
+        return gltf_mat.get("name") or f"openskp_material_{index}"
+
+    mat = bpy.data.materials.new(name=f"{label(front, front_index)} | {label(back, back_index)}")
+    mat["openskp_material_index"] = front_index
+    mat["openskp_back_material_index"] = back_index
+    mat.use_nodes = True
+    r, g, b, a = _base_color(front)
+    lr, lg, lb = srgb_to_linear((r, g, b))
+    mat.diffuse_color = (lr, lg, lb, a)  # Solid shading shows the front paint
+
+    nt = mat.node_tree
+    front_bsdf = nt.nodes.get("Principled BSDF")
+    back_bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    back_bsdf.location = (front_bsdf.location.x, front_bsdf.location.y - 700)
+    _populate_surface(mat, front_bsdf, front, textures, image_cache)
+    _populate_surface(
+        mat, back_bsdf, back, textures, image_cache, uv_map=_BACK_UV_LAYER if _has_texture(back) else None
+    )
+
+    out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
+    geometry = nt.nodes.new("ShaderNodeNewGeometry")
+    mix = nt.nodes.new("ShaderNodeMixShader")
+    mix.label = "Front / back paint"
+    geometry.location = (out.location.x - 200, out.location.y + 250)
+    mix.location = (out.location.x, out.location.y + 150)
+    out.location.x += 200
+    nt.links.new(geometry.outputs["Backfacing"], mix.inputs["Fac"])
+    nt.links.new(front_bsdf.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(back_bsdf.outputs["BSDF"], mix.inputs[2])
+    nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
+    mat.use_backface_culling = False  # both sides are drawn, each with its own paint
+
+    material_cache[key] = mat
     return mat
 
 
@@ -348,6 +441,71 @@ def _add_colorize_tint(mat, tex_node, bsdf, image, color, colorize_type):
     tex_node.location.x -= 200
 
 
+def _triangle_key(verts, tri):
+    """(position set, winding) of a triangle, or None for a degenerate one.
+    Two triangles with the same set and opposite winding are twins: the same
+    face seen from its two sides. Positions compare exactly: openskp emits
+    both copies from one triangulation, so their vertices are identical."""
+    corners = [verts[v] for v in tri[:3]]
+    if len(set(corners)) < 3:
+        return None
+    start = corners.index(min(corners))
+    ordered = corners[start:] + corners[:start]
+    return frozenset(corners), ordered[1] < ordered[2]
+
+
+def _find_twin_triangles(verts, tris):
+    """{triangle index: its twin's index} for every pair of triangles that
+    are the same face with opposite winding and different materials. The
+    materials must differ: a face painted the same on both sides is already
+    one double-sided copy, and two same-paint triangles stacked in one place
+    are two faces of the model, not two sides of one."""
+    if len({tri[3] for tri in tris}) < 2:
+        return {}  # twins need two different materials: nothing to search for
+    earlier = {}  # shape -> [(triangle index, winding)] not yet paired
+    twin_of = {}
+    for t, tri in enumerate(tris):
+        key = _triangle_key(verts, tri)
+        if key is None:
+            continue
+        shape, winding = key
+        candidates = earlier.setdefault(shape, [])
+        for position, (other, other_winding) in enumerate(candidates):
+            if other_winding != winding and tris[other][3] != tri[3]:
+                twin_of[other] = t
+                twin_of[t] = other
+                del candidates[position]
+                break
+        else:
+            candidates.append((t, winding))
+    return twin_of
+
+
+def _choose_front_triangles(verts, tris, twin_of):
+    """{kept triangle: dropped twin}. Either copy can carry the pair, because
+    the Backfacing mix picks the paint by which side is seen; this only
+    decides which paint Solid shading shows, so the copy facing away from
+    the mesh's centre (the outside of a box) is kept, and the first one when
+    that does not decide."""
+    if not twin_of:
+        return {}
+    centre = [sum(v[axis] for v in verts) / len(verts) for axis in range(3)]
+
+    def outward(t):
+        a, b, c = (verts[v] for v in tris[t][:3])
+        u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+        w = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+        n = (u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0])
+        mid = [(a[i] + b[i] + c[i]) / 3 - centre[i] for i in range(3)]
+        return sum(n[i] * mid[i] for i in range(3))
+
+    chosen = {}
+    for first, second in sorted((t, o) for t, o in twin_of.items() if t < o):
+        keep, drop = (second, first) if outward(second) > 0 >= outward(first) else (first, second)
+        chosen[keep] = drop
+    return chosen
+
+
 def _build_mesh_object(name, resource, gltf_materials, material_cache, textures, image_cache):
     """Builds one Mesh Object (local space, at the origin) from an
     InstancedMeshResource's primitives - already-triangulated, so this is
@@ -359,22 +517,17 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache, textures,
     and to set each of its triangles' own polygon.material_index, so the
     mesh's material slots and per-face assignment match the source file's
     own per-face paint, not just one flat color for the whole object.
+
+    A face painted differently on its two sides arrives as two single-sided
+    triangle sets with identical vertices and opposite winding (see this
+    module's "Front and back paint" section). Each such pair becomes one
+    polygon with a front/back material (_get_or_build_pair_material), and
+    the twin is dropped, so nothing overlaps.
     """
     verts = []
     vert_uvs = []
-    tris = []
-    tri_material_indices = []
-    slot_by_material_index = {}
-    mesh_materials = []
-
+    tris = []  # (a, b, c, material_index) per source triangle, in order
     for prim in resource.primitives:
-        if prim.material_index not in slot_by_material_index:
-            slot_by_material_index[prim.material_index] = len(mesh_materials)
-            mesh_materials.append(
-                _get_or_build_material(prim.material_index, gltf_materials, material_cache, textures, image_cache)
-            )
-        slot = slot_by_material_index[prim.material_index]
-
         base = len(verts)
         pos = prim.positions
         uvs = prim.uvs
@@ -383,25 +536,80 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache, textures,
         for i in range(0, len(uvs), 2):
             vert_uvs.append((uvs[i], uvs[i + 1]))
         idx = prim.indices
-        tri_count = len(idx) // 3
-        for i in range(tri_count):
-            tris.append((base + idx[i * 3], base + idx[i * 3 + 1], base + idx[i * 3 + 2]))
-            tri_material_indices.append(slot)
+        for i in range(len(idx) // 3):
+            tris.append((base + idx[i * 3], base + idx[i * 3 + 1], base + idx[i * 3 + 2], prim.material_index))
+
+    has_uvs = len(vert_uvs) == len(verts) and bool(vert_uvs)
+    twin_of = _find_twin_triangles(verts, tris)
+    base_of_pair = _choose_front_triangles(verts, tris, twin_of)  # pair's kept triangle -> dropped twin
+
+    slot_by_key = {}
+    mesh_materials = []
+
+    def slot_for(front_index, back_index):
+        key = front_index if back_index is None else (front_index, back_index)
+        if key not in slot_by_key:
+            slot_by_key[key] = len(mesh_materials)
+            mesh_materials.append(
+                _get_or_build_material(front_index, gltf_materials, material_cache, textures, image_cache)
+                if back_index is None
+                else _get_or_build_pair_material(
+                    front_index, back_index, gltf_materials, material_cache, textures, image_cache
+                )
+            )
+        return slot_by_key[key]
+
+    dropped = set(base_of_pair.values())
+    kept = []  # (a, b, c, slot, back_uvs or None)
+    needs_back_uvs = False
+    for t, (a, b, c, material_index) in enumerate(tris):
+        if t in dropped:
+            continue
+        twin = base_of_pair.get(t)
+        if twin is None:
+            kept.append((a, b, c, slot_for(material_index, None), None))
+            continue
+        back_index = tris[twin][3]
+        back_uvs = None
+        if has_uvs and _has_texture(
+            gltf_materials[back_index] if 0 <= back_index < len(gltf_materials) else {}
+        ):
+            needs_back_uvs = True
+            by_position = {verts[v]: vert_uvs[v] for v in tris[twin][:3]}
+            back_uvs = tuple(by_position[verts[v]] for v in (a, b, c))
+        kept.append((a, b, c, slot_for(material_index, back_index), back_uvs))
+
+    # Dropping a twin can leave vertices nothing uses: keep only those that are.
+    used = sorted({v for tri in kept for v in tri[:3]})
+    new_index = {old: new for new, old in enumerate(used)}
+    out_verts = [verts[v] for v in used]
+    out_uvs = [vert_uvs[v] for v in used] if has_uvs else []
+    out_tris = [(new_index[a], new_index[b], new_index[c]) for a, b, c, _, _ in kept]
 
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(verts, [], tris)
+    mesh.from_pydata(out_verts, [], out_tris)
     for mat in mesh_materials:
         mesh.materials.append(mat)
-    for poly, slot in zip(mesh.polygons, tri_material_indices):
-        poly.material_index = slot
+    for poly, tri in zip(mesh.polygons, kept):
+        poly.material_index = tri[3]
 
     # UVs are per-LOOP (face-corner) in Blender, not per-vertex - each
-    # loop's own vertex_index looks back up into vert_uvs (built parallel
-    # to verts above, in the same per-primitive order) to find its UV.
-    if vert_uvs:
+    # loop's own vertex_index looks back up into out_uvs (parallel to
+    # out_verts) to find its UV.
+    if out_uvs:
         uv_layer = mesh.uv_layers.new(name="UVMap")
         for loop in mesh.loops:
-            uv_layer.data[loop.index].uv = vert_uvs[loop.vertex_index]
+            uv_layer.data[loop.index].uv = out_uvs[loop.vertex_index]
+    if needs_back_uvs:
+        # The back paint's own mapping, per corner; the other polygons just
+        # repeat the front mapping so the layer is complete.
+        back_layer = mesh.uv_layers.new(name=_BACK_UV_LAYER)
+        for loop in mesh.loops:
+            back_layer.data[loop.index].uv = out_uvs[loop.vertex_index]
+        for poly, tri in zip(mesh.polygons, kept):
+            if tri[4] is not None:
+                for corner, uv in zip(range(poly.loop_start, poly.loop_start + poly.loop_total), tri[4]):
+                    back_layer.data[corner].uv = uv
 
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
