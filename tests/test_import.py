@@ -567,6 +567,74 @@ def check_colorized_texture_is_tinted():
     print("colorized texture: re-tinted toward its colour (shift and tint) - OK")
 
 
+def _png(width, height, rows):
+    """A minimal PNG, RGBA when the pixels have 4 values and RGB when they
+    have 3, so the alpha test needs no image file: none of the committed
+    fixtures has a texture with its own alpha channel."""
+    import struct
+    import zlib
+
+    channels = len(rows[0][0])
+    raw = b"".join(b"\x00" + bytes(v for px in row for v in px) for row in rows)
+
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 6 if channels == 4 else 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+def check_alpha_materials_use_the_right_render_method():
+    """A texture with its own alpha channel (a fence, a lattice, a leaf)
+    renders with EEVEE's Dithered method, which needs no sorting, so the
+    holes show what is behind them from every angle; a flat translucent
+    colour (SketchUp's glass) stays Blended, which is smooth where Dithered
+    is grainy; and a front/back pair takes Dithered when either paint is a
+    cut-out texture, whichever order the paints come in."""
+
+    class Texture:
+        def __init__(self, data):
+            self.data, self.mime_type, self.filename = data, "image/png", ""
+
+    clear, solid = (255, 255, 255, 0), (255, 255, 255, 255)
+    textures = [
+        Texture(_png(2, 2, [[clear, solid], [solid, clear]])),  # 0: cut-out
+        Texture(_png(2, 2, [[(255, 255, 255)] * 2] * 2)),  # 1: opaque image
+    ]
+
+    def painted(name, texture_index=None, alpha=1.0):
+        pbr = {"baseColorFactor": [0.5, 0.5, 0.5, alpha]}
+        if texture_index is not None:
+            pbr["baseColorTexture"] = {"index": texture_index}
+        return {"name": name, "pbrMetallicRoughness": pbr, "doubleSided": True}
+
+    gltf = [
+        painted("cut-out", 0),
+        painted("opaque image", 1),
+        painted("glass", alpha=0.5),
+        painted("flat"),
+        painted("glass image", 1, alpha=0.5),
+    ]
+
+    def build(index):
+        return import_skp._get_or_build_material(index, gltf, {}, textures, {})
+
+    cutout = build(0)
+    alpha_links = cutout.node_tree.nodes["Principled BSDF"].inputs["Alpha"].links
+    assert alpha_links and alpha_links[0].from_node.type == "TEX_IMAGE", "cut-out alpha isn't wired to Alpha"
+    assert cutout.surface_render_method == "DITHERED", "a cut-out texture must use the Dithered render method"
+    assert build(2).surface_render_method == "BLENDED", "flat translucent glass must stay Blended"
+    assert build(4).surface_render_method == "BLENDED", "a translucent material with an opaque image stays Blended"
+    assert build(1).surface_render_method == "DITHERED" and build(3).surface_render_method == "DITHERED"
+
+    for front, back in ((0, 2), (2, 0), (0, 4), (4, 0)):
+        pair = import_skp._get_or_build_pair_material(front, back, gltf, {}, textures, {})
+        assert pair.surface_render_method == "DITHERED", f"pair ({front}, {back}) has a cut-out, must be Dithered"
+    glass_pair = import_skp._get_or_build_pair_material(2, 4, gltf, {}, textures, {})
+    assert glass_pair.surface_render_method == "BLENDED", "a pair of flat translucent paints must stay Blended"
+    print("alpha materials: cut-outs Dithered, flat glass Blended, pairs Dithered when either paint cuts out - OK")
+
+
 def check_missing_bundled_library_is_a_clear_error():
     """A bundled library that cannot be imported (what Blender 4.2.0-4.2.3 causes by
     installing the cp313 wheel into Python 3.11) stops the import with an actionable
@@ -605,6 +673,7 @@ def main():
         f"expected to check {len(EXPECTED)} fixtures, found {checked} .skp files in {FIXTURES_DIR}"
     )
     check_colorized_texture_is_tinted()
+    check_alpha_materials_use_the_right_render_method()
     print("test_import: all fixtures OK (including source-geometry discoverability)")
 
 
