@@ -601,12 +601,25 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache, textures,
             back_uvs = tuple(by_position[verts[v]] for v in (a, b, c))
         kept.append((a, b, c, slot_for(material_index, back_index), back_uvs))
 
-    # Dropping a twin can leave vertices nothing uses: keep only those that are.
-    used = sorted({v for tri in kept for v in tri[:3]})
-    new_index = {old: new for new, old in enumerate(used)}
-    out_verts = [verts[v] for v in used]
-    out_uvs = [vert_uvs[v] for v in used] if has_uvs else []
-    out_tris = [(new_index[a], new_index[b], new_index[c]) for a, b, c, _, _ in kept]
+    # openskp gives every face its own copy of the vertices it uses, so a
+    # shared corner arrives as several vertices at one position. Weld them
+    # (exact positions: they come from the same SketchUp vertex), or the mesh
+    # is several times larger than it should be and every face is detached
+    # from its neighbours. A triangle with two corners at one point has no
+    # area and would become an invalid polygon once welded: leave it out.
+    kept = [tri for tri in kept if len({verts[v] for v in tri[:3]}) == 3]
+    welded = {}  # position -> index in out_verts
+    out_verts = []
+    out_tris = []
+    for a, b, c, _, _ in kept:
+        corners = []
+        for v in (a, b, c):
+            index = welded.get(verts[v])
+            if index is None:
+                index = welded[verts[v]] = len(out_verts)
+                out_verts.append(verts[v])
+            corners.append(index)
+        out_tris.append(tuple(corners))
 
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(out_verts, [], out_tris)
@@ -615,23 +628,24 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache, textures,
     for poly, tri in zip(mesh.polygons, kept):
         poly.material_index = tri[3]
 
-    # UVs are per-LOOP (face-corner) in Blender, not per-vertex - each
-    # loop's own vertex_index looks back up into out_uvs (parallel to
-    # out_verts) to find its UV.
-    if out_uvs:
+    # UVs are per-LOOP (face-corner) in Blender, and a welded vertex is shared
+    # by faces that map it differently (a texture seam), so each corner takes
+    # the UV of the source vertex it came from, not one UV per welded vertex.
+    # Every polygon is a triangle, so polygon i owns loops 3i .. 3i+2, in the
+    # corner order of kept[i].
+    if has_uvs:
+        front_uvs = [uv for tri in kept for v in tri[:3] for uv in vert_uvs[v]]
         uv_layer = mesh.uv_layers.new(name="UVMap")
-        for loop in mesh.loops:
-            uv_layer.data[loop.index].uv = out_uvs[loop.vertex_index]
-    if needs_back_uvs:
-        # The back paint's own mapping, per corner; the other polygons just
-        # repeat the front mapping so the layer is complete.
-        back_layer = mesh.uv_layers.new(name=_BACK_UV_LAYER)
-        for loop in mesh.loops:
-            back_layer.data[loop.index].uv = out_uvs[loop.vertex_index]
-        for poly, tri in zip(mesh.polygons, kept):
-            if tri[4] is not None:
-                for corner, uv in zip(range(poly.loop_start, poly.loop_start + poly.loop_total), tri[4]):
-                    back_layer.data[corner].uv = uv
+        uv_layer.data.foreach_set("uv", front_uvs)
+        if needs_back_uvs:
+            # The back paint's own mapping, per corner; the other polygons just
+            # repeat the front mapping so the layer is complete.
+            back_uvs = list(front_uvs)
+            for i, tri in enumerate(kept):
+                if tri[4] is not None:
+                    back_uvs[6 * i:6 * i + 6] = [value for uv in tri[4] for value in uv]
+            back_layer = mesh.uv_layers.new(name=_BACK_UV_LAYER)
+            back_layer.data.foreach_set("uv", back_uvs)
 
     mesh.update()
     obj = bpy.data.objects.new(name, mesh)
