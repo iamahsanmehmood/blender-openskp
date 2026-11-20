@@ -637,6 +637,77 @@ def check_alpha_materials_use_the_right_render_method():
     print("alpha materials: cut-outs Dithered, flat glass Blended, pairs Dithered when either paint cuts out - OK")
 
 
+def check_vertices_are_welded():
+    """openskp gives every face its own copy of its vertices; the importer
+    welds the ones at the same position, so a box is 8 vertices (what Merge by
+    Distance leaves) and not one detached set per face, while each corner keeps
+    its own UV so a texture seam survives the weld (blender-openskp#16)."""
+    import tempfile
+
+    import bmesh
+    import openskp
+
+    s = 100.0
+
+    def P(x, y, z):
+        return (x * s, y * s, z * s)
+
+    # An open box (no top), faces wound outward, textured on the front side.
+    faces = [
+        [P(0, 0, 0), P(0, 1, 0), P(1, 1, 0), P(1, 0, 0)],
+        [P(0, 0, 0), P(1, 0, 0), P(1, 0, 1), P(0, 0, 1)],
+        [P(1, 0, 0), P(1, 1, 0), P(1, 1, 1), P(1, 0, 1)],
+        [P(1, 1, 0), P(0, 1, 0), P(0, 1, 1), P(1, 1, 1)],
+        [P(0, 1, 0), P(0, 0, 0), P(0, 0, 1), P(0, 1, 1)],
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        image = os.path.join(tmp, "grid.png")
+        with open(image, "wb") as f:
+            f.write(_png(2, 2, [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (255, 255, 0)]]))
+        skp = os.path.join(tmp, "box.skp")
+        builder = openskp.SkpBuilder()
+        front = builder.add_texture_material("Grid", image, 10, 10)
+        back = builder.add_material("Orange", (255, 128, 0, 255))
+        for face in faces:
+            builder.add_face(face, material=front, back_material=back)
+        builder.save(skp)
+
+        resource = openskp.SkpFile.open(skp).build_instanced_scene().mesh_resources[0]
+        source = {
+            (tuple(round(c, 3) for c in prim.positions[i * 3:i * 3 + 3]),
+             tuple(round(c, 4) for c in prim.uvs[i * 2:i * 2 + 2]))
+            for prim in resource.primitives
+            for i in range(len(prim.positions) // 3)
+        }
+        source_vertices = sum(len(prim.positions) // 3 for prim in resource.primitives)
+        before = set(bpy.data.objects)
+        import_skp.import_skp(skp)
+        (obj,) = [o for o in set(bpy.data.objects) - before if o.type == "MESH"]
+
+    mesh = obj.data
+    assert source_vertices > 8, "the test box must arrive with detached per-face vertices"
+    assert len(mesh.vertices) == 8, f"box: {len(mesh.vertices)} vertices, expected the 8 corners"
+    assert len(mesh.polygons) == 10, f"box: {len(mesh.polygons)} polygons, expected 5 faces x 2 triangles"
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    before_count = len(bm.verts)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=1e-4)
+    assert before_count == len(bm.verts), "Merge by Distance still finds vertices to remove"
+    bm.free()
+
+    # Each corner keeps the UV of the source vertex it came from, so a vertex
+    # shared by faces that map it differently has several UVs, none invented.
+    uv_data = mesh.uv_layers["UVMap"].data
+    per_vertex = {}
+    for loop in mesh.loops:
+        position = tuple(round(c, 3) for c in mesh.vertices[loop.vertex_index].co)
+        uv = tuple(round(c, 4) for c in uv_data[loop.index].uv)
+        assert (position, uv) in source, f"corner {position} has UV {uv}, which the source never gives it"
+        per_vertex.setdefault(loop.vertex_index, set()).add(uv)
+    assert any(len(uvs) > 1 for uvs in per_vertex.values()), "no welded vertex kept more than one UV (seams lost)"
+    print(f"vertices welded: {source_vertices} source vertices -> 8, per-corner UVs kept - OK")
+
+
 def _world_matrices(objects):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     return sorted(
@@ -726,6 +797,7 @@ def main():
     )
     check_colorized_texture_is_tinted()
     check_alpha_materials_use_the_right_render_method()
+    check_vertices_are_welded()
     check_hierarchy("capilla_quiroz_v17.skp", expected_groups=0)
     check_nesting_tree()
     print("test_import: all fixtures OK (including source-geometry discoverability)")
