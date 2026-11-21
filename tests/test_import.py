@@ -44,10 +44,16 @@ EXPECTED = {
     "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0, 3),
     # OpenSKP's own nesting fixture: groups Outer > Shelf > Inner, each with faces.
     "nesting_2021.skp": (3, 3, 6, 0, 0, 0, 1, 0, 0),
-    # One face with a TIFF-textured material: a scene carries only PNG and JPEG, so no texture
-    # comes in (textures_loaded 0); see check_a_skipped_texture_is_reported_by_the_import.
+    # One face each with a TIFF, TGA or GIF textured material. The last number, textures_loaded, is
+    # 0 with an openskp that leaves such a texture out (the 1.5.0 bundled here) and, with one that
+    # keeps it, 1 for TIFF and TGA but still 0 for GIF, which Blender cannot use as an image
+    # (_UNLOADABLE_TEXTURES); check() sets it from the library in use. See
+    # check_original_textures_are_loaded.
     "texture_tiff_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
+    "texture_tga_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
+    "texture_gif_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
 }
+TEXTURE_FIXTURES = ("texture_tiff_2021.skp", "texture_tga_2021.skp", "texture_gif_2021.skp")
 
 
 def check(fixture_name):
@@ -71,6 +77,9 @@ def check(fixture_name):
     )
     print(f"{fixture_name}: {got}")
     expected = EXPECTED.get(fixture_name)
+    if fixture_name in TEXTURE_FIXTURES:
+        loaded = 1 if _library_keeps_original_textures() and fixture_name != "texture_gif_2021.skp" else 0
+        expected = expected[:8] + (loaded,)
     if expected is not None:
         assert got == expected, f"{fixture_name}: expected {expected}, got {got}"
     if stats["unique_meshes"]:
@@ -737,20 +746,61 @@ def check_import_reports_no_warnings_for_a_clean_file():
     print("a file with PNG/JPEG textures: no warnings - OK")
 
 
+def _library_keeps_original_textures():
+    """Whether the openskp library in use can keep a TIFF, TGA or GIF texture in a scene (newer
+    than the 1.5.0 bundled in this add-on); the texture fixtures import differently without it."""
+    import inspect
+
+    import openskp
+
+    return "original_textures" in inspect.signature(openskp.SkpFile.build_instanced_scene).parameters
+
+
 def check_a_skipped_texture_is_reported_by_the_import():
-    """A TIFF-textured material comes in without its texture, and the import
-    says so (blender-openskp#17). Needs an openskp that logs it (newer than the
-    1.5.0 bundled in this add-on); with an older one this has nothing to check."""
+    """With an openskp that logs a texture it leaves out but cannot keep it (between 1.5.0 and the
+    release that can), a TIFF-textured material comes in without its texture and the import says
+    so (blender-openskp#17). Neither an older library (nothing logged) nor a newer one (which
+    keeps the texture, see check_original_textures_are_loaded) has anything to check here."""
     import openskp.scene
 
     if not hasattr(openskp.scene, "_warn_skipped_texture"):
         print("skipped-texture warning: the bundled openskp does not log it yet - not checked")
+        return
+    if _library_keeps_original_textures():
+        print("skipped-texture warning: this openskp keeps the texture instead - not checked")
         return
     stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "texture_tiff_2021.skp"))
     assert stats["textures_loaded"] == 0
     assert len(stats["warnings"]) == 1, stats["warnings"]
     assert "Tex_TIF" in stats["warnings"][0] and "TIFF" in stats["warnings"][0], stats["warnings"]
     print("a TIFF texture: skipped, and the import reports it - OK")
+
+
+def check_original_textures_are_loaded():
+    """A TIFF or TGA texture comes in as a real, packed Blender image wired into the material,
+    where it used to be dropped (blender-openskp#17). Needs an openskp that can keep it."""
+    if not _library_keeps_original_textures():
+        print("original textures: the bundled openskp cannot keep them yet - not checked")
+        return
+    for name in ("texture_tiff_2021.skp", "texture_tga_2021.skp"):
+        before = set(bpy.data.images)
+        stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, name))
+        assert stats["textures_loaded"] == 1 and stats["warnings"] == [], (name, stats)
+        (image,) = set(bpy.data.images) - before
+        assert tuple(image.size) == (64, 64), (name, tuple(image.size))
+        assert image.packed_file is not None, f"{name}: the image is not packed into the .blend"
+        shown = [
+            mat.name
+            for mat in bpy.data.materials
+            if mat.use_nodes and any(node.type == "TEX_IMAGE" and node.image == image for node in mat.node_tree.nodes)
+        ]
+        assert shown, f"{name}: no material shows the loaded image"
+    # A GIF is kept by the library but Blender opens it as a movie: no image, and the import says so.
+    before = set(bpy.data.images)
+    stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "texture_gif_2021.skp"))
+    assert stats["textures_loaded"] == 0 and set(bpy.data.images) == before
+    assert len(stats["warnings"]) == 1 and "GIF" in stats["warnings"][0], stats["warnings"]
+    print("original textures: TIFF and TGA come in as packed images in the material, a GIF is reported - OK")
 
 
 def _world_matrices(objects):
@@ -846,6 +896,7 @@ def main():
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
     check_a_skipped_texture_is_reported_by_the_import()
+    check_original_textures_are_loaded()
     check_hierarchy("capilla_quiroz_v17.skp", expected_groups=0)
     check_nesting_tree()
     print("test_import: all fixtures OK (including source-geometry discoverability)")

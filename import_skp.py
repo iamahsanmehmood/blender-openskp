@@ -109,6 +109,7 @@ is available.
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
 import tempfile
@@ -144,6 +145,28 @@ def _gltf_matrix_to_blender(m):
     )
 
 
+# The file extension Blender needs to recognise an image's format when it loads it, by the MIME
+# type openskp reports. Anything not listed is loaded as a JPEG (what every non-PNG texture was
+# before openskp could carry a scene texture in its own format).
+_TEXTURE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/tiff": ".tif",
+    "image/gif": ".gif",
+    "image/x-tga": ".tga",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+    "image/vnd.adobe.photoshop": ".psd",
+    "image/vnd.ms-dds": ".dds",
+    "image/jp2": ".jp2",
+}
+
+# Texture formats the scene can carry that Blender cannot use as an image texture. Blender opens a
+# GIF as a MOVIE source: the file stays open (it cannot be removed after packing) and the frame is
+# not reliably there, so a material with one is built without it, and the import says so.
+_UNLOADABLE_TEXTURES = {"image/gif": "GIF"}
+
+
 def _get_or_build_texture_image(texture_index, textures, image_cache):
     """Returns the Blender Image for textures[texture_index], loading and
     packing it exactly once and caching it for every later material that
@@ -163,7 +186,9 @@ def _get_or_build_texture_image(texture_index, textures, image_cache):
         return None
 
     tex = textures[texture_index]
-    ext = ".png" if tex.mime_type == "image/png" else ".jpg"
+    if tex.mime_type in _UNLOADABLE_TEXTURES:
+        return None
+    ext = _TEXTURE_EXTENSIONS.get(tex.mime_type, ".jpg")
     fd, path = tempfile.mkstemp(suffix=ext)
     try:
         with os.fdopen(fd, "wb") as f:
@@ -962,8 +987,21 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
     print(f"openskp: parsing {os.path.basename(filepath)}...")
     t0 = time.time()
     skp = openskp.SkpFile.open(filepath)
+    # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp newer than the
+    # 1.5.0 bundled here can keep it in its own format, which Blender reads); older ones have no
+    # such option and build the scene as before.
+    options = {}
+    if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
+        options["original_textures"] = True
     with _capture_library_warnings() as library_warnings:
-        scene = skp.build_instanced_scene()
+        scene = skp.build_instanced_scene(**options)
+    for index, texture in enumerate(getattr(scene, "textures", None) or []):
+        if texture.mime_type in _UNLOADABLE_TEXTURES:
+            name = os.path.basename(texture.filename) if texture.filename else f"number {index}"
+            library_warnings.append(
+                f"Texture {name} is a {_UNLOADABLE_TEXTURES[texture.mime_type]}, which Blender cannot use as an "
+                "image texture: the materials that use it are built without it"
+            )
     for message in library_warnings:
         print(f"openskp: warning: {message}")
     print(f"openskp: parsed in {time.time() - t0:.1f}s, building objects...")
