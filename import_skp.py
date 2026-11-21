@@ -987,9 +987,9 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
     print(f"openskp: parsing {os.path.basename(filepath)}...")
     t0 = time.time()
     skp = openskp.SkpFile.open(filepath)
-    # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp newer than the
-    # 1.5.0 bundled here can keep it in its own format, which Blender reads); older ones have no
-    # such option and build the scene as before.
+    # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp 1.6.0 and newer
+    # can keep it in its own format, which Blender reads); older ones have no such option and
+    # build the scene as before.
     options = {}
     if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
         options["original_textures"] = True
