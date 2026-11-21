@@ -45,7 +45,7 @@ EXPECTED = {
     # OpenSKP's own nesting fixture: groups Outer > Shelf > Inner, each with faces.
     "nesting_2021.skp": (3, 3, 6, 0, 0, 0, 1, 0, 0),
     # One face each with a TIFF, TGA or GIF textured material. The last number, textures_loaded, is
-    # 0 with an openskp that leaves such a texture out (the 1.5.0 bundled here) and, with one that
+    # 0 with an openskp that leaves such a texture out (before 1.6.0, which is bundled now) and, with one that
     # keeps it, 1 for TIFF and TGA but still 0 for GIF, which Blender cannot use as an image
     # (_UNLOADABLE_TEXTURES); check() sets it from the library in use. See
     # check_original_textures_are_loaded.
@@ -747,8 +747,8 @@ def check_import_reports_no_warnings_for_a_clean_file():
 
 
 def _library_keeps_original_textures():
-    """Whether the openskp library in use can keep a TIFF, TGA or GIF texture in a scene (newer
-    than the 1.5.0 bundled in this add-on); the texture fixtures import differently without it."""
+    """Whether the openskp library in use can keep a TIFF, TGA or GIF texture in a scene (1.6.0 and
+    newer, which is what this add-on bundles); the texture fixtures import differently without it."""
     import inspect
 
     import openskp
@@ -757,8 +757,8 @@ def _library_keeps_original_textures():
 
 
 def check_a_skipped_texture_is_reported_by_the_import():
-    """With an openskp that logs a texture it leaves out but cannot keep it (between 1.5.0 and the
-    release that can), a TIFF-textured material comes in without its texture and the import says
+    """With an openskp that logs a texture it leaves out but cannot keep it (a build between 1.5.0
+    and 1.6.0; the bundled library is past that), a TIFF-textured material comes in without its texture and the import says
     so (blender-openskp#17). Neither an older library (nothing logged) nor a newer one (which
     keeps the texture, see check_original_textures_are_loaded) has anything to check here."""
     import openskp.scene

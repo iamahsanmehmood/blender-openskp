@@ -134,9 +134,8 @@ grainy. Cycles ignores the setting. The same source image shared by
 several materials loads once, not once per material. SketchUp keeps a
 TIFF, TGA or GIF texture in the format it was imported in (BMP it converts to
 PNG), and a scene carries only PNG and JPEG unless the library is asked to
-keep the original: with a library that can (newer than the 1.5.0 bundled
-here), a TIFF or TGA texture comes in like any other, packed into the
-`.blend`. A GIF does not: Blender opens it as a movie, so a material with a
+keep the original: the bundled library (OpenSKP 1.6.0) can, so a TIFF or
+TGA texture comes in like any other, packed into the `.blend`. A GIF does not: Blender opens it as a movie, so a material with a
 GIF texture is built without it. When a texture is left out for any reason,
 the import says so: a warning in Blender's status bar and, with every
 message, in the console, naming the material or file and the format.
