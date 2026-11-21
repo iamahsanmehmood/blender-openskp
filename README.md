@@ -23,6 +23,25 @@ project, just not the other way around, so this doesn't affect OpenSKP
 itself or the [FreeCAD addon](https://github.com/iamahsanmehmood/freecad-openskp),
 which both remain MIT.
 
+## Featured
+
+This add-on has been covered by [Blender 3D Architect](https://www.youtube.com/@blender3darchitect), a YouTube channel about Blender for architecture:
+
+<table>
+<tr>
+<td align="center" width="50%">
+<a href="https://www.youtube.com/watch?v=q-Gjsa4tuPU"><img src="https://img.youtube.com/vi/q-Gjsa4tuPU/mqdefault.jpg" alt="Blender and FreeCAD Can Now Read and Write SketchUp Files (video)" width="100%"></a><br>
+<b>Blender and FreeCAD Can Now Read and Write SketchUp Files</b><br>
+<sub>Blender 3D Architect · October 2026</sub>
+</td>
+<td align="center" width="50%">
+<a href="https://www.youtube.com/watch?v=M43s__dC3FM"><img src="https://img.youtube.com/vi/M43s__dC3FM/mqdefault.jpg" alt="Blender 5.3 Just Made Importing SketchUp Files Easier Than Ever (video)" width="100%"></a><br>
+<b>Blender 5.3 Just Made Importing SketchUp Files Easier Than Ever</b><br>
+<sub>Blender 3D Architect · November 2026</sub>
+</td>
+</tr>
+</table>
+
 ## What it does
 
 **Import** parses a `.skp` file via OpenSKP's `build_instanced_scene()` —
@@ -178,8 +197,9 @@ staying standalone too.
 
 ## Installation
 
-Not yet published on the [Blender Extensions Platform](https://extensions.blender.org/).
-Install manually, either way:
+**Easiest:** it's on the official [Blender Extensions Platform](https://extensions.blender.org/add-ons/openskp-import-export/). In Blender, open **Edit → Preferences → Get Extensions**, search for **OpenSKP**, and click **Install**.
+
+Or install manually, either way:
 
 - **Latest release**: download the zip from the [latest release](https://github.com/iamahsanmehmood/blender-openskp/releases/latest).
 - **Latest `main`, no release needed**: click the green **Code** button on this page → **Download ZIP** (no git required) — installs the same way, always up to date, useful when a fix has landed but hasn't made it into a packaged release yet. Verified directly: this repo's own zip download installs and runs correctly, no extraction or rebuilding needed.
