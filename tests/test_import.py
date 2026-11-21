@@ -44,6 +44,9 @@ EXPECTED = {
     "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0, 3),
     # OpenSKP's own nesting fixture: groups Outer > Shelf > Inner, each with faces.
     "nesting_2021.skp": (3, 3, 6, 0, 0, 0, 1, 0, 0),
+    # One face with a TIFF-textured material: a scene carries only PNG and JPEG, so no texture
+    # comes in (textures_loaded 0); see check_a_skipped_texture_is_reported_by_the_import.
+    "texture_tiff_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
 }
 
 
@@ -708,6 +711,48 @@ def check_vertices_are_welded():
     print(f"vertices welded: {source_vertices} source vertices -> 8, per-corner UVs kept - OK")
 
 
+def check_library_warnings_are_collected():
+    """Warnings the openskp library logs while it builds a scene (a texture
+    format a scene cannot carry, ...) are collected during the import, each
+    distinct message once, and nothing else: not info messages, not other
+    loggers' warnings, and the handler is gone afterwards."""
+    import logging
+
+    library = logging.getLogger("openskp")
+    handlers_before = list(library.handlers)
+    with import_skp._capture_library_warnings() as messages:
+        logging.getLogger("openskp.scene").warning("Texture of material %r is TIFF", "Wall")
+        logging.getLogger("openskp.instanced_scene").warning("Texture of material %r is TIFF", "Wall")
+        logging.getLogger("openskp.scene").warning("Texture of material %r is TGA", "Floor")
+        logging.getLogger("openskp.scene").info("not a warning")
+        logging.getLogger("somebody_else").warning("not openskp's")
+    assert messages == ["Texture of material 'Wall' is TIFF", "Texture of material 'Floor' is TGA"], messages
+    assert list(library.handlers) == handlers_before, "the capture handler was not removed"
+    print("library warnings: collected once each, nothing else, handler removed - OK")
+
+
+def check_import_reports_no_warnings_for_a_clean_file():
+    stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp"))
+    assert stats["warnings"] == [], stats["warnings"]
+    print("a file with PNG/JPEG textures: no warnings - OK")
+
+
+def check_a_skipped_texture_is_reported_by_the_import():
+    """A TIFF-textured material comes in without its texture, and the import
+    says so (blender-openskp#17). Needs an openskp that logs it (newer than the
+    1.5.0 bundled in this add-on); with an older one this has nothing to check."""
+    import openskp.scene
+
+    if not hasattr(openskp.scene, "_warn_skipped_texture"):
+        print("skipped-texture warning: the bundled openskp does not log it yet - not checked")
+        return
+    stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "texture_tiff_2021.skp"))
+    assert stats["textures_loaded"] == 0
+    assert len(stats["warnings"]) == 1, stats["warnings"]
+    assert "Tex_TIF" in stats["warnings"][0] and "TIFF" in stats["warnings"][0], stats["warnings"]
+    print("a TIFF texture: skipped, and the import reports it - OK")
+
+
 def _world_matrices(objects):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     return sorted(
@@ -798,6 +843,9 @@ def main():
     check_colorized_texture_is_tinted()
     check_alpha_materials_use_the_right_render_method()
     check_vertices_are_welded()
+    check_library_warnings_are_collected()
+    check_import_reports_no_warnings_for_a_clean_file()
+    check_a_skipped_texture_is_reported_by_the_import()
     check_hierarchy("capilla_quiroz_v17.skp", expected_groups=0)
     check_nesting_tree()
     print("test_import: all fixtures OK (including source-geometry discoverability)")

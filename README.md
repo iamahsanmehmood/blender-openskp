@@ -112,7 +112,13 @@ depends on an external file path. A texture with its own alpha channel
 its holes show what is behind them from every angle; flat translucent
 colours such as glass stay **Blended**, which is smooth where Dithered is
 grainy. Cycles ignores the setting. The same source image shared by
-several materials loads once, not once per material. Export doesn't
+several materials loads once, not once per material. Only PNG and JPEG
+textures come in: SketchUp keeps a TIFF, TGA or GIF texture in its own
+format, and the scene the library builds carries only PNG and JPEG, so such
+a material is imported without its texture. With a library that reports it
+(newer than the 1.5.0 bundled here), the import then says so: a warning in
+Blender's status bar and, with every message, in the console, naming the
+material and the format. Export doesn't
 write texture images back out yet — a textured material exports as its
 resolved solid color only, same as materials export always has.
 
