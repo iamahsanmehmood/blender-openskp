@@ -42,6 +42,11 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
             f"{stats['unique_curve_meshes']} loose-edge groups "
             f"({stats['curve_placements']} placed)",
         )
+        warnings = stats.get("warnings") or []
+        if warnings:
+            # Blender's status bar shows one line; the console has every message
+            more = f" (and {len(warnings) - 1} more, see the console)" if len(warnings) > 1 else ""
+            self.report({"WARNING"}, f"OpenSKP: {warnings[0]}{more}")
         return {"FINISHED"}
 
 

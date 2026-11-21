@@ -109,6 +109,7 @@ is available.
 from __future__ import annotations
 
 import importlib
+import logging
 import os
 import tempfile
 import time
@@ -902,6 +903,35 @@ def _find_layer_collection(layer_collection, target_collection):
 _BUNDLED_LIBRARIES = ("mapbox_earcut", "shapely")
 
 
+class _CapturedWarnings(logging.Handler):
+    """Collects the warnings the openskp library logs while it builds a scene
+    (a texture format a scene cannot carry, a missing optional dependency, ...),
+    so the import can show them to the user instead of leaving them in a log
+    nobody reads. Each distinct message is kept once, in the order it came."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        message = record.getMessage()
+        if message not in self.messages:
+            self.messages.append(message)
+
+
+class _capture_library_warnings:
+    def __enter__(self):
+        self.handler = _CapturedWarnings()
+        self._logger = logging.getLogger("openskp")
+        self._logger.addHandler(self.handler)
+        return self.handler.messages
+
+    def __exit__(self, *exc_info):
+        self._logger.removeHandler(self.handler)
+        return False
+
+
+
 def check_bundled_libraries():
     """Raises RuntimeError, with something the user can act on, when a library
     bundled with this extension cannot be imported."""
@@ -932,7 +962,10 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
     print(f"openskp: parsing {os.path.basename(filepath)}...")
     t0 = time.time()
     skp = openskp.SkpFile.open(filepath)
-    scene = skp.build_instanced_scene()
+    with _capture_library_warnings() as library_warnings:
+        scene = skp.build_instanced_scene()
+    for message in library_warnings:
+        print(f"openskp: warning: {message}")
     print(f"openskp: parsed in {time.time() - t0:.1f}s, building objects...")
 
     resources_by_id = {r.id: r for r in scene.mesh_resources}
@@ -953,6 +986,9 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         "curve_placements": 0,
         "curve_runs": 0,
         "groups": 0,
+        # what the library warned about while building the scene (a texture
+        # it could not carry, ...); the operator shows it in Blender's report
+        "warnings": library_warnings,
     }
 
     root_name = os.path.splitext(os.path.basename(filepath))[0]
