@@ -103,9 +103,10 @@ than reimplementing SketchUp's material-inheritance rules here.
   is imported as one polygon whose material mixes the two paints on
   Geometry > Backfacing (named `Front | Back`), so EEVEE and Cycles show
   each side's own paint and nothing overlaps. Solid shading cannot read
-  node trees, so it shows the front paint on both sides. A texture on the
-  back side is read from a second UV layer, `UVMap_back`. Export writes the
-  front paint only; the back paint is not exported yet.
+  node trees, so it shows the painted side's colour when the other side is
+  unpainted, and the front paint when both sides are painted. A texture on
+  the back side is read from a second UV layer, `UVMap_back`. Export writes
+  the front paint only; the back paint is not exported yet.
 - **Colorized textures** (SketchUp's `[Name]1` copies of a texture
   recoloured in the Materials panel) are re-tinted toward their colour
   with a Mix node labelled "SketchUp colorize" — an approximation of

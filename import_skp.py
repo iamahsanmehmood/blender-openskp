@@ -340,14 +340,32 @@ def _use_dithered_alpha(mat):
 _BACK_UV_LAYER = "UVMap_back"
 
 
+def _is_painted(gltf_mat):
+    """Whether ``gltf_mat`` comes from a SketchUp material (which carries its
+    name or a texture) rather than an unpainted side's fallback colour."""
+    return bool(gltf_mat.get("name")) or _has_texture(gltf_mat)
+
+
+def _solid_display_material(front, back):
+    """Which side's colour Solid viewport shading (``Material.diffuse_color``)
+    shows for a front/back pair: the painted side when the other side is
+    unpainted (such as a box wall painted only on the inside, #16), and the
+    polygon's front side when both sides are painted or neither is."""
+    if _is_painted(back) and not _is_painted(front):
+        return back
+    return front
+
+
 def _get_or_build_pair_material(front_index, back_index, gltf_materials, material_cache, textures, image_cache):
     """The Blender Material for a polygon with one paint on its front and
     another on its back: both surfaces live in one node tree and a Mix
     Shader driven by Geometry > Backfacing picks between them, so the
     polygon is visible, and correct, from both sides in every render engine
-    (and Solid shading shows the front paint, with no overlapping copy to
-    fight it). The back surface reads its texture from the UVMap_back
-    layer. Cached per (front, back) pair of openskp material indices."""
+    (and Solid shading shows the painted side when the other side is just
+    the default, or the front paint when both sides are painted, with no
+    overlapping copy to fight it). The back surface reads its texture from
+    the UVMap_back layer. Cached per (front, back) pair of openskp material
+    indices."""
     key = (front_index, back_index)
     if key in material_cache:
         return material_cache[key]
@@ -364,9 +382,9 @@ def _get_or_build_pair_material(front_index, back_index, gltf_materials, materia
     mat["openskp_material_index"] = front_index
     mat["openskp_back_material_index"] = back_index
     mat.use_nodes = True
-    r, g, b, a = _base_color(front)
+    r, g, b, a = _base_color(_solid_display_material(front, back))
     lr, lg, lb = srgb_to_linear((r, g, b))
-    mat.diffuse_color = (lr, lg, lb, a)  # Solid shading shows the front paint
+    mat.diffuse_color = (lr, lg, lb, a)
 
     nt = mat.node_tree
     front_bsdf = nt.nodes.get("Principled BSDF")
@@ -530,11 +548,12 @@ def _find_twin_triangles(verts, tris):
 
 
 def _choose_front_triangles(verts, tris, twin_of):
-    """{kept triangle: dropped twin}. Either copy can carry the pair, because
-    the Backfacing mix picks the paint by which side is seen; this only
-    decides which paint Solid shading shows, so the copy facing away from
-    the mesh's centre (the outside of a box) is kept, and the first one when
-    that does not decide."""
+    """{kept triangle: dropped twin}. Either copy can carry the pair in EEVEE
+    and Cycles, because the Backfacing mix picks the paint by which side is
+    seen; keeping the copy facing away from the mesh's centre (the outside of
+    a box, and the first copy when that does not decide) preserves outward
+    polygon normals and decides which paint Solid shading shows when both
+    sides are painted (or neither is)."""
     if not twin_of:
         return {}
     centre = [sum(v[axis] for v in verts) / len(verts) for axis in range(3)]

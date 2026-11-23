@@ -325,10 +325,17 @@ def check_front_back_pairs(fixture_name, scene, resource, obj):
         front_in = mix.inputs[1].links[0].from_node
         back_in = mix.inputs[2].links[0].from_node
         assert front_in.name != back_in.name and front_in.type == back_in.type == "BSDF_PRINCIPLED"
-        r, g, b, a = front_gltf.get("pbrMetallicRoughness", {}).get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
+        front_painted = bool(front_gltf.get("name")) or bool(
+            front_gltf.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+        )
+        back_painted = bool(back_gltf.get("name")) or bool(
+            back_gltf.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+        )
+        solid_gltf = back_gltf if back_painted and not front_painted else front_gltf
+        r, g, b, a = solid_gltf.get("pbrMetallicRoughness", {}).get("baseColorFactor", [0.8, 0.8, 0.8, 1.0])
         expected = tuple(round(c, 3) for c in (*import_skp.srgb_to_linear((r, g, b)), a))
         assert tuple(round(c, 3) for c in mat.diffuse_color) == expected, (
-            f"{label}/{mat.name}: Solid shading should show the front paint"
+            f"{label}/{mat.name}: Solid shading should show the painted side (or front when both are painted)"
         )
         if back_gltf.get("pbrMetallicRoughness", {}).get("baseColorTexture"):
             assert import_skp._BACK_UV_LAYER in mesh.uv_layers, f"{label}: textured back paint but no back UV layer"
@@ -880,6 +887,106 @@ def check_missing_bundled_library_is_a_clear_error():
     print("missing bundled library: clear error naming it and Blender 4.2.4 - OK")
 
 
+def check_solid_view_shows_painted_side():
+    """In Solid viewport shading (`Material.diffuse_color`), a face painted on
+    only one side shows that painted side's colour even when the painted side
+    faces into the mesh (e.g. a box wall painted only on the inside, with its
+    outward polygon side unpainted, blender-openskp#16), while keeping outward
+    polygon normals and the EEVEE/Cycles front/back shader mix intact. When
+    both sides are painted (or neither is), Solid shading shows the polygon's
+    front (outward) paint."""
+    import tempfile
+
+    import mathutils
+    import openskp
+
+    s = 100.0
+    sm = s * 0.0254
+
+    def P(x, y, z):
+        return (x * s, y * s, z * s)
+
+    aluminum_rgb = (180, 190, 205)
+    blue_rgb = (20, 90, 220)
+    orange_rgb = (240, 120, 20)
+
+    def linear_rgba(rgb):
+        return tuple(round(c, 3) for c in (*import_skp.srgb_to_linear(tuple(v / 255 for v in rgb)), 1.0))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skp = os.path.join(tmp, "solid_sides_box.skp")
+        builder = openskp.SkpBuilder()
+        alum = builder.add_material("Metal Aluminum Anodized", (*aluminum_rgb, 255))
+        blue = builder.add_material("Blue", (*blue_rgb, 255))
+        orange = builder.add_material("Orange", (*orange_rgb, 255))
+
+        # +X wall: wound INWARD, painted Aluminum on its SketchUp front (inside)
+        # and unpainted on its SketchUp back (outside) - reproduces box.skp in #16.
+        builder.add_face([P(1, 0, 1), P(1, 1, 1), P(1, 1, 0), P(1, 0, 0)], material=alum)
+        # -Y wall: wound outward, painted Blue on outside, unpainted inside.
+        builder.add_face([P(0, 0, 0), P(1, 0, 0), P(1, 0, 1), P(0, 0, 1)], material=blue)
+        # +Y wall: wound outward, painted Blue outside and Orange inside.
+        builder.add_face([P(1, 1, 0), P(0, 1, 0), P(0, 1, 1), P(1, 1, 1)], material=blue, back_material=orange)
+        # -X wall: wound INWARD, painted Orange on front (inside) and Blue on back (outside).
+        builder.add_face([P(0, 1, 0), P(0, 1, 1), P(0, 0, 1), P(0, 0, 0)], material=orange, back_material=blue)
+        # Unpainted bottom (-Z) and top (+Z) close the box.
+        builder.add_face([P(0, 0, 0), P(0, 1, 0), P(1, 1, 0), P(1, 0, 0)])
+        builder.add_face([P(0, 0, 1), P(1, 0, 1), P(1, 1, 1), P(0, 1, 1)])
+        builder.save(skp)
+
+        before = set(bpy.data.objects)
+        import_skp.import_skp(skp)
+        (obj,) = [o for o in set(bpy.data.objects) - before if o.type == "MESH"]
+
+    mesh = obj.data
+    assert len(mesh.polygons) == 12, f"expected 6 quads x 2 triangles, got {len(mesh.polygons)}"
+    centre = sum((v.co for v in mesh.vertices), mathutils.Vector()) / len(mesh.vertices)
+
+    wall_colors = {"+X": set(), "-X": set(), "-Y": set(), "+Y": set()}
+    plus_x_mats = set()
+    for poly in mesh.polygons:
+        assert poly.normal.dot(poly.center - centre) > 0, (
+            f"polygon at {tuple(poly.center)} has inward normal {tuple(poly.normal)}"
+        )
+        mat = mesh.materials[poly.material_index]
+        diffuse = tuple(round(c, 3) for c in mat.diffuse_color)
+        # Local mesh coordinates are glTF Y-up metres: (x_m, z_m, -y_m).
+        if abs(poly.center.x - sm) < 1e-4:
+            wall_colors["+X"].add(diffuse)
+            plus_x_mats.add(mat)
+        elif abs(poly.center.x) < 1e-4:
+            wall_colors["-X"].add(diffuse)
+        elif abs(poly.center.z) < 1e-4:
+            wall_colors["-Y"].add(diffuse)
+        elif abs(poly.center.z + sm) < 1e-4:
+            wall_colors["+Y"].add(diffuse)
+
+    assert wall_colors["+X"] == {linear_rgba(aluminum_rgb)}, (
+        f"+X wall (painted inside, unpainted outside) should show Aluminum in Solid view, got {wall_colors['+X']}"
+    )
+    assert wall_colors["-Y"] == {linear_rgba(blue_rgb)}, f"-Y wall got {wall_colors['-Y']}"
+    assert wall_colors["+Y"] == {linear_rgba(blue_rgb)}, f"+Y wall (both painted) got {wall_colors['+Y']}"
+    assert wall_colors["-X"] == {linear_rgba(blue_rgb)}, f"-X wall (both painted, wound inward) got {wall_colors['-X']}"
+
+    # On the +X wall, EEVEE/Cycles still keep unpainted on front (outside) and Aluminum on back (inside).
+    (plus_x_mat,) = plus_x_mats
+    assert plus_x_mat.name.endswith("| Metal Aluminum Anodized"), plus_x_mat.name
+    mix = next(n for n in plus_x_mat.node_tree.nodes if n.type == "MIX_SHADER")
+    back_bsdf = mix.inputs[2].links[0].from_node
+    assert tuple(round(c, 3) for c in back_bsdf.inputs["Base Color"].default_value) == linear_rgba(aluminum_rgb)
+
+    # When neither side is painted (two unnamed fallback colours, as openskp#533 will emit for
+    # style front/back colours), Solid shading shows the polygon's front colour.
+    unpainted_gltf = [
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.95, 0.95, 1.0]}},
+        {"pbrMetallicRoughness": {"baseColorFactor": [0.9, 0.4, 0.1, 1.0]}},
+    ]
+    unpainted_pair = import_skp._get_or_build_pair_material(0, 1, unpainted_gltf, {}, [], {})
+    want_front = tuple(round(c, 3) for c in (*import_skp.srgb_to_linear((0.95, 0.95, 0.95)), 1.0))
+    assert tuple(round(c, 3) for c in unpainted_pair.diffuse_color) == want_front
+    print("Solid view painted side: painted inside/outside/both/neither all show expected colour - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -893,6 +1000,7 @@ def main():
     check_colorized_texture_is_tinted()
     check_alpha_materials_use_the_right_render_method()
     check_vertices_are_welded()
+    check_solid_view_shows_painted_side()
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
     check_a_skipped_texture_is_reported_by_the_import()
