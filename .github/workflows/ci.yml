@@ -6,67 +6,138 @@ on:
   pull_request:
 
 jobs:
-  test:
+  matrix:
+    name: Blender ${{ matrix.version }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported release (blender_version_min = "4.2.4", Python 3.11),
+          # 4.5 LTS (Python 3.11), and newest 5.x (Python 3.13).
+          - series: "4.2"
+            version: "4.2.4"
+          - series: "4.5"
+            version: "4.5.16"
+          - series: "5.3"
+            version: "5.3.0"
+    env:
+      BLENDER_DIR: blender-${{ matrix.version }}-linux-x64
     steps:
       - uses: actions/checkout@v4
 
-      # Blender isn't a pip package - tested against the real, official
-      # Linux build Blender itself publishes (a plain tar.xz, no AppImage/
-      # FUSE dance needed here, unlike FreeCAD). The extracted tree is
-      # cached (not just the download) so a cache hit skips extraction and
-      # the pip-install step below too.
-      - name: Cache extracted Blender
+      - name: Cache extracted Blender ${{ matrix.version }}
         id: cache-blender
         uses: actions/cache@v4
         with:
-          path: blender-4.5.10-linux-x64
-          key: blender-4.5.10-linux-x64-extracted-v1
+          path: blender-${{ matrix.version }}-linux-x64
+          key: blender-${{ matrix.version }}-linux-x64-extracted-v1
 
-      - name: Download and extract Blender
+      - name: Download and extract Blender ${{ matrix.version }}
         if: steps.cache-blender.outputs.cache-hit != 'true'
         run: |
-          curl -fL -o blender.tar.xz \
-            https://download.blender.org/release/Blender4.5/blender-4.5.10-linux-x64.tar.xz
+          (
+            curl -fL --retry 3 -A "Mozilla/5.0" -o blender.tar.xz \
+              "https://download.blender.org/release/Blender${{ matrix.series }}/${BLENDER_DIR}.tar.xz" ||
+            curl -fL --retry 3 -o blender.tar.xz \
+              "https://ftp.nluug.nl/pub/graphics/blender/release/Blender${{ matrix.series }}/${BLENDER_DIR}.tar.xz"
+          )
           tar xf blender.tar.xz
           rm blender.tar.xz
 
-      - name: Locate blender and its bundled site-packages
+      - name: Locate blender binary
         id: locate
         run: |
-          BLENDER=$(find blender-4.5.10-linux-x64 -maxdepth 1 -type f -name blender)
-          SITE_PACKAGES=$(find blender-4.5.10-linux-x64 -type d -name site-packages | head -1)
-          if [ -z "$BLENDER" ] || [ -z "$SITE_PACKAGES" ]; then
-            echo "::error::could not locate blender binary or its site-packages"
-            find blender-4.5.10-linux-x64 -maxdepth 4
+          BLENDER=$(find "$BLENDER_DIR" -maxdepth 1 -type f -name blender)
+          if [ -z "$BLENDER" ]; then
+            echo "::error::could not locate blender binary under $BLENDER_DIR"
+            find "$BLENDER_DIR" -maxdepth 3
             exit 1
           fi
           echo "blender=$BLENDER" >> "$GITHUB_OUTPUT"
-          echo "site_packages=$SITE_PACKAGES" >> "$GITHUB_OUTPUT"
 
-      # Calls pip's own internal API from inside a script Blender runs,
-      # targeting Blender's bundled site-packages directly, rather than
-      # spawning `sys.executable -m pip` - confirmed on Windows that
-      # Blender's own bundled python.exe supports that, but this is a
-      # different OS and FreeCAD's own equivalent launcher turned out NOT
-      # to support "-m" at all, so this avoids repeating that same
-      # unverified assumption here. numpy already ships with Blender;
-      # mapbox_earcut/shapely/defusedxml don't.
-      - name: Install openskp's runtime dependencies
-        if: steps.cache-blender.outputs.cache-hit != 'true'
+      # Builds the exact release zip layout (.github/workflows/release.yml) and
+      # installs + enables it with `extension install-file` into an isolated user
+      # resources dir. That extracts the matching bundled cp311/cp313 wheels from
+      # blender_manifest.toml offline (no PyPI pip install) and catches manifest
+      # or wheel-packaging regressions before users hit them (#29).
+      - name: Build release zip
         run: |
-          cat > _pip_install.py <<PYEOF
-          from pip._internal.cli.main import main as _pip_main
-          raise SystemExit(_pip_main([
-              "install", "--quiet", "--target", "${{ steps.locate.outputs.site_packages }}",
-              "mapbox_earcut", "shapely", "defusedxml",
-          ]))
+          python3 - <<'PYEOF'
+          import os, zipfile
+
+          OUT = "blender-openskp-ci.zip"
+          EXCLUDE_DIRS = {".git", "tests", "__pycache__", ".github", os.environ["BLENDER_DIR"]}
+
+          with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = [
+                      d for d in dirs
+                      if d not in EXCLUDE_DIRS and not d.startswith("blender-")
+                  ]
+                  for fn in files:
+                      if fn.endswith(".zip"):
+                          continue
+                      full = os.path.join(root, fn)
+                      arcname = os.path.relpath(full, ".").replace("\\", "/")
+                      zf.write(full, arcname)
+          print("wrote", OUT, os.path.getsize(OUT), "bytes")
           PYEOF
-          ${{ steps.locate.outputs.blender }} --background --python _pip_install.py
-          rm _pip_install.py
+
+      - name: Install release zip via extension install-file
+        run: |
+          export BLENDER_USER_RESOURCES="$RUNNER_TEMP/blender-user"
+          mkdir -p "$BLENDER_USER_RESOURCES"
+          "${{ steps.locate.outputs.blender }}" --background \
+            --command extension install-file -r user_default -e blender-openskp-ci.zip
+          rm blender-openskp-ci.zip
+
+      - name: Verify installed extension operators
+        run: |
+          export BLENDER_USER_RESOURCES="$RUNNER_TEMP/blender-user"
+          cat > _check_installed_ext.py <<'PYEOF'
+          import os, tempfile, bpy
+
+          res = bpy.ops.import_scene.openskp(filepath="tests/fixtures/SU_File.skp")
+          assert res == {"FINISHED"}, res
+          for lc in bpy.context.view_layer.layer_collection.children:
+              for sub in lc.children:
+                  if sub.exclude:
+                      sub.exclude = False
+          bpy.context.view_layer.update()
+          for obj in bpy.context.view_layer.objects:
+              if obj.type == "MESH":
+                  obj.select_set(True)
+          with tempfile.TemporaryDirectory() as tmp:
+              out = os.path.join(tmp, "roundtrip.skp")
+              res_out = bpy.ops.export_scene.openskp(filepath=out)
+              assert res_out == {"FINISHED"} and os.path.getsize(out) > 100, res_out
+          print("installed extension operators: import + export OK")
+          PYEOF
+          "${{ steps.locate.outputs.blender }}" --background --python-exit-code 1 --python _check_installed_ext.py
+          rm _check_installed_ext.py
 
       - name: Run import tests
-        run: ${{ steps.locate.outputs.blender }} --background --python tests/test_import.py
+        run: |
+          export BLENDER_USER_RESOURCES="$RUNNER_TEMP/blender-user"
+          "${{ steps.locate.outputs.blender }}" --background --python-exit-code 1 --python tests/test_import.py
 
       - name: Run export tests
-        run: ${{ steps.locate.outputs.blender }} --background --python tests/test_export.py
+        run: |
+          export BLENDER_USER_RESOURCES="$RUNNER_TEMP/blender-user"
+          "${{ steps.locate.outputs.blender }}" --background --python-exit-code 1 --python tests/test_export.py
+
+  test:
+    name: test
+    needs: matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all Blender versions passed
+        if: needs.matrix.result != 'success'
+        run: |
+          echo "::error::One or more Blender matrix jobs did not succeed (result: ${{ needs.matrix.result }})"
+          exit 1
+      - name: All Blender versions passed
+        if: needs.matrix.result == 'success'
+        run: echo "All Blender matrix jobs passed."
