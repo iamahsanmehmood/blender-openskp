@@ -112,6 +112,7 @@ import importlib
 import inspect
 import logging
 import os
+import re
 import tempfile
 import time
 
@@ -967,13 +968,44 @@ class _capture_library_warnings:
     def __enter__(self):
         self.handler = _CapturedWarnings()
         self._logger = logging.getLogger("openskp")
+        self._saved_level = self._logger.level
+        if self._logger.getEffectiveLevel() > logging.WARNING:
+            self._logger.setLevel(logging.WARNING)
         self._logger.addHandler(self.handler)
         return self.handler.messages
 
     def __exit__(self, *exc_info):
         self._logger.removeHandler(self.handler)
+        self._logger.setLevel(self._saved_level)
         return False
 
+
+def _reconcile_partial_read_warnings(scene, filepath, library_warnings):
+    """Returns ``unread_root_entities`` (0 when the file was read in full or
+    with an openskp wheel older than openskp#552) and orders any partial-read
+    warning first so Blender's one-line status bar report never hides dropped
+    geometry behind a texture format note."""
+    unread = (
+        int(scene.unread_root_entities)
+        if hasattr(scene, "unread_root_entities") and scene.unread_root_entities
+        else 0
+    )
+    if not unread:
+        for message in library_warnings:
+            if "read only in part" in message:
+                match = re.search(r"\((\d+)\s+unread\)", message)
+                if match:
+                    unread = int(match.group(1))
+                    break
+    if unread > 0 and not any("read only in part" in m for m in library_warnings):
+        library_warnings.insert(
+            0,
+            f"{os.path.basename(filepath)} was read only in part "
+            f"({unread} root entities could not be read and were dropped)",
+        )
+    else:
+        library_warnings.sort(key=lambda m: 0 if "read only in part" in m else 1)
+    return unread
 
 
 def check_bundled_libraries():
@@ -1005,14 +1037,14 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
 
     print(f"openskp: parsing {os.path.basename(filepath)}...")
     t0 = time.time()
-    skp = openskp.SkpFile.open(filepath)
-    # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp 1.6.0 and newer
-    # can keep it in its own format, which Blender reads); older ones have no such option and
-    # build the scene as before.
-    options = {}
-    if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
-        options["original_textures"] = True
     with _capture_library_warnings() as library_warnings:
+        skp = openskp.SkpFile.open(filepath)
+        # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp 1.6.0 and newer
+        # can keep it in its own format, which Blender reads); older ones have no such option and
+        # build the scene as before.
+        options = {}
+        if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
+            options["original_textures"] = True
         scene = skp.build_instanced_scene(**options)
     for index, texture in enumerate(getattr(scene, "textures", None) or []):
         if texture.mime_type in _UNLOADABLE_TEXTURES:
@@ -1021,6 +1053,7 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
                 f"Texture {name} is a {_UNLOADABLE_TEXTURES[texture.mime_type]}, which Blender cannot use as an "
                 "image texture: the materials that use it are built without it"
             )
+    unread_root_entities = _reconcile_partial_read_warnings(scene, filepath, library_warnings)
     for message in library_warnings:
         print(f"openskp: warning: {message}")
     print(f"openskp: parsed in {time.time() - t0:.1f}s, building objects...")
@@ -1043,8 +1076,10 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         "curve_placements": 0,
         "curve_runs": 0,
         "groups": 0,
-        # what the library warned about while building the scene (a texture
-        # it could not carry, ...); the operator shows it in Blender's report
+        "unread_root_entities": unread_root_entities,
+        # what the library warned about while building the scene (a partial
+        # classic read, a texture it could not carry, ...); the operator shows
+        # it in Blender's report
         "warnings": library_warnings,
     }
 

@@ -750,7 +750,82 @@ def check_library_warnings_are_collected():
 def check_import_reports_no_warnings_for_a_clean_file():
     stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp"))
     assert stats["warnings"] == [], stats["warnings"]
+    assert stats["unread_root_entities"] == 0, stats
     print("a file with PNG/JPEG textures: no warnings - OK")
+
+
+def check_partial_read_warning_is_reported():
+    """When openskp reports a classic file whose root entity list stopped early
+    (openskp.legacy warning or InstancedScene.unread_root_entities, openskp#552),
+    import_skp collects the warning even if the root logger was silenced, orders
+    it ahead of texture notes so Blender's one-line status bar shows it, and
+    records unread_root_entities in stats."""
+    import functools
+    import logging
+    import tempfile
+
+    import openskp
+
+    orig_build = openskp.SkpFile.build_instanced_scene
+    root_logger = logging.getLogger()
+    saved_root_level = root_logger.level
+    try:
+        # 1. openskp.legacy warning during build_instanced_scene with root logger
+        # silenced to ERROR, on a file that also produces a GIF texture warning:
+        # partial-read warning is still captured and placed first in stats["warnings"].
+        @functools.wraps(orig_build)
+        def build_with_legacy_warning(self, *args, **kwargs):
+            scene = orig_build(self, *args, **kwargs)
+            logging.getLogger("openskp.legacy").warning(
+                "Classic .skp root entity list stopped early after 4 entities "
+                "(6 unread): this file was read only in part"
+            )
+            return scene
+
+        root_logger.setLevel(logging.ERROR)
+        openskp.SkpFile.build_instanced_scene = build_with_legacy_warning
+        stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "texture_gif_2021.skp"))
+        assert stats["unread_root_entities"] == 6, stats
+        assert len(stats["warnings"]) >= 2, stats["warnings"]
+        assert "read only in part" in stats["warnings"][0], stats["warnings"]
+        assert any("GIF" in m for m in stats["warnings"][1:]), stats["warnings"]
+
+        # 2. Attribute-only signal (hasattr(scene, "unread_root_entities")).
+        @functools.wraps(orig_build)
+        def build_with_scene_attr(self, *args, **kwargs):
+            scene = orig_build(self, *args, **kwargs)
+            scene.unread_root_entities = 4
+            return scene
+
+        openskp.SkpFile.build_instanced_scene = build_with_scene_attr
+        stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "SU_File.skp"))
+        assert stats["unread_root_entities"] == 4, stats
+        assert len(stats["warnings"]) == 1 and "read only in part" in stats["warnings"][0], stats
+
+        # 3. End-to-end check once a post-openskp#552 wheel is bundled.
+        openskp.SkpFile.build_instanced_scene = orig_build
+        root_logger.setLevel(saved_root_level)
+        if hasattr(openskp.SkpModel, "unread_root_entities"):
+            builder = openskp.create()
+            builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
+            builder.add_text("First", (0, 0, 0))
+            builder.add_text("Broken", (5, 0, 0))
+            builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)])
+            raw = bytearray(builder.to_bytes())
+            at = raw.find(b"\x01\xff\xfe\xff\x06B\x00")
+            assert at >= 0
+            raw[at : at + 4] = b"\x00\x00\x00\x00"
+            with tempfile.TemporaryDirectory() as tmp:
+                broken = os.path.join(tmp, "partial.skp")
+                with open(broken, "wb") as f:
+                    f.write(raw)
+                stats = import_skp.import_skp(broken)
+                assert stats["unread_root_entities"] > 0, stats
+                assert stats["warnings"] and "read only in part" in stats["warnings"][0], stats
+    finally:
+        openskp.SkpFile.build_instanced_scene = orig_build
+        root_logger.setLevel(saved_root_level)
+    print("partial-read warning: captured, ordered first, unread count recorded - OK")
 
 
 def _library_keeps_original_textures():
@@ -1003,6 +1078,7 @@ def main():
     check_solid_view_shows_painted_side()
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
+    check_partial_read_warning_is_reported()
     check_a_skipped_texture_is_reported_by_the_import()
     check_original_textures_are_loaded()
     check_hierarchy("capilla_quiroz_v17.skp", expected_groups=0)
