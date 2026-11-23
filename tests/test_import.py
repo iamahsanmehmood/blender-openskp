@@ -52,6 +52,10 @@ EXPECTED = {
     "texture_tiff_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
     "texture_tga_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
     "texture_gif_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
+    # Scene camera fixtures (#26): gondola_v20.skp (1 parallel scene "Cena1")
+    # and two_scenes_2021.skp (SDK-written: perspective + parallel scenes).
+    "gondola_v20.skp": (12, 81, 3663, 4, 18, 4105, 1, 0, 0),
+    "two_scenes_2021.skp": (1, 1, 12, 0, 0, 0, 1, 0, 0),
 }
 TEXTURE_FIXTURES = ("texture_tiff_2021.skp", "texture_tga_2021.skp", "texture_gif_2021.skp")
 
@@ -88,6 +92,7 @@ def check(fixture_name):
         check_layer_collection(fixture_name)
         check_textures(fixture_name, new_objects)
         check_material_names_and_sides(fixture_name, new_objects)
+    check_scene_cameras_for_fixture(fixture_name, new_objects, stats)
     return got
 
 
@@ -1062,6 +1067,96 @@ def check_solid_view_shows_painted_side():
     print("Solid view painted side: painted inside/outside/both/neither all show expected colour - OK")
 
 
+def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
+    """Cross-validates imported Blender Camera objects against SkpModel.pages
+    for every fixture (#26): position, view direction (-Z), up vector (+Y),
+    perspective vertical FOV vs orthographic vertical height, 'Scenes'
+    collection membership, and active scene camera."""
+    import math
+    import mathutils
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    pages = openskp.SkpFile.open(path).parse().pages
+    valid_pages = [
+        p for p in pages
+        if p.eye is not None and p.target is not None
+        and (mathutils.Vector(p.target) - mathutils.Vector(p.eye)).length > 1e-12
+    ]
+    assert stats["scenes_imported"] == len(valid_pages), (
+        f"{fixture_name}: scenes_imported={stats['scenes_imported']}, expected {len(valid_pages)}"
+    )
+
+    root_name = os.path.splitext(fixture_name)[0]
+    root_coll = bpy.data.collections.get(root_name)
+    assert root_coll is not None
+    scenes_colls = [c for c in root_coll.children if re.sub(r"\.\d{3}$", "", c.name) == "Scenes"]
+
+    if not valid_pages:
+        assert not scenes_colls, f"{fixture_name}: unexpected 'Scenes' collection when file has no scenes"
+        return
+
+    assert len(scenes_colls) == 1, f"{fixture_name}: expected 1 'Scenes' collection, got {scenes_colls}"
+    scenes_coll = scenes_colls[0]
+    cam_objs = [o for o in new_objects if o.type == "CAMERA"]
+    assert len(cam_objs) == len(valid_pages), (fixture_name, len(cam_objs), len(valid_pages))
+    assert set(scenes_coll.objects) == set(cam_objs), (fixture_name, list(scenes_coll.objects))
+
+    by_base_name = {re.sub(r"\.\d{3}$", "", o.name): o for o in cam_objs}
+    for idx, page in enumerate(valid_pages):
+        want_name = page.name or f"Scene {idx + 1}"
+        assert want_name in by_base_name, f"{fixture_name}: missing camera {want_name!r} in {list(by_base_name)}"
+        cam_obj = by_base_name[want_name]
+        cam_data = cam_obj.data
+        assert cam_data.sensor_fit == "VERTICAL"
+
+        eye_m = mathutils.Vector(tuple(c * 0.0254 for c in page.eye))
+        target_m = mathutils.Vector(tuple(c * 0.0254 for c in page.target))
+        want_dir = (target_m - eye_m).normalized()
+        up_raw = mathutils.Vector(page.up) if page.up is not None else mathutils.Vector((0.0, 0.0, 1.0))
+        want_right = want_dir.cross(up_raw).normalized()
+        want_up = (-want_dir).cross(want_right).normalized()
+
+        got_pos = cam_obj.matrix_world.translation
+        got_dir = (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+        got_up = (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 1.0, 0.0))).normalized()
+        assert (got_pos - eye_m).length < 1e-5, f"{fixture_name}/{want_name}: pos {tuple(got_pos)} != {tuple(eye_m)}"
+        assert (got_dir - want_dir).length < 1e-5, f"{fixture_name}/{want_name}: dir {tuple(got_dir)} != {tuple(want_dir)}"
+        assert (got_up - want_up).length < 1e-5, f"{fixture_name}/{want_name}: up {tuple(got_up)} != {tuple(want_up)}"
+
+        vf = cam_data.view_frame(scene=bpy.context.scene)
+        v_span = max(v.y for v in vf) - min(v.y for v in vf)
+        if page.parallel:
+            assert cam_data.type == "ORTHO", (fixture_name, want_name, cam_data.type)
+            want_h = page.ortho_height * 0.0254
+            assert abs(cam_data.ortho_scale - want_h) < 1e-5, (cam_data.ortho_scale, want_h)
+            assert abs(v_span - want_h) < 1e-5, (v_span, want_h)
+        else:
+            assert cam_data.type == "PERSP", (fixture_name, want_name, cam_data.type)
+            assert abs(math.degrees(cam_data.angle) - page.fov) < 1e-4, (math.degrees(cam_data.angle), page.fov)
+            z_depth = abs(vf[0].z)
+            got_fov = math.degrees(2.0 * math.atan((v_span * 0.5) / z_depth))
+            assert abs(got_fov - page.fov) < 1e-4, (got_fov, page.fov)
+
+        if idx == 0:
+            assert bpy.context.scene.camera == cam_obj, (
+                f"{fixture_name}: active camera is {bpy.context.scene.camera}, expected {cam_obj}"
+            )
+    print(f"{fixture_name}: {len(valid_pages)} scene camera(s) match eye/target/up and frustum - OK")
+
+
+def check_cameraless_page_is_skipped():
+    """A SketchUp 2021+ scene that saves no camera (eye=None, openskp#458) is
+    skipped cleanly without creating a broken camera or failing import."""
+    import openskp
+
+    no_cam = openskp.model.Page(name="TagsOnly", eye=None, target=None)
+    assert import_skp._build_camera_from_page(no_cam, 0) is None
+    coincident = openskp.model.Page(name="Degenerate", eye=(10.0, 10.0, 10.0), target=(10.0, 10.0, 10.0))
+    assert import_skp._build_camera_from_page(coincident, 0) is None
+    print("cameraless/coincident Page: skipped cleanly - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -1076,6 +1171,7 @@ def main():
     check_alpha_materials_use_the_right_render_method()
     check_vertices_are_welded()
     check_solid_view_shows_painted_side()
+    check_cameraless_page_is_skipped()
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
     check_partial_read_warning_is_reported()

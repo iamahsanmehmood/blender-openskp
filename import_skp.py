@@ -111,6 +111,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import math
 import os
 import re
 import tempfile
@@ -118,6 +119,8 @@ import time
 
 import bpy
 import mathutils
+
+_INCH_TO_M = 0.0254
 
 # glTF Y-up -> Blender Z-up: (x, y, z) -> (x, -z, y). Same convention
 # openskp's own scene.py/instanced_scene.py already document for their
@@ -941,6 +944,84 @@ def _find_layer_collection(layer_collection, target_collection):
     return None
 
 
+def _build_camera_from_page(page, index):
+    """Builds a Blender Camera Object for one SketchUp ``Page`` (saved scene),
+    or ``None`` when the scene saves no camera (``eye``/``target`` missing or
+    coincident).
+
+    After ``_YUP_TO_ZUP`` converts openskp's glTF Y-up scene nodes to Blender
+    Z-up, Blender world space matches SketchUp's right-handed ``+X`` east,
+    ``+Y`` north, ``+Z`` up axes scaled by ``0.0254`` m/in. A Blender camera
+    looks down local ``-Z`` with local ``+Y`` up and ``+X`` right, and
+    ``sensor_fit = 'VERTICAL'`` makes ``angle`` and ``ortho_scale`` match
+    SketchUp's vertical ``fov`` (degrees) and ``ortho_height`` (inches).
+    """
+    if page.eye is None or page.target is None:
+        return None
+    eye_m = mathutils.Vector(tuple(c * _INCH_TO_M for c in page.eye))
+    target_m = mathutils.Vector(tuple(c * _INCH_TO_M for c in page.target))
+    view_vec = target_m - eye_m
+    dist = view_vec.length
+    if dist <= 1e-12:
+        return None
+    forward = view_vec / dist
+    back = -forward
+
+    up_hint = mathutils.Vector(page.up) if page.up is not None else mathutils.Vector((0.0, 0.0, 1.0))
+    if up_hint.length <= 1e-12:
+        up_hint = mathutils.Vector((0.0, 0.0, 1.0))
+    right = forward.cross(up_hint)
+    if right.length <= 1e-9:
+        fallback = mathutils.Vector((0.0, 1.0, 0.0)) if abs(forward.z) > 0.9 else mathutils.Vector((0.0, 0.0, 1.0))
+        right = forward.cross(fallback)
+    right.normalize()
+    true_up = back.cross(right)
+    true_up.normalize()
+
+    cam_name = page.name or f"Scene {index + 1}"
+    cam_data = bpy.data.cameras.new(cam_name)
+    cam_data.sensor_fit = "VERTICAL"
+    cam_data.clip_end = max(1000.0, dist * 10.0)
+    if page.parallel:
+        cam_data.type = "ORTHO"
+        if page.ortho_height > 0.0:
+            cam_data.ortho_scale = page.ortho_height * _INCH_TO_M
+    else:
+        cam_data.type = "PERSP"
+        if 0.0 < page.fov < 180.0:
+            cam_data.angle = math.radians(page.fov)
+
+    cam_obj = bpy.data.objects.new(cam_name, cam_data)
+    cam_obj.matrix_world = mathutils.Matrix(
+        (
+            (right.x, true_up.x, back.x, eye_m.x),
+            (right.y, true_up.y, back.y, eye_m.y),
+            (right.z, true_up.z, back.z, eye_m.z),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+    return cam_obj
+
+
+def _import_scene_cameras(pages, root_collection, context):
+    """Creates a 'Scenes' collection under ``root_collection`` holding one
+    Blender Camera per saved SketchUp scene (``Page``) and makes the first
+    scene camera active (#26). Returns the number of cameras created."""
+    cameras = []
+    for index, page in enumerate(pages or ()):
+        cam_obj = _build_camera_from_page(page, index)
+        if cam_obj is not None:
+            cameras.append(cam_obj)
+    if not cameras:
+        return 0
+    scenes_coll = bpy.data.collections.new("Scenes")
+    root_collection.children.link(scenes_coll)
+    for cam_obj in cameras:
+        scenes_coll.objects.link(cam_obj)
+    context.scene.camera = cameras[0]
+    return len(cameras)
+
+
 # Libraries openskp needs that ship as wheels inside this extension. Blender 4.2.0 to
 # 4.2.3 can install the wrong build of them (see blender_manifest.toml), and openskp
 # only prints a warning and falls back to fan triangulation without mapbox_earcut,
@@ -1046,6 +1127,9 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
             options["original_textures"] = True
         scene = skp.build_instanced_scene(**options)
+        pages = getattr(scene, "pages", None)
+        if pages is None and hasattr(skp, "parse"):
+            pages = getattr(skp.parse(), "pages", None) or []
     for index, texture in enumerate(getattr(scene, "textures", None) or []):
         if texture.mime_type in _UNLOADABLE_TEXTURES:
             name = os.path.basename(texture.filename) if texture.filename else f"number {index}"
@@ -1118,12 +1202,14 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         is_root=True,
     )
     stats["textures_loaded"] = len(image_cache)
+    stats["scenes_imported"] = _import_scene_cameras(pages, root_collection, context)
     print(
         f"openskp: {stats['unique_meshes']} unique meshes "
         f"({stats['triangles']} triangles), {stats['placements']} instances placed; "
         f"{stats['unique_curve_meshes']} unique loose-edge groups "
         f"({stats['curve_runs']} runs), {stats['curve_placements']} placed; "
-        f"{len(layer_collection_cache)} layers, {stats['textures_loaded']} textures "
+        f"{len(layer_collection_cache)} layers, {stats['textures_loaded']} textures, "
+        f"{stats['scenes_imported']} scene cameras "
         f"in {time.time() - t0:.1f}s"
     )
 

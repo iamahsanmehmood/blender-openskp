@@ -144,6 +144,15 @@ Export doesn't
 write texture images back out yet — a textured material exports as its
 resolved solid color only, same as materials export always has.
 
+**Scenes (cameras)** (import only) carry over as Blender `Camera` objects
+inside a `Scenes` Collection under the imported model's root Collection
+(#26): one camera per saved SketchUp scene (`SkpModel.pages`), named after
+its scene tab, positioned and oriented from SketchUp's `eye`, `target` and
+`up` vectors (converted from inches to metres), configured as perspective
+(`PERSP`, vertical FOV matching `Page.fov`) or parallel (`ORTHO`, vertical
+frustum height matching `Page.ortho_height`), with the first scene set as
+the active `Scene.camera`.
+
 **Layers** (SketchUp calls them "tags", import only) carry over too, as
 Collections: every placement lands in a Collection named for its own
 layer, one per distinct layer in the file, and a layer switched off in
