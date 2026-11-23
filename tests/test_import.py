@@ -52,6 +52,10 @@ EXPECTED = {
     "texture_tiff_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
     "texture_tga_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
     "texture_gif_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
+    # Scene camera fixtures (#26): gondola_v20.skp (1 parallel scene "Cena1")
+    # and two_scenes_2021.skp (SDK-written: perspective + parallel scenes).
+    "gondola_v20.skp": (12, 81, 3663, 4, 18, 4105, 1, 0, 0),
+    "two_scenes_2021.skp": (1, 1, 12, 0, 0, 0, 1, 0, 0),
 }
 TEXTURE_FIXTURES = ("texture_tiff_2021.skp", "texture_tga_2021.skp", "texture_gif_2021.skp")
 
@@ -66,9 +70,26 @@ def check(fixture_name):
     # the objects-created-by-THIS-import filter below was added). So
     # every check below that looks an object up by name is restricted to
     # objects that didn't exist prior to this specific import call.
-    objects_before = set(bpy.data.objects)
-    stats = import_skp.import_skp(path)
-    new_objects = set(bpy.data.objects) - objects_before
+    import openskp
+
+    orig_parse = openskp.SkpFile.parse
+    parse_calls = 0
+
+    def count_parse(self, *args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_parse(self, *args, **kwargs)
+
+    openskp.SkpFile.parse = count_parse
+    try:
+        objects_before = set(bpy.data.objects)
+        stats = import_skp.import_skp(path)
+        new_objects = set(bpy.data.objects) - objects_before
+    finally:
+        openskp.SkpFile.parse = orig_parse
+    assert parse_calls == 0, (
+        f"{fixture_name}: import_skp() called SkpFile.parse() {parse_calls} times (must not parse twice)"
+    )
 
     got = (
         stats["unique_meshes"], stats["placements"], stats["triangles"],
@@ -88,6 +109,7 @@ def check(fixture_name):
         check_layer_collection(fixture_name)
         check_textures(fixture_name, new_objects)
         check_material_names_and_sides(fixture_name, new_objects)
+    check_scene_cameras_for_fixture(fixture_name, new_objects, stats)
     return got
 
 
@@ -1128,6 +1150,150 @@ def check_concave_surfaces_keep_one_orientation():
     print("concave surfaces: one orientation, one front/back material - OK")
 
 
+def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
+    """Cross-validates imported Blender Camera objects against SkpModel.pages
+    for every fixture (#26): position, view direction (-Z), up vector (+Y),
+    perspective vertical FOV vs orthographic vertical height, 'Scenes'
+    collection membership, and active scene camera.
+
+    When the bundled openskp wheel does not yet expose ``InstancedScene.pages``
+    (openskp <= 1.6.0, before openskp#593), verifies that ``import_skp()`` left
+    ``scenes_imported == 0`` without parsing twice, then passes
+    ``SkpFile.parse().pages`` to ``_import_scene_cameras`` directly so the
+    camera construction stays covered today."""
+    import math
+    import mathutils
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    has_scene_pages = hasattr(openskp.SkpFile.open(path).build_instanced_scene(), "pages")
+    pages = openskp.SkpFile.open(path).parse().pages
+    valid_pages = [
+        p for p in pages
+        if p.eye is not None and p.target is not None
+        and (mathutils.Vector(p.target) - mathutils.Vector(p.eye)).length > 1e-12
+    ]
+
+    root_name = os.path.splitext(fixture_name)[0]
+    root_coll = bpy.data.collections.get(root_name)
+    assert root_coll is not None
+
+    if has_scene_pages:
+        assert stats["scenes_imported"] == len(valid_pages), (
+            f"{fixture_name}: scenes_imported={stats['scenes_imported']}, expected {len(valid_pages)}"
+        )
+        cam_objs = [o for o in new_objects if o.type == "CAMERA"]
+    else:
+        assert stats["scenes_imported"] == 0, (
+            f"{fixture_name}: bundled scene has no .pages, expected scenes_imported=0, got {stats['scenes_imported']}"
+        )
+        assert not [o for o in new_objects if o.type == "CAMERA"], (
+            f"{fixture_name}: unexpected cameras created without InstancedScene.pages"
+        )
+        before_direct = set(bpy.data.objects)
+        created = import_skp._import_scene_cameras(pages, root_coll, bpy.context)
+        assert created == len(valid_pages), (fixture_name, created, len(valid_pages))
+        cam_objs = [o for o in (set(bpy.data.objects) - before_direct) if o.type == "CAMERA"]
+
+    scenes_colls = [c for c in root_coll.children if re.sub(r"\.\d{3}$", "", c.name) == "Scenes"]
+
+    if not valid_pages:
+        assert not scenes_colls, f"{fixture_name}: unexpected 'Scenes' collection when file has no scenes"
+        return
+
+    assert len(scenes_colls) == 1, f"{fixture_name}: expected 1 'Scenes' collection, got {scenes_colls}"
+    scenes_coll = scenes_colls[0]
+    assert len(cam_objs) == len(valid_pages), (fixture_name, len(cam_objs), len(valid_pages))
+    assert set(scenes_coll.objects) == set(cam_objs), (fixture_name, list(scenes_coll.objects))
+
+    by_base_name = {re.sub(r"\.\d{3}$", "", o.name): o for o in cam_objs}
+    for idx, page in enumerate(valid_pages):
+        want_name = page.name or f"Scene {idx + 1}"
+        assert want_name in by_base_name, f"{fixture_name}: missing camera {want_name!r} in {list(by_base_name)}"
+        cam_obj = by_base_name[want_name]
+        cam_data = cam_obj.data
+        assert cam_data.sensor_fit == "VERTICAL"
+
+        eye_m = mathutils.Vector(tuple(c * 0.0254 for c in page.eye))
+        target_m = mathutils.Vector(tuple(c * 0.0254 for c in page.target))
+        want_dir = (target_m - eye_m).normalized()
+        up_raw = mathutils.Vector(page.up) if page.up is not None else mathutils.Vector((0.0, 0.0, 1.0))
+        want_right = want_dir.cross(up_raw).normalized()
+        want_up = (-want_dir).cross(want_right).normalized()
+
+        got_pos = cam_obj.matrix_world.translation
+        got_dir = (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
+        got_up = (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 1.0, 0.0))).normalized()
+        assert (got_pos - eye_m).length < 1e-5, f"{fixture_name}/{want_name}: pos {tuple(got_pos)} != {tuple(eye_m)}"
+        assert (got_dir - want_dir).length < 1e-5, (
+            f"{fixture_name}/{want_name}: dir {tuple(got_dir)} != {tuple(want_dir)}"
+        )
+        assert (got_up - want_up).length < 1e-5, f"{fixture_name}/{want_name}: up {tuple(got_up)} != {tuple(want_up)}"
+
+        vf = cam_data.view_frame(scene=bpy.context.scene)
+        v_span = max(v.y for v in vf) - min(v.y for v in vf)
+        if page.parallel:
+            assert cam_data.type == "ORTHO", (fixture_name, want_name, cam_data.type)
+            want_h = page.ortho_height * 0.0254
+            assert abs(cam_data.ortho_scale - want_h) < 1e-5, (cam_data.ortho_scale, want_h)
+            assert abs(v_span - want_h) < 1e-5, (v_span, want_h)
+        else:
+            assert cam_data.type == "PERSP", (fixture_name, want_name, cam_data.type)
+            assert abs(math.degrees(cam_data.angle) - page.fov) < 1e-4, (math.degrees(cam_data.angle), page.fov)
+            z_depth = abs(vf[0].z)
+            got_fov = math.degrees(2.0 * math.atan((v_span * 0.5) / z_depth))
+            assert abs(got_fov - page.fov) < 1e-4, (got_fov, page.fov)
+
+        if idx == 0:
+            assert bpy.context.scene.camera == cam_obj, (
+                f"{fixture_name}: active camera is {bpy.context.scene.camera}, expected {cam_obj}"
+            )
+    print(f"{fixture_name}: {len(valid_pages)} scene camera(s) match eye/target/up and frustum - OK")
+
+
+def check_cameraless_page_is_skipped():
+    """A SketchUp 2021+ scene that saves no camera (eye=None, openskp#458) is
+    skipped cleanly without creating a broken camera or failing import, and
+    an InstancedScene carrying .pages wires straight through import_skp() with
+    zero SkpFile.parse() calls."""
+    import openskp
+
+    no_cam = openskp.model.Page(name="TagsOnly", eye=None, target=None)
+    assert import_skp._build_camera_from_page(no_cam, 0) is None
+    coincident = openskp.model.Page(name="Degenerate", eye=(10.0, 10.0, 10.0), target=(10.0, 10.0, 10.0))
+    assert import_skp._build_camera_from_page(coincident, 0) is None
+
+    path = os.path.join(FIXTURES_DIR, "two_scenes_2021.skp")
+    expected_pages = openskp.SkpFile.open(path).parse().pages
+    orig_build = openskp.SkpFile.build_instanced_scene
+    orig_parse = openskp.SkpFile.parse
+    parse_calls = 0
+
+    def build_with_pages(self, *args, **kwargs):
+        scene = orig_build(self, *args, **kwargs)
+        scene.pages = expected_pages
+        return scene
+
+    def count_parse(self, *args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_parse(self, *args, **kwargs)
+
+    openskp.SkpFile.build_instanced_scene = build_with_pages
+    openskp.SkpFile.parse = count_parse
+    try:
+        before = set(bpy.data.objects)
+        stats = import_skp.import_skp(path)
+        created_cams = [o for o in (set(bpy.data.objects) - before) if o.type == "CAMERA"]
+    finally:
+        openskp.SkpFile.build_instanced_scene = orig_build
+        openskp.SkpFile.parse = orig_parse
+
+    assert parse_calls == 0, f"expected 0 parse() calls, got {parse_calls}"
+    assert stats["scenes_imported"] == 2 and len(created_cams) == 2, (stats["scenes_imported"], len(created_cams))
+    print("cameraless/coincident Page skipped and InstancedScene.pages wired with 0 parse() calls - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -1143,6 +1309,7 @@ def main():
     check_vertices_are_welded()
     check_solid_view_shows_painted_side()
     check_concave_surfaces_keep_one_orientation()
+    check_cameraless_page_is_skipped()
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
     check_partial_read_warning_is_reported()
