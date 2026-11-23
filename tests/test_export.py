@@ -378,7 +378,16 @@ def _save_export_sample(src_path, name):
 
 
 def _reset_clean_scene():
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    for coll in list(bpy.data.collections):
+        bpy.data.collections.remove(coll)
+    for mesh in list(bpy.data.meshes):
+        bpy.data.meshes.remove(mesh)
+    for mat in list(bpy.data.materials):
+        bpy.data.materials.remove(mat)
+    for cam in list(bpy.data.cameras):
+        bpy.data.cameras.remove(cam)
 
 
 def test_native_collection_instances_export():
