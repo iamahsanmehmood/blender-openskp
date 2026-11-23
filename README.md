@@ -56,14 +56,17 @@ updates every placement at once — matching how SketchUp's own components
 behave, and a real architectural improvement over a flat triangle-soup
 import.
 
-**Export** (File → Export → SketchUp) flattens the selected mesh objects
-(or every visible mesh object, if nothing is selected) into a new `.skp`
-file — global (world) transform resolved, so parented/linked objects land
-in the right position. Exports Blender's own triangulated view of each
-mesh (`calc_loop_triangles`, guaranteed planar per-triangle) rather than
-raw n-gons, since nothing in Blender enforces that an edited mesh's faces
-stay planar. Round-trip-verified: exported coordinates match the original
-geometry exactly (see `tests/test_export.py`).
+**Export** (File → Export → SketchUp) writes selected objects (or every
+visible object when nothing is selected) to a native `.skp` file, preserving
+component structure (#28): each instanced Collection (and each *Keep SketchUp
+Hierarchy* parented group/component Empty tree) is written once in bottom-up
+order as a SketchUp component definition, and each placement Empty
+(`instance_type='COLLECTION'` or hierarchy group Empty) becomes a component
+instance carrying its 4x4 transform (position, rotation, non-uniform scale and
+mirroring) and SketchUp tag (Collection membership). Standalone mesh objects
+outside instanced definitions stay loose geometry at the file's root, keeping
+planar n-gons whole and triangulating only genuinely non-planar faces (see
+`tests/test_export.py`).
 
 **Layer export**: each exported object's own Collection becomes its
 SketchUp layer/tag — the first Collection it's linked into other than the
@@ -170,15 +173,6 @@ imported hidden.
 mesh polygons have no native "outer boundary + holes" concept to read
 one back from, unlike a real B-rep). Texture images are import-only - a
 textured material exports as its resolved solid color, not the image.
-Both layer and material export are deliberately NOT wired through an
-imported file's own master/source objects (`<file> (source geometry)`) -
-those sit in one Collection per unique *definition*, not per layer,
-since the same definition can appear on several different tags (and,
-less often, several different material contexts) across different
-placements - so a straight reimport-then-reexport won't automatically
-carry a file's original tags/paint back out yet; that needs exporting
-via the placement Empties instead of their shared master mesh, future
-scope.
 
 **Editing imported geometry:** what you see placed in the viewport is a
 Collection-Instance Empty, not a mesh — pressing Tab on it does nothing
@@ -190,11 +184,11 @@ collection's checkbox, select the object inside it, then Tab as normal.
 Editing it updates every placement at once, matching how SketchUp's own
 components behave.
 
-**Exporting imported geometry back out:** select the *master* objects
-under `<filename> (source geometry)` (not the placement Empties, which
-`export_skp.py`'s `type == 'MESH'` filter skips) — otherwise the export
-operator falls back to "every visible mesh in the scene," which won't be
-what you expect.
+**Exporting imported geometry back out:** select the placed Empties in the
+viewport/Outliner (or select nothing to export all visible placements and
+meshes) — each unique definition under `<filename> (source geometry)` exports
+once as a SketchUp component definition and each placement Empty exports as a
+component instance on its tag Collection (#28).
 
 ## Why standalone
 
