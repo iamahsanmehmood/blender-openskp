@@ -1127,9 +1127,9 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
             options["original_textures"] = True
         scene = skp.build_instanced_scene(**options)
-        pages = getattr(scene, "pages", None)
-        if pages is None and hasattr(skp, "parse"):
-            pages = getattr(skp.parse(), "pages", None) or []
+        # Saved scenes come from InstancedScene.pages (openskp#593) so the file is
+        # never parsed twice; older wheels without the attribute leave it off.
+        pages = getattr(scene, "pages", None) or []
     for index, texture in enumerate(getattr(scene, "textures", None) or []):
         if texture.mime_type in _UNLOADABLE_TEXTURES:
             name = os.path.basename(texture.filename) if texture.filename else f"number {index}"

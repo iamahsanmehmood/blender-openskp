@@ -146,12 +146,14 @@ resolved solid color only, same as materials export always has.
 
 **Scenes (cameras)** (import only) carry over as Blender `Camera` objects
 inside a `Scenes` Collection under the imported model's root Collection
-(#26): one camera per saved SketchUp scene (`SkpModel.pages`), named after
-its scene tab, positioned and oriented from SketchUp's `eye`, `target` and
-`up` vectors (converted from inches to metres), configured as perspective
+(#26): one camera per saved SketchUp scene (`InstancedScene.pages`), named
+after its scene tab, positioned and oriented from SketchUp's `eye`, `target`
+and `up` vectors (converted from inches to metres), configured as perspective
 (`PERSP`, vertical FOV matching `Page.fov`) or parallel (`ORTHO`, vertical
-frustum height matching `Page.ortho_height`), with the first scene set as
-the active `Scene.camera`.
+frustum height matching `Page.ortho_height`), with the first scene set as the
+active `Scene.camera`. Requires the next OpenSKP release (after 1.6.0, with
+`InstancedScene.pages` from openskp#593) to be bundled; with the currently
+bundled OpenSKP 1.6.0 no extra parse runs and scene cameras stay off.
 
 **Layers** (SketchUp calls them "tags", import only) carry over too, as
 Collections: every placement lands in a Collection named for its own

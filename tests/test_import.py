@@ -70,9 +70,26 @@ def check(fixture_name):
     # the objects-created-by-THIS-import filter below was added). So
     # every check below that looks an object up by name is restricted to
     # objects that didn't exist prior to this specific import call.
-    objects_before = set(bpy.data.objects)
-    stats = import_skp.import_skp(path)
-    new_objects = set(bpy.data.objects) - objects_before
+    import openskp
+
+    orig_parse = openskp.SkpFile.parse
+    parse_calls = 0
+
+    def count_parse(self, *args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_parse(self, *args, **kwargs)
+
+    openskp.SkpFile.parse = count_parse
+    try:
+        objects_before = set(bpy.data.objects)
+        stats = import_skp.import_skp(path)
+        new_objects = set(bpy.data.objects) - objects_before
+    finally:
+        openskp.SkpFile.parse = orig_parse
+    assert parse_calls == 0, (
+        f"{fixture_name}: import_skp() called SkpFile.parse() {parse_calls} times (must not parse twice)"
+    )
 
     got = (
         stats["unique_meshes"], stats["placements"], stats["triangles"],
@@ -1071,25 +1088,47 @@ def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
     """Cross-validates imported Blender Camera objects against SkpModel.pages
     for every fixture (#26): position, view direction (-Z), up vector (+Y),
     perspective vertical FOV vs orthographic vertical height, 'Scenes'
-    collection membership, and active scene camera."""
+    collection membership, and active scene camera.
+
+    When the bundled openskp wheel does not yet expose ``InstancedScene.pages``
+    (openskp <= 1.6.0, before openskp#593), verifies that ``import_skp()`` left
+    ``scenes_imported == 0`` without parsing twice, then passes
+    ``SkpFile.parse().pages`` to ``_import_scene_cameras`` directly so the
+    camera construction stays covered today."""
     import math
     import mathutils
     import openskp
 
     path = os.path.join(FIXTURES_DIR, fixture_name)
+    has_scene_pages = hasattr(openskp.SkpFile.open(path).build_instanced_scene(), "pages")
     pages = openskp.SkpFile.open(path).parse().pages
     valid_pages = [
         p for p in pages
         if p.eye is not None and p.target is not None
         and (mathutils.Vector(p.target) - mathutils.Vector(p.eye)).length > 1e-12
     ]
-    assert stats["scenes_imported"] == len(valid_pages), (
-        f"{fixture_name}: scenes_imported={stats['scenes_imported']}, expected {len(valid_pages)}"
-    )
 
     root_name = os.path.splitext(fixture_name)[0]
     root_coll = bpy.data.collections.get(root_name)
     assert root_coll is not None
+
+    if has_scene_pages:
+        assert stats["scenes_imported"] == len(valid_pages), (
+            f"{fixture_name}: scenes_imported={stats['scenes_imported']}, expected {len(valid_pages)}"
+        )
+        cam_objs = [o for o in new_objects if o.type == "CAMERA"]
+    else:
+        assert stats["scenes_imported"] == 0, (
+            f"{fixture_name}: bundled scene has no .pages, expected scenes_imported=0, got {stats['scenes_imported']}"
+        )
+        assert not [o for o in new_objects if o.type == "CAMERA"], (
+            f"{fixture_name}: unexpected cameras created without InstancedScene.pages"
+        )
+        before_direct = set(bpy.data.objects)
+        created = import_skp._import_scene_cameras(pages, root_coll, bpy.context)
+        assert created == len(valid_pages), (fixture_name, created, len(valid_pages))
+        cam_objs = [o for o in (set(bpy.data.objects) - before_direct) if o.type == "CAMERA"]
+
     scenes_colls = [c for c in root_coll.children if re.sub(r"\.\d{3}$", "", c.name) == "Scenes"]
 
     if not valid_pages:
@@ -1098,7 +1137,6 @@ def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
 
     assert len(scenes_colls) == 1, f"{fixture_name}: expected 1 'Scenes' collection, got {scenes_colls}"
     scenes_coll = scenes_colls[0]
-    cam_objs = [o for o in new_objects if o.type == "CAMERA"]
     assert len(cam_objs) == len(valid_pages), (fixture_name, len(cam_objs), len(valid_pages))
     assert set(scenes_coll.objects) == set(cam_objs), (fixture_name, list(scenes_coll.objects))
 
@@ -1121,7 +1159,9 @@ def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
         got_dir = (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0))).normalized()
         got_up = (cam_obj.matrix_world.to_3x3() @ mathutils.Vector((0.0, 1.0, 0.0))).normalized()
         assert (got_pos - eye_m).length < 1e-5, f"{fixture_name}/{want_name}: pos {tuple(got_pos)} != {tuple(eye_m)}"
-        assert (got_dir - want_dir).length < 1e-5, f"{fixture_name}/{want_name}: dir {tuple(got_dir)} != {tuple(want_dir)}"
+        assert (got_dir - want_dir).length < 1e-5, (
+            f"{fixture_name}/{want_name}: dir {tuple(got_dir)} != {tuple(want_dir)}"
+        )
         assert (got_up - want_up).length < 1e-5, f"{fixture_name}/{want_name}: up {tuple(got_up)} != {tuple(want_up)}"
 
         vf = cam_data.view_frame(scene=bpy.context.scene)
@@ -1147,14 +1187,45 @@ def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
 
 def check_cameraless_page_is_skipped():
     """A SketchUp 2021+ scene that saves no camera (eye=None, openskp#458) is
-    skipped cleanly without creating a broken camera or failing import."""
+    skipped cleanly without creating a broken camera or failing import, and
+    an InstancedScene carrying .pages wires straight through import_skp() with
+    zero SkpFile.parse() calls."""
     import openskp
 
     no_cam = openskp.model.Page(name="TagsOnly", eye=None, target=None)
     assert import_skp._build_camera_from_page(no_cam, 0) is None
     coincident = openskp.model.Page(name="Degenerate", eye=(10.0, 10.0, 10.0), target=(10.0, 10.0, 10.0))
     assert import_skp._build_camera_from_page(coincident, 0) is None
-    print("cameraless/coincident Page: skipped cleanly - OK")
+
+    path = os.path.join(FIXTURES_DIR, "two_scenes_2021.skp")
+    expected_pages = openskp.SkpFile.open(path).parse().pages
+    orig_build = openskp.SkpFile.build_instanced_scene
+    orig_parse = openskp.SkpFile.parse
+    parse_calls = 0
+
+    def build_with_pages(self, *args, **kwargs):
+        scene = orig_build(self, *args, **kwargs)
+        scene.pages = expected_pages
+        return scene
+
+    def count_parse(self, *args, **kwargs):
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_parse(self, *args, **kwargs)
+
+    openskp.SkpFile.build_instanced_scene = build_with_pages
+    openskp.SkpFile.parse = count_parse
+    try:
+        before = set(bpy.data.objects)
+        stats = import_skp.import_skp(path)
+        created_cams = [o for o in (set(bpy.data.objects) - before) if o.type == "CAMERA"]
+    finally:
+        openskp.SkpFile.build_instanced_scene = orig_build
+        openskp.SkpFile.parse = orig_parse
+
+    assert parse_calls == 0, f"expected 0 parse() calls, got {parse_calls}"
+    assert stats["scenes_imported"] == 2 and len(created_cams) == 2, (stats["scenes_imported"], len(created_cams))
+    print("cameraless/coincident Page skipped and InstancedScene.pages wired with 0 parse() calls - OK")
 
 
 def main():
