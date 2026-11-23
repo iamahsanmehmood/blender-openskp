@@ -1084,6 +1084,72 @@ def check_solid_view_shows_painted_side():
     print("Solid view painted side: painted inside/outside/both/neither all show expected colour - OK")
 
 
+def check_concave_surfaces_keep_one_orientation():
+    """A torus painted on the outside only becomes one front/back material
+    with every polygon facing outward, whichever side SketchUp calls the
+    front: the inner ring faces the mesh's centre, which used to turn it
+    inside out and give the mesh a second, reversed material (#33). A single
+    flat face keeps SketchUp's own front."""
+    import math
+    import tempfile
+
+    import bmesh
+    import openskp
+
+    segments, sides = 16, 10
+    big, small = 100.0, 30.0
+
+    def point(i, j):
+        u, v = 2 * math.pi * (i % segments) / segments, 2 * math.pi * (j % sides) / sides
+        r = big + small * math.cos(v)
+        return (r * math.cos(u), r * math.sin(u), small * math.sin(v))
+
+    quads = [
+        [point(i, j), point(i + 1, j), point(i + 1, j + 1), point(i, j + 1)]
+        for i in range(segments)
+        for j in range(sides)
+    ]
+
+    def import_faces(faces, paint_front):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = os.path.join(tmp, "grid.png")
+            with open(image, "wb") as f:
+                f.write(_png(2, 2, [[(255, 0, 0), (0, 255, 0)], [(0, 0, 255), (255, 255, 0)]]))
+            skp = os.path.join(tmp, "shape.skp")
+            builder = openskp.SkpBuilder()
+            paint = builder.add_texture_material("Blinds", image, 10, 10)
+            for face in faces:
+                builder.add_face(face, **{"material" if paint_front else "back_material": paint})
+            builder.save(skp)
+            before = set(bpy.data.objects)
+            import_skp.import_skp(skp)
+        (obj,) = [o for o in set(bpy.data.objects) - before if o.type == "MESH"]
+        return obj.data
+
+    for label, faces, paint_front in (
+        ("front outside", quads, True),
+        ("front inside, back painted", [q[::-1] for q in quads], False),
+    ):
+        mesh = import_faces(faces, paint_front)
+        names = [m.name for m in mesh.materials]
+        assert len(names) == 1 and names[0].startswith("Blinds |"), f"torus ({label}): materials {names}"
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        turned = [e for e in bm.edges if len(e.link_loops) == 2 and e.link_loops[0].vert == e.link_loops[1].vert]
+        assert all(len(e.link_faces) == 2 for e in bm.edges), f"torus ({label}): not closed"
+        assert not turned, f"torus ({label}): {len(turned)} edges where the surface turns over"
+        assert bm.calc_volume(signed=True) > 0, f"torus ({label}): faces inward"
+        bm.free()
+        # The paint is on the polygons' front, so it uses the main UV layer.
+        assert [layer.name for layer in mesh.uv_layers] == ["UVMap"], list(mesh.uv_layers.keys())
+
+    for flat in ([(0, 0, 7), (9, 0, 7), (9, 5, 7), (0, 5, 7)], [(0, 5, 7), (9, 5, 7), (9, 0, 7), (0, 0, 7)]):
+        mesh = import_faces([flat], True)
+        names = [m.name for m in mesh.materials]
+        assert len(names) == 1 and names[0].startswith("Blinds |"), f"flat face: {names}"
+    print("concave surfaces: one orientation, one front/back material - OK")
+
+
 def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
     """Cross-validates imported Blender Camera objects against SkpModel.pages
     for every fixture (#26): position, view direction (-Z), up vector (+Y),
@@ -1242,6 +1308,7 @@ def main():
     check_alpha_materials_use_the_right_render_method()
     check_vertices_are_welded()
     check_solid_view_shows_painted_side()
+    check_concave_surfaces_keep_one_orientation()
     check_cameraless_page_is_skipped()
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
