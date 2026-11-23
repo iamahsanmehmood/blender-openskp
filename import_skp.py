@@ -111,6 +111,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import math
 import os
 import re
 import tempfile
@@ -551,26 +552,73 @@ def _find_twin_triangles(verts, tris):
 def _choose_front_triangles(verts, tris, twin_of):
     """{kept triangle: dropped twin}. Either copy can carry the pair in EEVEE
     and Cycles, because the Backfacing mix picks the paint by which side is
-    seen; keeping the copy facing away from the mesh's centre (the outside of
-    a box, and the first copy when that does not decide) preserves outward
-    polygon normals and decides which paint Solid shading shows when both
-    sides are painted (or neither is)."""
+    seen; the choice decides the polygon normals, which of the two paints uses
+    the main UV layer, and which paint Solid shading shows when both sides are
+    painted (or neither is).
+
+    Connected pairs are turned the same way round, so a surface keeps one
+    orientation across its edges, and then each connected surface as a whole
+    faces outward. Deciding triangle by triangle ("facing away from the mesh's
+    centre") is only right for convex shapes: on a torus it turned the faces
+    of the inner ring inside out (#33). A surface with no outside, such as a
+    single flat face, keeps the first copy."""
     if not twin_of:
         return {}
+    pairs = sorted((t, o) for t, o in twin_of.items() if t < o)
+
+    # Neighbours: pairs sharing an edge that belongs to exactly two pairs. An
+    # edge where more of them meet doesn't say which two form one surface.
+    by_edge = {}
+    for n, (first, _) in enumerate(pairs):
+        a, b, c = (verts[v] for v in tris[first][:3])
+        for start, end in ((a, b), (b, c), (c, a)):
+            forward = start < end
+            by_edge.setdefault((start, end) if forward else (end, start), []).append((n, forward))
+    neighbours = [[] for _ in pairs]
+    for users in by_edge.values():
+        if len(users) == 2 and users[0][0] != users[1][0]:
+            (n, n_forward), (m, m_forward) = users
+            # Two triangles of one consistently turned surface run along
+            # their shared edge in opposite directions.
+            flip = n_forward == m_forward
+            neighbours[n].append((m, flip))
+            neighbours[m].append((n, flip))
+
     centre = [sum(v[axis] for v in verts) / len(verts) for axis in range(3)]
 
     def outward(t):
-        a, b, c = (verts[v] for v in tris[t][:3])
-        u = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
-        w = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
-        n = (u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0])
-        mid = [(a[i] + b[i] + c[i]) / 3 - centre[i] for i in range(3)]
-        return sum(n[i] * mid[i] for i in range(3))
+        """Six times the signed volume between the triangle and the centre:
+        positive when it faces away from it. Added up over a closed surface
+        this is the volume inside, whatever the shape."""
+        a, b, c = ([v[axis] - centre[axis] for axis in range(3)] for v in (verts[k] for k in tris[t][:3]))
+        return (
+            a[0] * (b[1] * c[2] - b[2] * c[1])
+            + a[1] * (b[2] * c[0] - b[0] * c[2])
+            + a[2] * (b[0] * c[1] - b[1] * c[0])
+        )
 
     chosen = {}
-    for first, second in sorted((t, o) for t, o in twin_of.items() if t < o):
-        keep, drop = (second, first) if outward(second) > 0 >= outward(first) else (first, second)
-        chosen[keep] = drop
+    flipped = [None] * len(pairs)
+    for seed in range(len(pairs)):
+        if flipped[seed] is not None:
+            continue
+        flipped[seed] = False
+        surface = [seed]
+        for n in surface:  # grows while it is walked
+            for m, flip in neighbours[n]:
+                if flipped[m] is None:
+                    flipped[m] = flipped[n] != flip
+                    surface.append(m)
+        volumes = [outward(pairs[n][0]) * (-1 if flipped[n] else 1) for n in surface]
+        total = sum(volumes)
+        # A flat surface has no volume against the centre, only rounding noise,
+        # so the sum is compared with the size of what went into it.
+        size = sum(math.prod(math.dist(verts[v], centre) for v in tris[pairs[n][0]][:3]) for n in surface)
+        turn = total < -1e-6 * size
+        for n in surface:
+            first, second = pairs[n]
+            keep, drop = (second, first) if flipped[n] != turn else (first, second)
+            chosen[keep] = drop
     return chosen
 
 
