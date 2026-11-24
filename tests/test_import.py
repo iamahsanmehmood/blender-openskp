@@ -56,6 +56,8 @@ EXPECTED = {
     # and two_scenes_2021.skp (SDK-written: perspective + parallel scenes).
     "gondola_v20.skp": (12, 81, 3663, 4, 18, 4105, 1, 0, 0),
     "two_scenes_2021.skp": (1, 1, 12, 0, 0, 0, 1, 0, 0),
+    # 3-level nested components (Bolt -> Bracket -> Frame) across 4 tags (#28).
+    "nested_components_2021.skp": (4, 15, 8, 0, 0, 0, 4, 0, 0),
 }
 TEXTURE_FIXTURES = ("texture_tiff_2021.skp", "texture_tga_2021.skp", "texture_gif_2021.skp")
 

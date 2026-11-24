@@ -69,9 +69,14 @@ class EXPORT_OT_openskp(bpy.types.Operator, ExportHelper):
             self.report({"ERROR"}, f"OpenSKP export failed: {exc}")
             return {"CANCELLED"}
 
+        comp_note = (
+            f", {stats['definitions_written']} components ({stats['instances_written']} instances)"
+            if stats.get("instances_written")
+            else ""
+        )
         self.report(
             {"INFO"},
-            f"Exported {stats['faces_written']} faces "
+            f"Exported {stats['faces_written']} faces{comp_note} "
             f"({stats['objects_skipped']} objects skipped)",
         )
         return {"FINISHED"}
