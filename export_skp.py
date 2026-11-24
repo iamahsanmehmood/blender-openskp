@@ -13,12 +13,13 @@ selected) to a new ``.skp`` file:
 - **Plain mesh objects as loose root geometry**: standalone ``MESH`` objects
   (including meshes parented under ordinary Blender ``Empty``s, armatures, or
   other meshes, and visible collections that are also instanced) keep the flat
-  root-face export, preserving planar n-gons (triangulating only genuinely
-  non-planar polygons), per-face solid material colors/opacity, and per-object
-  layer/tag assignment.
+  root-face export, applying active mesh modifiers, preserving planar n-gons
+  (triangulating only genuinely non-planar polygons), per-face solid material
+  colors/opacity, and per-object layer/tag assignment.
 """
 from __future__ import annotations
 
+import math
 import re
 
 import bpy
@@ -26,6 +27,7 @@ import mathutils
 
 # 1 inch = 0.0254 m exactly - SketchUp's native unit is inches, Blender's is metres.
 METRES_TO_INCHES = 1.0 / 0.0254
+INCHES_TO_METRES = 0.0254
 
 # Relative-to-polygon-size tolerance for the planarity check - a vertex's
 # distance from the polygon's own best-fit plane, divided by the polygon's
@@ -48,18 +50,19 @@ _YUP_TO_ZUP = mathutils.Matrix(
 )
 _ZUP_TO_YUP = _YUP_TO_ZUP.transposed()
 
-_UNPAINTED_SLOT_RE = re.compile(r"^openskp_material_\d+(?:\.\d{3})?$")
-_BLENDER_DUP_SUFFIX_RE = re.compile(r"^(.*)\.(\d{3})$")
+_UNPAINTED_SLOT_RE = re.compile(r"^openskp_material_\d+(?:\.\d{3,})?$")
+_BLENDER_DUP_SUFFIX_RE = re.compile(r"^(.*)\.(\d{3,})$")
 
 
 def _is_source_geom_name(name: str) -> bool:
-    return re.sub(r"\.\d{3}$", "", name).endswith("(source geometry)")
+    return re.sub(r"\.\d{3,}$", "", name).endswith("(source geometry)")
 
 
 def _strip_blender_dup_suffix(name: str, existing_names) -> str:
-    """Strips a trailing ``.001``..``.999`` suffix only when the base name
-    already exists in ``existing_names`` (meaning Blender auto-numbered a
-    duplicate datablock), keeping real user names such as ``Cabinet.600``."""
+    """Strips a trailing ``.001``..``.999``..``.1000+`` suffix only when the
+    base name already exists in ``existing_names`` (meaning Blender
+    auto-numbered a duplicate datablock), keeping real user names such as
+    ``Cabinet.600``."""
     m = _BLENDER_DUP_SUFFIX_RE.match(name)
     if m and m.group(1) and m.group(1) in existing_names:
         return m.group(1)
@@ -103,10 +106,12 @@ def _is_planar(mesh, polygon):
     return True
 
 
-def _collect_import_collections():
+def _collect_import_collections(all_collection_names):
     """Classifies collections created by ``import_skp`` so source-geometry
-    collections convert back from glTF Y-up to SketchUp Z-up and imported tag
-    collections strip any Blender ``.001`` duplicate suffix."""
+    collections convert back from glTF Y-up to SketchUp Z-up, imported tag
+    collections strip any Blender ``.001`` duplicate suffix, and only imported
+    ``Scenes`` / ``Annotations`` metadata collections (never user collections
+    named ``Annotations``) are ignored as tags."""
     imported_roots = set()
     source_roots = []
     for coll in bpy.data.collections:
@@ -128,6 +133,15 @@ def _collect_import_collections():
         walk_source(sr)
 
     imported_tag_collections = set()
+    imported_meta_collections = set()
+
+    def mark_meta_subtree(c):
+        if c.name in imported_meta_collections:
+            return
+        imported_meta_collections.add(c.name)
+        for ch in c.children:
+            mark_meta_subtree(ch)
+
     for root_name in imported_roots:
         root_coll = bpy.data.collections.get(root_name)
         if root_coll is None:
@@ -135,47 +149,52 @@ def _collect_import_collections():
         for child in root_coll.children:
             if _is_source_geom_name(child.name):
                 continue
-            base = _strip_blender_dup_suffix(child.name, bpy.data.collections)
+            base = _strip_blender_dup_suffix(child.name, all_collection_names)
             if base in ("Scenes", "Annotations"):
+                mark_meta_subtree(child)
                 continue
             imported_tag_collections.add(child.name)
+            for sub in child.children:
+                sub_base = _strip_blender_dup_suffix(sub.name, all_collection_names)
+                if sub_base == "Annotations":
+                    mark_meta_subtree(sub)
 
-    return imported_roots, source_collections, imported_tag_collections
+    return imported_roots, source_collections, imported_tag_collections, imported_meta_collections
 
 
 def _object_layer_name(
-    obj,
-    scene_collection,
+    coll_names_for_obj,
+    scene_collection_name: str,
     imported_roots=(),
     source_collections=(),
     imported_tag_collections=(),
-    instanced_colls=(),
+    imported_meta_collections=(),
     own_container_colls=(),
+    all_collection_names=(),
 ):
-    """The Collection this object's export should be tagged with in SketchUp -
+    """The Collection an object's export should be tagged with in SketchUp -
     the first Collection it is linked into other than the scene's own default
     ones ("Scene Collection", "Collection"), an imported model root, an
-    instanced component definition collection, or a "(source geometry)"
-    collection. Returns ``None`` for SketchUp's default untagged layer
-    ("Layer0")."""
-    for coll in obj.users_collection:
-        cname = coll.name
-        if cname in (scene_collection.name, "Collection"):
+    imported metadata collection ("Scenes"/"Annotations"), its own enclosing
+    definition collection, or a "(source geometry)" collection. Returns ``None``
+    for SketchUp's default untagged layer ("Layer0")."""
+    for cname in coll_names_for_obj:
+        if cname in (scene_collection_name, "Collection"):
             continue
         if (
             cname in imported_roots
             or cname in source_collections
-            or cname in instanced_colls
+            or cname in imported_meta_collections
             or cname in own_container_colls
         ):
             continue
         if _is_source_geom_name(cname):
             continue
         if cname in imported_tag_collections:
-            tag = _strip_blender_dup_suffix(cname, bpy.data.collections)
+            tag = _strip_blender_dup_suffix(cname, all_collection_names)
         else:
             tag = cname
-        if tag in ("Layer0", "Annotations"):
+        if tag == "Layer0":
             return None
         return tag
     return None
@@ -185,34 +204,77 @@ def _linear_to_srgb(c):
     return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
 
 
-def _material_rgba_opacity(mat):
-    """A Material's solid display color as openskp's writer wants it:
-    (r, g, b) ints 0-255, plus a separate 0.0-1.0 opacity (``None`` when
-    fully opaque). ``diffuse_color`` is scene-linear and SketchUp colours are
-    sRGB, so it is converted on the way out."""
-    r, g, b, a = mat.diffuse_color
+def _rgba_opacity_from_linear(lin_rgba):
+    r, g, b, a = lin_rgba
     rgba = tuple(round(_linear_to_srgb(min(max(c, 0.0), 1.0)) * 255) for c in (r, g, b))
     opacity = None if a >= 0.999 else float(a)
     return rgba, opacity
 
 
-def _material_spec(mat):
+def _material_rgba_opacity(mat):
+    """A Material's solid display color as openskp's writer wants it:
+    (r, g, b) ints 0-255, plus a separate 0.0-1.0 opacity (``None`` when
+    fully opaque). ``diffuse_color`` is scene-linear and SketchUp colours are
+    sRGB, so it is converted on the way out."""
+    return _rgba_opacity_from_linear(mat.diffuse_color)
+
+
+def _recolored_import_slot_rgba_opacity(mat):
+    """Checks whether an unnamed ``openskp_material_N`` fallback material created
+    by ``import_skp`` was recoloured by the user (via ``diffuse_color`` or via
+    Principled BSDF ``Base Color``/``Alpha``). Returns ``(rgba, opacity)`` when
+    recoloured, or ``None`` when still holding ``import_skp``'s fallback colour."""
+    dc = tuple(float(x) for x in mat.diffuse_color)
+    init = mat.get("openskp_initial_diffuse")
+    init_tup = tuple(float(x) for x in init) if init is not None and len(init) == 4 else None
+
+    bsdf_col = None
+    if getattr(mat, "use_nodes", False) and getattr(mat, "node_tree", None) is not None:
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None and "Base Color" in bsdf.inputs and not bsdf.inputs["Base Color"].is_linked:
+            bc = bsdf.inputs["Base Color"].default_value
+            ba = bsdf.inputs["Alpha"].default_value if "Alpha" in bsdf.inputs else 1.0
+            bsdf_col = (float(bc[0]), float(bc[1]), float(bc[2]), float(ba))
+
+    if init_tup is not None:
+        if any(abs(a - b) > 1e-4 for a, b in zip(dc, init_tup)):
+            return _rgba_opacity_from_linear(dc)
+        if bsdf_col is not None and any(abs(a - b) > 1e-4 for a, b in zip(bsdf_col, init_tup)):
+            return _rgba_opacity_from_linear(bsdf_col)
+        return None
+
+    if bsdf_col is not None and any(abs(a - b) > 1e-4 for a, b in zip(dc, bsdf_col)):
+        return _rgba_opacity_from_linear(dc)
+    return None
+
+
+def _material_spec(mat, all_material_names=None):
     """Returns ``(dedup_key, skp_name, rgba, opacity)`` for a Blender Material,
-    or ``None`` when unpainted (including ``import_skp``'s unnamed fallback
-    slots ``openskp_material_N`` so unpainted SketchUp faces stay unpainted)."""
+    or ``None`` when unpainted (including untouched ``import_skp`` unnamed
+    fallback slots ``openskp_material_N``, while exporting them if recoloured)."""
     if mat is None:
         return None
+    if all_material_names is None:
+        all_material_names = bpy.data.materials
     if "openskp_material_index" in mat:
-        base = _strip_blender_dup_suffix(mat.name, bpy.data.materials)
+        base = _strip_blender_dup_suffix(mat.name, all_material_names)
         if "openskp_back_material_index" in mat and " | " in base:
             front_name, back_name = base.split(" | ", 1)
             front_unpainted = bool(_UNPAINTED_SLOT_RE.match(front_name))
             back_unpainted = bool(_UNPAINTED_SLOT_RE.match(back_name))
             if front_unpainted and back_unpainted:
-                return None
+                recol = _recolored_import_slot_rgba_opacity(mat)
+                if recol is None:
+                    return None
+                rgba, opacity = recol
+                return (f"skp:{mat.name}:{rgba}:{opacity}", mat.name, rgba, opacity)
             skp_name = back_name if front_unpainted else front_name
         elif _UNPAINTED_SLOT_RE.match(base):
-            return None
+            recol = _recolored_import_slot_rgba_opacity(mat)
+            if recol is None:
+                return None
+            rgba, opacity = recol
+            return (f"skp:{mat.name}:{rgba}:{opacity}", mat.name, rgba, opacity)
         else:
             skp_name = base
         rgba, opacity = _material_rgba_opacity(mat)
@@ -247,43 +309,68 @@ def _build_local_mesh_polys(mesh):
     return polys, 0
 
 
-def _get_local_mesh_polys(obj, depsgraph=None, local_mesh_cache=None):
-    """Returns ``(local_polys, local_skipped)`` for ``obj``, caching per
-    ``Mesh`` datablock when ``obj`` carries no modifiers (#28)."""
+def _get_mesh_polys_and_materials(obj, depsgraph=None, local_mesh_cache=None):
+    """Returns ``(local_polys, local_skipped, materials_list)`` for ``obj``,
+    caching per ``Mesh`` datablock when ``obj`` carries no modifiers and reading
+    evaluated ``mesh.materials`` when modifiers (such as Geometry Nodes
+    ``Set Material``) are present (#28)."""
     if obj.data is None:
-        return (), 0
+        return (), 0, ()
     if not obj.modifiers:
         key = obj.data.as_pointer()
         if local_mesh_cache is not None and key in local_mesh_cache:
-            return local_mesh_cache[key]
-        mesh = obj.to_mesh()
-        try:
-            entry = _build_local_mesh_polys(mesh)
-        finally:
-            obj.to_mesh_clear()
-        if local_mesh_cache is not None:
-            local_mesh_cache[key] = entry
-        return entry
+            local_polys, local_skipped = local_mesh_cache[key]
+        else:
+            mesh = obj.to_mesh()
+            try:
+                local_polys, local_skipped = _build_local_mesh_polys(mesh)
+            finally:
+                obj.to_mesh_clear()
+            if local_mesh_cache is not None:
+                local_mesh_cache[key] = (local_polys, local_skipped)
+        mats = [slot.material for slot in obj.material_slots]
+        if not mats and obj.data.materials:
+            mats = list(obj.data.materials)
+        return local_polys, local_skipped, mats
 
     eval_obj = obj.evaluated_get(depsgraph) if depsgraph is not None else obj
     mesh = eval_obj.to_mesh()
     try:
-        return _build_local_mesh_polys(mesh)
+        local_polys, local_skipped = _build_local_mesh_polys(mesh)
+        eval_slots = eval_obj.material_slots
+        mats = []
+        n_mats = max(len(mesh.materials), len(eval_slots))
+        for idx in range(n_mats):
+            if idx < len(eval_slots) and eval_slots[idx].link == "OBJECT":
+                mats.append(eval_slots[idx].material)
+            elif idx < len(mesh.materials):
+                mats.append(mesh.materials[idx])
+            elif idx < len(eval_slots):
+                mats.append(eval_slots[idx].material)
+        return local_polys, local_skipped, mats
     finally:
         eval_obj.to_mesh_clear()
 
 
-def _extract_mesh_faces(obj, transform, stats, depsgraph=None, local_mesh_cache=None):
+def _extract_mesh_faces(
+    obj,
+    transform,
+    stats,
+    depsgraph=None,
+    local_mesh_cache=None,
+    mat_spec_fn=None,
+):
     """Extracts ``(pts_inches, mat_spec)`` tuples from ``obj`` transformed by
     4x4 metre matrix ``transform``."""
-    local_polys, local_skipped = _get_local_mesh_polys(obj, depsgraph, local_mesh_cache)
+    local_polys, local_skipped, mats = _get_mesh_polys_and_materials(
+        obj, depsgraph, local_mesh_cache
+    )
     stats["faces_skipped"] += local_skipped
     if not local_polys:
         return []
 
-    specs = [_material_spec(slot.material) for slot in obj.material_slots]
-    if not specs and obj.data and obj.data.materials:
-        specs = [_material_spec(m) for m in obj.data.materials]
+    resolve_mat = mat_spec_fn if mat_spec_fn is not None else _material_spec
+    specs = [resolve_mat(m) for m in mats]
     num_specs = len(specs)
 
     faces = []
@@ -304,11 +391,43 @@ def _try_invert(m4):
         return None
 
 
-def _is_identity_matrix(m4, rot_tol=1e-4, trans_tol_m=1e-4) -> bool:
+def _faces_max_radius_in(faces) -> float:
+    max_r_sq = 0.0
+    for pts, _spec, _lay in faces:
+        for px, py, pz in pts:
+            r_sq = px * px + py * py + pz * pz
+            if r_sq > max_r_sq:
+                max_r_sq = r_sq
+    return math.sqrt(max_r_sq)
+
+
+def _m3_scale_bound(m3) -> float:
+    if m3 is None:
+        return 1.0
+    r0 = m3[0] * m3[0] + m3[1] * m3[1] + m3[2] * m3[2]
+    r1 = m3[3] * m3[3] + m3[4] * m3[4] + m3[5] * m3[5]
+    r2 = m3[6] * m3[6] + m3[7] * m3[7] + m3[8] * m3[8]
+    return math.sqrt(max(r0, r1, r2))
+
+
+def _compute_def_max_radius_in(faces, children, definitions) -> float:
+    max_r = _faces_max_radius_in(faces)
+    for child_key, _iname, m3, tr, _lay in children:
+        child_r = definitions[child_key]["max_radius_in"]
+        tr_len = math.sqrt(tr[0] * tr[0] + tr[1] * tr[1] + tr[2] * tr[2])
+        bound = tr_len + _m3_scale_bound(m3) * child_r
+        if bound > max_r:
+            max_r = bound
+    return max_r
+
+
+def _is_identity_matrix(m4, radius_in: float = 0.0, rot_tol=1e-4, trans_tol_m=1e-4) -> bool:
+    radius_m = radius_in * INCHES_TO_METRES
+    eff_rot_tol = min(rot_tol, trans_tol_m / max(1.0, radius_m))
     ident = mathutils.Matrix.Identity(4)
     for r in range(4):
         for c in range(4):
-            limit = trans_tol_m if c == 3 and r < 3 else rot_tol
+            limit = trans_tol_m if c == 3 and r < 3 else eff_rot_tol
             if abs(m4[r][c] - ident[r][c]) > limit:
                 return False
     return True
@@ -333,23 +452,30 @@ def _matrix_to_skp_args(m4):
     return m3, tr
 
 
-def _instance_name_for(empty_obj, def_base_name: str, is_imported: bool = False) -> str:
+def _instance_name_for(
+    empty_obj,
+    def_base_name: str,
+    is_imported: bool = False,
+    all_object_names=None,
+) -> str:
     """Returns the SketchUp instance name for ``empty_obj``, or ``""`` when
-    the Empty only carries its definition's name (with optional ``.001``
-    Blender duplicate suffix) - SketchUp stores unnamed instances as ``""``
-    rather than baking the definition's name into the instance."""
+    the Empty only carries its definition's name (with optional ``.001`` /
+    ``.1000+`` Blender duplicate suffix) - SketchUp stores unnamed instances as
+    ``""`` rather than baking the definition's name into the instance."""
     raw_name = empty_obj.name
     if not raw_name or raw_name == def_base_name:
         return ""
     m = _BLENDER_DUP_SUFFIX_RE.match(raw_name)
     if m and m.group(1) == def_base_name:
         return ""
+    if all_object_names is None:
+        all_object_names = bpy.data.objects
     if is_imported:
-        base = _strip_blender_dup_suffix(raw_name, bpy.data.objects)
+        base = _strip_blender_dup_suffix(raw_name, all_object_names)
         if not base or base == def_base_name or re.match(r"^(?:mesh|Component)_\d+$", base):
             return ""
         return base
-    if m and m.group(1) and f"{m.group(1)}.001" in bpy.data.objects and m.group(1) in bpy.data.objects:
+    if m and m.group(1) and f"{m.group(1)}.001" in all_object_names and m.group(1) in all_object_names:
         return m.group(1)
     return raw_name
 
@@ -374,16 +500,29 @@ def _faces_approx_equal(faces_a, faces_b, pos_tol_in=2e-3) -> bool:
     return True
 
 
-def _children_approx_equal(ch_a, ch_b, rot_tol=2e-4, pos_tol_in=2e-3) -> bool:
+def _children_approx_equal(
+    ch_a,
+    ch_b,
+    definitions,
+    rot_tol=2e-4,
+    pos_tol_in=2e-3,
+) -> bool:
+    """Compares two child-instance lists for definition deduplication, scaling
+    the allowed 3x3 matrix tolerance with each child definition's radius so a
+    100 m beam rotated by 1.9e-4 rad is never merged with an unrotated one, and
+    ignoring child instance names so Blender's auto-numbered child Empties do
+    not split identical definitions (#28)."""
     if len(ch_a) != len(ch_b):
         return False
     ident3 = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-    for (dk_a, in_a, m3_a, tr_a, lay_a), (dk_b, in_b, m3_b, tr_b, lay_b) in zip(ch_a, ch_b):
-        if dk_a != dk_b or (in_a or "") != (in_b or "") or (lay_a or "") != (lay_b or ""):
+    for (dk_a, _in_a, m3_a, tr_a, lay_a), (dk_b, _in_b, m3_b, tr_b, lay_b) in zip(ch_a, ch_b):
+        if dk_a != dk_b or (lay_a or "") != (lay_b or ""):
             return False
+        child_r = definitions[dk_a]["max_radius_in"] if dk_a in definitions else 1.0
+        eff_rot_tol = min(rot_tol, pos_tol_in / max(1.0, child_r))
         ra = m3_a or ident3
         rb = m3_b or ident3
-        if any(abs(a - b) > rot_tol for a, b in zip(ra, rb)):
+        if any(abs(a - b) > eff_rot_tol for a, b in zip(ra, rb)):
             return False
         if (
             abs(tr_a[0] - tr_b[0]) > pos_tol_in
@@ -432,29 +571,38 @@ def _iter_collection_objects(coll):
     yield from walk(coll)
 
 
+def _world_relative_fallback(ancestor_obj, desc_obj):
+    inv = _try_invert(ancestor_obj.matrix_world)
+    if inv is not None:
+        return inv @ desc_obj.matrix_world
+    return ancestor_obj.matrix_world.inverted_safe() @ desc_obj.matrix_world
+
+
 def _parent_relative_blender_matrix(ancestor_obj, desc_obj):
     """Computes ``ancestor_obj.matrix_world^-1 @ desc_obj.matrix_world`` from
     ``matrix_parent_inverse @ matrix_basis`` along the parent chain whenever
-    the chain uses unconstrained object parenting, avoiding float32 rotation
-    drift from world-matrix inversion (#28)."""
+    that chain agrees with ``desc_obj.matrix_world``, falling back to
+    ``matrix_world`` whenever constraints, Follow Path curves, or drivers move
+    the object (#28)."""
     steps = []
     cur = desc_obj
     while cur is not None and cur != ancestor_obj:
         if cur.parent is None or cur.parent_type != "OBJECT" or len(cur.constraints) > 0:
-            inv = _try_invert(ancestor_obj.matrix_world)
-            if inv is not None:
-                return inv @ desc_obj.matrix_world
-            return ancestor_obj.matrix_world.inverted_safe() @ desc_obj.matrix_world
+            return _world_relative_fallback(ancestor_obj, desc_obj)
         steps.append(cur.matrix_parent_inverse @ cur.matrix_basis)
         cur = cur.parent
     if cur != ancestor_obj:
-        inv = _try_invert(ancestor_obj.matrix_world)
-        if inv is not None:
-            return inv @ desc_obj.matrix_world
-        return ancestor_obj.matrix_world.inverted_safe() @ desc_obj.matrix_world
+        return _world_relative_fallback(ancestor_obj, desc_obj)
     rel = mathutils.Matrix.Identity(4)
     for step_m in reversed(steps):
         rel = rel @ step_m
+    mw_desc = desc_obj.matrix_world
+    pred_world = ancestor_obj.matrix_world @ rel
+    for r in range(4):
+        for c in range(4):
+            ref_mag = max(1.0, abs(mw_desc[r][c]))
+            if abs(pred_world[r][c] - mw_desc[r][c]) > 1e-4 * ref_mag:
+                return _world_relative_fallback(ancestor_obj, desc_obj)
     return rel
 
 
@@ -467,8 +615,59 @@ def export_skp(filepath, context):
 
     depsgraph = context.evaluated_depsgraph_get()
     local_mesh_cache = {}
-    imported_roots, source_collections, imported_tag_collections = _collect_import_collections()
-    scene_collection = context.scene.collection
+    all_object_names = {o.name for o in bpy.data.objects}
+    all_collection_names = {c.name for c in bpy.data.collections}
+    all_material_names = {m.name for m in bpy.data.materials}
+
+    # Build O(1) parent -> children and object -> collection-names maps once per
+    # export (Object.children and Object.users_collection scan the whole blend
+    # file linearly on each access, making large scenes quadratic).
+    children_by_ptr = {}
+    for o in context.scene.objects:
+        p = o.parent
+        if p is not None:
+            children_by_ptr.setdefault(p.as_pointer(), []).append(o)
+
+    def children_of(parent_obj):
+        return children_by_ptr.get(parent_obj.as_pointer(), ())
+
+    user_colls_by_ptr = {}
+
+    def record_coll_tree(c):
+        cname = c.name
+        for o in c.objects:
+            lst = user_colls_by_ptr.setdefault(o.as_pointer(), [])
+            if cname not in lst:
+                lst.append(cname)
+
+    record_coll_tree(context.scene.collection)
+    for c in bpy.data.collections:
+        record_coll_tree(c)
+
+    (
+        imported_roots,
+        source_collections,
+        imported_tag_collections,
+        imported_meta_collections,
+    ) = _collect_import_collections(all_collection_names)
+    scene_collection_name = context.scene.collection.name
+
+    mat_spec_cache = {}
+
+    def cached_material_spec(mat):
+        if mat is None:
+            return None
+        mptr = mat.as_pointer()
+        if mptr not in mat_spec_cache:
+            mat_spec_cache[mptr] = _material_spec(mat, all_material_names)
+        return mat_spec_cache[mptr]
+
+    coll_objects_cache = {}
+
+    def coll_objects(coll):
+        if coll.name not in coll_objects_cache:
+            coll_objects_cache[coll.name] = tuple(_iter_collection_objects(coll))
+        return coll_objects_cache[coll.name]
 
     selected_candidates = [
         o for o in context.selected_objects
@@ -486,9 +685,9 @@ def export_skp(filepath, context):
         ]
 
     # Expand hierarchy descendants under any included imported group Empty,
-    # walking through all intermediate object types (Mesh -> Mesh, Armature ->
-    # Mesh, ordinary Empty -> Mesh) while skipping hidden children unless they
-    # were explicitly selected themselves.
+    # walking through ALL intermediate object types — including hidden or
+    # excluded nested group Empties — so active descendants below an inactive
+    # intermediate group are never dropped.
     expanded = list(raw_candidates)
     seen_ptrs = {o.as_pointer() for o in expanded}
 
@@ -498,19 +697,13 @@ def export_skp(filepath, context):
         return ch.visible_get() and not ch.hide_viewport
 
     def add_group_descendants(parent_obj):
-        for ch in parent_obj.children:
-            included = is_child_included(ch)
-            if _is_group_empty(ch):
-                if not included:
-                    continue
-                if ch.as_pointer() not in seen_ptrs:
-                    seen_ptrs.add(ch.as_pointer())
-                    expanded.append(ch)
-                add_group_descendants(ch)
-                continue
-            if included and (ch.type == "MESH" or _is_collection_empty(ch)):
-                if ch.as_pointer() not in seen_ptrs:
-                    seen_ptrs.add(ch.as_pointer())
+        for ch in children_of(parent_obj):
+            if is_child_included(ch) and (
+                ch.type == "MESH" or _is_collection_empty(ch) or _is_group_empty(ch)
+            ):
+                ptr = ch.as_pointer()
+                if ptr not in seen_ptrs:
+                    seen_ptrs.add(ptr)
                     expanded.append(ch)
             add_group_descendants(ch)
 
@@ -526,13 +719,13 @@ def export_skp(filepath, context):
     def mark_instanced_collection(coll, def_hint=None):
         if coll is None:
             return
-        is_lines_coll = re.sub(r"\.\d{3}$", "", coll.name).endswith(" (lines)")
+        is_lines_coll = re.sub(r"\.\d{3,}$", "", coll.name).endswith(" (lines)")
         if def_hint and not is_lines_coll and coll.name not in coll_skp_def_hint:
             coll_skp_def_hint[coll.name] = def_hint
         if coll.name in instanced_colls:
             return
         instanced_colls.add(coll.name)
-        for o in _iter_collection_objects(coll):
+        for o in coll_objects(coll):
             if _is_collection_empty(o):
                 mark_instanced_collection(o.instance_collection, o.get("sketchup_definition"))
 
@@ -549,11 +742,12 @@ def export_skp(filepath, context):
         # as well as part of a collection definition - never drop the original.
         if obj.visible_get():
             return False
-        if not obj.users_collection:
+        ucolls = user_colls_by_ptr.get(obj.as_pointer())
+        if not ucolls:
             return False
         return all(
-            c.name in source_collections or c.name in instanced_colls
-            for c in obj.users_collection
+            cname in source_collections or cname in instanced_colls
+            for cname in ucolls
         )
 
     active_objs = [o for o in expanded if not is_definition_master_mesh(o)]
@@ -580,16 +774,23 @@ def export_skp(filepath, context):
         "instances_written": 0,
     }
 
+    obj_layer_cache = {}
+
     def layer_of(obj, own_container_colls=()):
-        return _object_layer_name(
-            obj,
-            scene_collection,
-            imported_roots,
-            source_collections,
-            imported_tag_collections,
-            instanced_colls,
-            own_container_colls,
-        )
+        cache_key = (obj.as_pointer(), own_container_colls)
+        if cache_key not in obj_layer_cache:
+            ucolls = user_colls_by_ptr.get(obj.as_pointer(), ())
+            obj_layer_cache[cache_key] = _object_layer_name(
+                ucolls,
+                scene_collection_name,
+                imported_roots,
+                source_collections,
+                imported_tag_collections,
+                imported_meta_collections,
+                own_container_colls,
+                all_collection_names,
+            )
+        return obj_layer_cache[cache_key]
 
     def uses_skp_yup_frame(obj) -> bool:
         if _is_collection_empty(obj):
@@ -608,17 +809,19 @@ def export_skp(filepath, context):
         if coll.name in coll_skp_def_hint and coll_skp_def_hint[coll.name]:
             return coll_skp_def_hint[coll.name]
         if coll.name in source_collections:
-            return _strip_blender_dup_suffix(coll.name, bpy.data.collections)
+            return _strip_blender_dup_suffix(coll.name, all_collection_names)
         return coll.name
 
     # Ordered bottom-up component definitions:
     # def_key -> {"base_name": str, "name": str, "faces": [(pts, spec, lname)],
-    #             "children": [(child_key, inst_name, m3, tr, layer_name)]}
+    #             "children": [(child_key, inst_name, m3, tr, layer_name)],
+    #             "max_radius_in": float}
     definitions = {}
     def_order = []
     used_def_names = set()
     coll_def_cache = {}
     coll_faces_cache = {}
+    coll_own_radius_cache = {}
     visiting_colls = set()
 
     def alloc_def_name(base_name: str) -> str:
@@ -643,11 +846,13 @@ def export_skp(filepath, context):
         offset_mat = mathutils.Matrix.Translation(-coll.instance_offset)
         own_containers = (coll.name,)
         added = 0
-        for o in _iter_collection_objects(coll):
+        for o in coll_objects(coll):
             m_obj = world_prefix_bl @ offset_mat @ o.matrix_world
             if o.type == "MESH" and o.data is not None:
                 o_layer = layer_of(o, own_containers) or fallback_layer
-                for pts, spec in _extract_mesh_faces(o, m_obj, stats, depsgraph, local_mesh_cache):
+                for pts, spec in _extract_mesh_faces(
+                    o, m_obj, stats, depsgraph, local_mesh_cache, cached_material_spec
+                ):
                     out_faces.append((pts, spec, o_layer))
                     added += 1
             elif _is_collection_empty(o):
@@ -664,14 +869,22 @@ def export_skp(filepath, context):
         offset_mat = mathutils.Matrix.Translation(-coll.instance_offset)
         own_containers = (coll.name,)
         faces = []
-        for o in _iter_collection_objects(coll):
+        for o in coll_objects(coll):
             if o.type == "MESH" and o.data is not None:
                 m_local = cmat @ offset_mat @ o.matrix_world
                 f_layer = layer_of(o, own_containers)
-                for pts, spec in _extract_mesh_faces(o, m_local, stats, depsgraph, local_mesh_cache):
+                for pts, spec in _extract_mesh_faces(
+                    o, m_local, stats, depsgraph, local_mesh_cache, cached_material_spec
+                ):
                     faces.append((pts, spec, f_layer))
         coll_faces_cache[coll.name] = faces
+        coll_own_radius_cache[coll.name] = _faces_max_radius_in(faces)
         return faces
+
+    def collection_own_radius_in(coll) -> float:
+        if coll.name not in coll_own_radius_cache:
+            extract_collection_own_faces(coll)
+        return coll_own_radius_cache[coll.name]
 
     def resolve_collection_def(coll):
         if coll is None:
@@ -687,7 +900,7 @@ def export_skp(filepath, context):
             own_containers = (coll.name,)
             faces = list(extract_collection_own_faces(coll))
             children = []
-            for o in _iter_collection_objects(coll):
+            for o in coll_objects(coll):
                 if _is_collection_empty(o):
                     child_coll = o.instance_collection
                     m_bl = cmat @ offset_mat @ o.matrix_world
@@ -707,7 +920,7 @@ def export_skp(filepath, context):
                     is_imp = child_coll.name in source_collections or ("sketchup_definition" in o)
                     children.append((
                         child_key,
-                        _instance_name_for(o, child_base, is_imported=is_imp),
+                        _instance_name_for(o, child_base, is_imported=is_imp, all_object_names=all_object_names),
                         m3,
                         tr,
                         o_layer,
@@ -722,6 +935,7 @@ def export_skp(filepath, context):
                 "name": alloc_def_name(base_name),
                 "faces": faces,
                 "children": children,
+                "max_radius_in": _compute_def_max_radius_in(faces, children, definitions),
             }
             def_order.append(def_key)
             coll_def_cache[coll.name] = def_key
@@ -755,19 +969,21 @@ def export_skp(filepath, context):
             return False
         if layer_of(ch) != layer_of(grp_obj):
             return False
-        return _is_identity_matrix(relative_skp_matrix(grp_obj, ch))
+        own_r = collection_own_radius_in(ch.instance_collection)
+        return _is_identity_matrix(relative_skp_matrix(grp_obj, ch), radius_in=own_r)
 
     def flatten_group_subtree(grp_obj, prefix_to_grp_bl, fallback_layer, out_faces):
         """Flattens ``grp_obj``'s active subtree into ``out_faces`` using
-        ``prefix_to_grp_bl`` (e.g. ``grp_obj.matrix_world`` at root when
-        ``grp_obj`` carries a singular zero-axis scale)."""
+        ``prefix_to_grp_bl``, walking through inactive intermediate group
+        Empties so active descendants below them are preserved."""
         added = 0
 
         def walk_sub(parent_obj):
             nonlocal added
-            for ch in parent_obj.children:
+            for ch in children_of(parent_obj):
                 if _is_group_empty(ch):
                     if ch.as_pointer() not in active_ptrs:
+                        walk_sub(ch)
                         continue
                     m_ch_bl = prefix_to_grp_bl @ _parent_relative_blender_matrix(grp_obj, ch)
                     added += flatten_group_subtree(
@@ -778,7 +994,9 @@ def export_skp(filepath, context):
                     m_ch_bl = prefix_to_grp_bl @ _parent_relative_blender_matrix(grp_obj, ch)
                     ch_layer = layer_of(ch) or fallback_layer
                     if ch.type == "MESH" and ch.data is not None:
-                        for pts, spec in _extract_mesh_faces(ch, m_ch_bl, stats, depsgraph, local_mesh_cache):
+                        for pts, spec in _extract_mesh_faces(
+                            ch, m_ch_bl, stats, depsgraph, local_mesh_cache, cached_material_spec
+                        ):
                             out_faces.append((pts, spec, ch_layer))
                             added += 1
                     elif _is_collection_empty(ch):
@@ -802,9 +1020,10 @@ def export_skp(filepath, context):
 
         def walk_group_children(parent_obj):
             nonlocal claimed_own_mesh
-            for ch in parent_obj.children:
+            for ch in children_of(parent_obj):
                 if _is_group_empty(ch):
                     if ch.as_pointer() not in active_ptrs:
+                        walk_group_children(ch)
                         continue
                     m_rel = relative_skp_matrix(grp_obj, ch)
                     ch_layer = layer_of(ch)
@@ -819,7 +1038,7 @@ def export_skp(filepath, context):
                     child_base = definitions[child_key]["base_name"]
                     children.append((
                         child_key,
-                        _instance_name_for(ch, child_base, is_imported=True),
+                        _instance_name_for(ch, child_base, is_imported=True, all_object_names=all_object_names),
                         m3,
                         tr,
                         ch_layer,
@@ -854,7 +1073,9 @@ def export_skp(filepath, context):
                                 is_imp = child_coll.name in source_collections or ("sketchup_definition" in ch)
                                 children.append((
                                     child_key,
-                                    _instance_name_for(ch, child_base, is_imported=is_imp),
+                                    _instance_name_for(
+                                        ch, child_base, is_imported=is_imp, all_object_names=all_object_names
+                                    ),
                                     m3,
                                     tr,
                                     ch_layer,
@@ -862,7 +1083,9 @@ def export_skp(filepath, context):
                     elif ch.type == "MESH" and ch.data is not None:
                         m_rel = relative_mesh_matrix(grp_obj, ch)
                         ch_layer = layer_of(ch)
-                        for pts, spec in _extract_mesh_faces(ch, m_rel, stats, depsgraph, local_mesh_cache):
+                        for pts, spec in _extract_mesh_faces(
+                            ch, m_rel, stats, depsgraph, local_mesh_cache, cached_material_spec
+                        ):
                             faces.append((pts, spec, ch_layer))
 
                 walk_group_children(ch)
@@ -875,7 +1098,9 @@ def export_skp(filepath, context):
         bucket_key = (def_base_name, len(faces), len(children))
         for existing_key in group_defs_by_bucket.get(bucket_key, ()):
             edef = definitions[existing_key]
-            if _faces_approx_equal(faces, edef["faces"]) and _children_approx_equal(children, edef["children"]):
+            if _faces_approx_equal(faces, edef["faces"]) and _children_approx_equal(
+                children, edef["children"], definitions
+            ):
                 return existing_key
 
         def_key = ("group", len(definitions))
@@ -884,6 +1109,7 @@ def export_skp(filepath, context):
             "name": alloc_def_name(def_base_name),
             "faces": faces,
             "children": children,
+            "max_radius_in": _compute_def_max_radius_in(faces, children, definitions),
         }
         def_order.append(def_key)
         group_defs_by_bucket.setdefault(bucket_key, []).append(def_key)
@@ -907,7 +1133,9 @@ def export_skp(filepath, context):
             if obj.data is None or (not obj.modifiers and len(obj.data.polygons) == 0):
                 stats["objects_skipped"] += 1
                 continue
-            obj_faces = _extract_mesh_faces(obj, obj.matrix_world, stats, depsgraph, local_mesh_cache)
+            obj_faces = _extract_mesh_faces(
+                obj, obj.matrix_world, stats, depsgraph, local_mesh_cache, cached_material_spec
+            )
             if not obj_faces and len(obj.data.polygons) == 0:
                 stats["objects_skipped"] += 1
                 continue
@@ -923,7 +1151,7 @@ def export_skp(filepath, context):
                 len(root_model_top_empties) == 1
                 and obj is root_model_top_empties[0]
                 and obj_layer is None
-                and _is_identity_matrix(m_skp)
+                and _is_identity_matrix(m_skp, radius_in=collection_own_radius_in(coll))
             ):
                 own_faces = extract_collection_own_faces(coll)
                 if not own_faces:
@@ -951,7 +1179,7 @@ def export_skp(filepath, context):
             is_imp = coll.name in source_collections or ("sketchup_definition" in obj)
             root_instances.append((
                 def_key,
-                _instance_name_for(obj, def_base, is_imported=is_imp),
+                _instance_name_for(obj, def_base, is_imported=is_imp, all_object_names=all_object_names),
                 m3,
                 tr,
                 obj_layer,
@@ -977,7 +1205,7 @@ def export_skp(filepath, context):
             def_base = definitions[def_key]["base_name"]
             root_instances.append((
                 def_key,
-                _instance_name_for(obj, def_base, is_imported=True),
+                _instance_name_for(obj, def_base, is_imported=True, all_object_names=all_object_names),
                 m3,
                 tr,
                 obj_layer,

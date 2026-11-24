@@ -256,6 +256,8 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
     mat.use_nodes = True
     lr, lg, lb = srgb_to_linear((r, g, b))
     mat.diffuse_color = (lr, lg, lb, a)  # Solid viewport shading / thumbnails
+    if not gltf_mat.get("name") and not _has_texture(gltf_mat):
+        mat["openskp_initial_diffuse"] = [lr, lg, lb, a]
 
     _populate_surface(mat, mat.node_tree.nodes.get("Principled BSDF"), gltf_mat, textures, image_cache)
 
@@ -389,6 +391,8 @@ def _get_or_build_pair_material(front_index, back_index, gltf_materials, materia
     r, g, b, a = _base_color(_solid_display_material(front, back))
     lr, lg, lb = srgb_to_linear((r, g, b))
     mat.diffuse_color = (lr, lg, lb, a)
+    if not _is_painted(front) and not _is_painted(back):
+        mat["openskp_initial_diffuse"] = [lr, lg, lb, a]
 
     nt = mat.node_tree
     front_bsdf = nt.nodes.get("Principled BSDF")

@@ -69,6 +69,8 @@ objects outside instanced definitions (including meshes parented under ordinary
 Blender Empties or armatures, and visible collections that are also instanced)
 stay loose geometry at the file's root, keeping planar n-gons whole and
 triangulating only genuinely non-planar faces (see `tests/test_export.py`).
+Active mesh modifiers (including Geometry Nodes and `Set Material`) are
+evaluated and applied on export.
 
 **Layer export**: each exported object's own Collection becomes its
 SketchUp layer/tag — the first Collection it's linked into other than the

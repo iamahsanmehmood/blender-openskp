@@ -324,6 +324,9 @@ def _depsgraph_export_scene_to_skp(filepath, context):
         eval_obj = oi.object
         if eval_obj.type != "MESH":
             continue
+        vis_owner = oi.parent.original if oi.is_instance and oi.parent is not None else eval_obj.original
+        if not vis_owner.visible_get():
+            continue
         mw = oi.matrix_world.copy()
         mesh = eval_obj.to_mesh()
         try:
@@ -770,6 +773,8 @@ def test_blender_edge_cases_and_review_regressions():
         st2 = export_skp.export_skp(p2, bpy.context)
         m2 = openskp.SkpFile.open(p2).parse()
         assert len(m2.root.faces) == 6, len(m2.root.faces)
+        assert sorted(l.name for l in m2.layers) == ["Chair", "Layer0"], [l.name for l in m2.layers]
+        assert all(f.layer not in (None, 0) for f in m2.root.faces.values()), [f.layer for f in m2.root.faces.values()]
         assert len(m2.root.instances) == 1 and st2["definitions_written"] == 1, st2
         assert_matches_depsgraph(m2, tmp, "item2_visible_and_instanced")
 
@@ -986,6 +991,325 @@ def test_blender_edge_cases_and_review_regressions():
     print("test_blender_edge_cases_and_review_regressions: OK (all 12 review cases verified against depsgraph)")
 
 
+def test_review_round2_regressions():
+    """Regression tests for round-2 review items 1-6 on PR #36:
+    1. Geometry below hidden or excluded nested group Empties (eye off, excluded
+       collection, nested_components_2021.skp with 'Brackets' hidden -> 22 faces,
+       and selecting [OuterGrp, InnerMesh]).
+    2. 4+ digit Blender duplicate suffixes (.1000+) on 600 Frames x 2 Bolts ->
+       2 definitions (not 103), and child names never split identical definitions.
+    3. Linear O(N) export scaling on 2,000 Frames x 4 Bolts (10,000+ objects).
+    4. Follow Path constraints/curves inside group Empties (6 m offset) and
+       size-scaled rotation tolerance (100 m beam rotated by 1.9e-4 rad -> not merged).
+    5. Paint preserved on recoloured openskp_material_0 after Make Instances Real,
+       and Geometry Nodes 'Set Material' read from evaluated mesh.materials.
+    6. Plain-mesh tags preserved on visible+instanced collections ('Chair') and
+       on a user-created collection named 'Annotations'.
+    """
+    import math
+    import tempfile
+    import time
+
+    import openskp
+
+    import_skp = _load_module("import_skp")
+
+    def find_layer_coll(lc, name):
+        if lc.collection.name == name:
+            return lc
+        for ch in lc.children:
+            res = find_layer_coll(ch, name)
+            if res is not None:
+                return res
+        return None
+
+    def assert_matches_depsgraph(skp_model, tmp_dir, tag, tol=2e-3):
+        dg_file = os.path.join(tmp_dir, f"dg_r2_{tag}.skp")
+        _depsgraph_export_scene_to_skp(dg_file, bpy.context)
+        dg_m = openskp.SkpFile.open(dg_file).parse()
+        got = _model_world_face_signature(skp_model)
+        want = _model_world_face_signature(dg_m)
+        assert got[0] == want[0], f"{tag}: face count {got[0]} != depsgraph {want[0]}"
+        assert abs(got[1] - want[1]) <= 1e-4 * max(1.0, want[1]), f"{tag}: area {got[1]} != {want[1]}"
+        _assert_same_vertices(got[2], want[2], tol=tol, label=tag)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- R2.1a & R2.1b: Visible outer group + eye-off nested group + visible mesh ---
+        _reset_clean_scene()
+        outer_g = bpy.data.objects.new("OuterGroup", None)
+        outer_g["sketchup_definition"] = "OuterGroup"
+        outer_g.location = (1.0, 0.0, 0.0)
+        bpy.context.scene.collection.objects.link(outer_g)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        outer_m = bpy.context.active_object
+        outer_m.parent = outer_g
+        outer_m.select_set(False)
+
+        inner_g = bpy.data.objects.new("InnerHiddenEyeGroup", None)
+        inner_g["sketchup_definition"] = "InnerGroup"
+        inner_g.parent = outer_g
+        inner_g.location = (3.0, 0.0, 0.0)
+        bpy.context.scene.collection.objects.link(inner_g)
+        inner_g.hide_set(True)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 2.0, 0.0))
+        inner_m = bpy.context.active_object
+        inner_m.parent = inner_g
+        inner_m.select_set(False)
+        bpy.context.view_layer.update()
+
+        p_r2_1a = os.path.join(tmp, "r2_1a_hidden_eye.skp")
+        st_1a = export_skp.export_skp(p_r2_1a, bpy.context)
+        assert st_1a["faces_written"] == 12, st_1a  # 12 quads == 24 triangles!
+        m_1a = openskp.SkpFile.open(p_r2_1a).parse()
+        assert_matches_depsgraph(m_1a, tmp, "1a_hidden_eye")
+
+        # Selecting [outer_g, inner_m] must keep inner_m (never drop it!)
+        for o in bpy.data.objects:
+            o.select_set(False)
+        outer_g.select_set(True)
+        inner_m.select_set(True)
+        bpy.context.view_layer.update()
+        p_r2_1b = os.path.join(tmp, "r2_1b_select_outer_and_inner_mesh.skp")
+        st_1b = export_skp.export_skp(p_r2_1b, bpy.context)
+        assert st_1b["faces_written"] == 12, st_1b
+
+        # --- R2.1c: Nested group in an excluded collection with visible child mesh ---
+        _reset_clean_scene()
+        excl_coll = bpy.data.collections.new("ExcludedGroups")
+        bpy.context.scene.collection.children.link(excl_coll)
+        find_layer_coll(bpy.context.view_layer.layer_collection, "ExcludedGroups").exclude = True
+
+        vis_outer = bpy.data.objects.new("VisOuter", None)
+        vis_outer["sketchup_definition"] = "VisOuter"
+        bpy.context.scene.collection.objects.link(vis_outer)
+
+        excl_inner = bpy.data.objects.new("ExclInner", None)
+        excl_inner["sketchup_definition"] = "ExclInner"
+        excl_inner.parent = vis_outer
+        excl_inner.location = (4.0, 1.0, 0.0)
+        excl_coll.objects.link(excl_inner)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 2.0))
+        vis_leaf = bpy.context.active_object
+        vis_leaf.parent = excl_inner
+        vis_leaf.select_set(False)
+        bpy.context.view_layer.update()
+
+        p_r2_1c = os.path.join(tmp, "r2_1c_excluded_nested.skp")
+        st_1c = export_skp.export_skp(p_r2_1c, bpy.context)
+        assert st_1c["faces_written"] == 6, st_1c
+        m_1c = openskp.SkpFile.open(p_r2_1c).parse()
+        assert_matches_depsgraph(m_1c, tmp, "1c_excluded_nested")
+
+        # --- R2.1d: nested_components_2021.skp with "Brackets" hidden -> 22 world faces ---
+        _reset_clean_scene()
+        fixtures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        nested_fixture = os.path.join(fixtures_dir, "nested_components_2021.skp")
+        import_skp.import_skp(nested_fixture, bpy.context, keep_hierarchy=True)
+        lc_brackets = find_layer_coll(bpy.context.view_layer.layer_collection, "Brackets")
+        assert lc_brackets is not None
+        lc_brackets.hide_viewport = True
+        bpy.context.view_layer.update()
+
+        p_r2_1d = os.path.join(tmp, "r2_1d_nested_brackets_hidden.skp")
+        export_skp.export_skp(p_r2_1d, bpy.context)
+        m_1d = openskp.SkpFile.open(p_r2_1d).parse()
+        sig_1d = _model_world_face_signature(m_1d)
+        assert sig_1d[0] == 22, sig_1d  # 6 Assembly + 2 * 8 Bolt faces = 22!
+        assert_matches_depsgraph(m_1d, tmp, "1d_nested_brackets_hidden")
+
+        # --- R2.2 & R2.3: 600 Frames x 2 Bolts (.1000+) & 2,000 Frames x 4 Bolts O(N) speed ---
+        b_many = openskp.create()
+        with b_many.add_component_definition("Bolt") as bolt_d:
+            bolt_d.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
+        with b_many.add_component_definition("Frame") as frame_d:
+            frame_d.add_face([(0, 0, 0), (20, 0, 0), (20, 10, 0), (0, 10, 0)])
+            frame_d.add_instance(bolt_d, name="BoltA", translation=(2.0, 2.0, 0.0))
+            frame_d.add_instance(bolt_d, name="BoltB", translation=(6.0, 2.0, 0.0))
+            frame_d.add_instance(bolt_d, name="BoltC", translation=(10.0, 2.0, 0.0))
+            frame_d.add_instance(bolt_d, name="BoltD", translation=(14.0, 2.0, 0.0))
+        for k in range(2000):
+            b_many.add_instance(frame_d, translation=((k % 50) * 30.0, (k // 50) * 20.0, 0.0))
+        many_src = os.path.join(tmp, "frames_2000x4_src.skp")
+        many_out = os.path.join(tmp, "frames_2000x4_out.skp")
+        with open(many_src, "wb") as f:
+            f.write(b_many.to_bytes())
+
+        _reset_clean_scene()
+        import_skp.import_skp(many_src, bpy.context, keep_hierarchy=True)
+        # Rename one child Bolt Empty to verify child names never split identical definitions
+        bolt_empties = [o for o in bpy.context.scene.objects if o.name.startswith("BoltA.")]
+        assert any(int(o.name.split(".")[-1]) >= 1000 for o in bolt_empties if o.name.split(".")[-1].isdigit())
+        bolt_empties[0].name = "CustomRenamedChildBolt"
+        bpy.context.view_layer.update()
+
+        t0 = time.perf_counter()
+        st_many = export_skp.export_skp(many_out, bpy.context)
+        dt_many = time.perf_counter() - t0
+        assert st_many["definitions_written"] == 2, st_many  # Frame + Bolt ONLY!
+        assert st_many["instances_written"] == 2004, st_many  # 4 Bolts in Frame + 2,000 Frames!
+        assert dt_many < 10.0, f"2,000 Frames x 4 Bolts export took {dt_many:.2f}s (expected linear < 10s)"
+        m_many = openskp.SkpFile.open(many_out).parse()
+        assert len([d for d in m_many.definitions.values() if d is not m_many.root]) == 2
+        assert not any(".1000" in (i.name or "") for d in m_many.definitions.values() for i in d.instances)
+        print(f"  2,000 Frames x 4 Bolts (10,000+ objects): exported 2 defs in {dt_many:.2f}s")
+
+        # --- R2.4a: Mesh following a 6 m path inside a group Empty ---
+        _reset_clean_scene()
+        path_grp = bpy.data.objects.new("PathGroup", None)
+        path_grp["sketchup_definition"] = "PathGroup"
+        path_grp.location = (2.0, 0.0, 0.0)
+        bpy.context.scene.collection.objects.link(path_grp)
+
+        curve_data = bpy.data.curves.new("TrackCurve", type="CURVE")
+        curve_data.dimensions = "3D"
+        curve_data.use_path = True
+        spline = curve_data.splines.new("POLY")
+        spline.points.add(1)
+        spline.points[0].co = (0.0, 0.0, 0.0, 1.0)
+        spline.points[1].co = (6.0, 0.0, 0.0, 1.0)
+        curve_obj = bpy.data.objects.new("TrackCurve", curve_data)
+        curve_obj.parent = path_grp
+        bpy.context.scene.collection.objects.link(curve_obj)
+
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        follower = bpy.context.active_object
+        follower.parent = path_grp
+        follower.select_set(False)
+        fp = follower.constraints.new(type="FOLLOW_PATH")
+        fp.target = curve_obj
+        fp.use_fixed_location = True
+        fp.offset_factor = 1.0  # moves follower +6 m along the curve!
+
+        bpy.ops.mesh.primitive_cube_add(size=0.5, location=(0.0, 1.0, 0.0))
+        sub_follower = bpy.context.active_object
+        sub_follower.parent = follower  # 0 constraints on sub_follower itself!
+        sub_follower.select_set(False)
+        bpy.context.view_layer.update()
+        assert follower.matrix_world.translation.x >= 8.0, follower.matrix_world.translation
+
+        p_r2_4a = os.path.join(tmp, "r2_4a_follow_path.skp")
+        export_skp.export_skp(p_r2_4a, bpy.context)
+        m_4a = openskp.SkpFile.open(p_r2_4a).parse()
+        assert_matches_depsgraph(m_4a, tmp, "4a_follow_path")
+
+        # --- R2.4b: Two Frames whose 100 m beam differs by 1.9e-4 rad (9.5 mm at tip) ---
+        _reset_clean_scene()
+        beam_coll = bpy.data.collections.new("LongBeam100m")
+        bm_mesh = bpy.data.meshes.new("BeamMesh100m")
+        bm_mesh.from_pydata(
+            [(-50.0, -0.2, 0.0), (50.0, -0.2, 0.0), (50.0, 0.2, 0.0), (-50.0, 0.2, 0.0)],
+            [],
+            [(0, 1, 2, 3)],
+        )
+        bm_mesh.update()
+        bm_obj = bpy.data.objects.new("BeamMesh100m", bm_mesh)
+        beam_coll.objects.link(bm_obj)
+
+        for idx, yaw in enumerate((0.0, 1.9e-4)):
+            fg = bpy.data.objects.new(f"LongFrame_{idx}", None)
+            fg["sketchup_definition"] = "LongFrame"
+            fg.location = (0.0, idx * 5.0, 0.0)
+            bpy.context.scene.collection.objects.link(fg)
+            bi = bpy.data.objects.new(f"BeamInst_{idx}", None)
+            bi.instance_type = "COLLECTION"
+            bi.instance_collection = beam_coll
+            bi.parent = fg
+            bi.rotation_euler = (0.0, 0.0, yaw)
+            bpy.context.scene.collection.objects.link(bi)
+        bpy.context.view_layer.update()
+
+        p_r2_4b = os.path.join(tmp, "r2_4b_100m_beam_rot.skp")
+        st_4b = export_skp.export_skp(p_r2_4b, bpy.context)
+        assert st_4b["definitions_written"] == 3, st_4b  # LongBeam100m + 2 distinct LongFrame defs!
+        m_4b = openskp.SkpFile.open(p_r2_4b).parse()
+        assert_matches_depsgraph(m_4b, tmp, "4b_100m_beam_rot", tol=2e-3)
+
+        # --- R2.5a: Import unpainted, Make Instances Real, recolour openskp_material_0 ---
+        _reset_clean_scene()
+        unp_src = os.path.join(tmp, "unpainted_box.skp")
+        ub = openskp.create()
+        ub.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
+        with open(unp_src, "wb") as f:
+            f.write(ub.to_bytes())
+        import_skp.import_skp(unp_src, bpy.context, keep_hierarchy=False)
+        for o in bpy.context.scene.objects:
+            o.select_set(o.type == "EMPTY")
+        bpy.ops.object.duplicates_make_real()
+        for o in list(bpy.context.scene.objects):
+            if o.type == "EMPTY":
+                bpy.data.objects.remove(o, do_unlink=True)
+            else:
+                o.select_set(False)
+        mat0 = bpy.data.materials["openskp_material_0"]
+        want_rgb = (220, 40, 60)
+        lr, lg, lb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in want_rgb))
+        mat0.diffuse_color = (lr, lg, lb, 1.0)
+        bpy.context.view_layer.update()
+
+        p_r2_5a = os.path.join(tmp, "r2_5a_recolored_mat0.skp")
+        st_5a = export_skp.export_skp(p_r2_5a, bpy.context)
+        assert st_5a["materials_written"] == 1, st_5a
+        m_5a = openskp.SkpFile.open(p_r2_5a).parse()
+        assert len(m_5a.materials) == 1
+        got_mat = m_5a.materials[0]
+        assert tuple(got_mat.color[:3]) == want_rgb, got_mat.color
+
+        # --- R2.5b: Geometry Nodes 'Set Material' on evaluated mesh ---
+        _reset_clean_scene()
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        gn_cube = bpy.context.active_object
+        gn_cube.select_set(False)
+        gn_mat = bpy.data.materials.new("GeoNodeGreen")
+        gn_rgb = (30, 190, 80)
+        glr, glg, glb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in gn_rgb))
+        gn_mat.diffuse_color = (glr, glg, glb, 1.0)
+
+        gn_mod = gn_cube.modifiers.new(name="SetMatGN", type="NODES")
+        nt = bpy.data.node_groups.new("SetMatGroup", "GeometryNodeTree")
+        nt.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+        nt.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+        n_in = nt.nodes.new("NodeGroupInput")
+        n_out = nt.nodes.new("NodeGroupOutput")
+        n_set = nt.nodes.new("GeometryNodeSetMaterial")
+        n_set.inputs["Material"].default_value = gn_mat
+        nt.links.new(n_in.outputs["Geometry"], n_set.inputs["Geometry"])
+        nt.links.new(n_set.outputs["Geometry"], n_out.inputs["Geometry"])
+        gn_mod.node_group = nt
+        bpy.context.view_layer.update()
+
+        p_r2_5b = os.path.join(tmp, "r2_5b_geonodes_set_mat.skp")
+        st_5b = export_skp.export_skp(p_r2_5b, bpy.context)
+        assert st_5b["materials_written"] == 1, st_5b
+        m_5b = openskp.SkpFile.open(p_r2_5b).parse()
+        assert len(m_5b.materials) == 1
+        got_gn_mat = m_5b.materials[0]
+        assert got_gn_mat.name == "GeoNodeGreen" and tuple(got_gn_mat.color[:3]) == gn_rgb, got_gn_mat
+
+        # --- R2.6: User collection named "Annotations" keeps tag "Annotations" on plain meshes ---
+        _reset_clean_scene()
+        user_annot_coll = bpy.data.collections.new("Annotations")
+        bpy.context.scene.collection.children.link(user_annot_coll)
+        bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0.0, 0.0, 0.0))
+        u_cube = bpy.context.active_object
+        for c in list(u_cube.users_collection):
+            c.objects.unlink(u_cube)
+        user_annot_coll.objects.link(u_cube)
+        u_cube.select_set(False)
+        bpy.context.view_layer.update()
+
+        p_r2_6 = os.path.join(tmp, "r2_6_user_annotations_tag.skp")
+        st_6 = export_skp.export_skp(p_r2_6, bpy.context)
+        assert st_6["layers_written"] == 1, st_6
+        m_6 = openskp.SkpFile.open(p_r2_6).parse()
+        assert sorted(l.name for l in m_6.layers) == ["Annotations", "Layer0"], [l.name for l in m_6.layers]
+        assert all(f.layer not in (None, 0) for f in m_6.root.faces.values()), [f.layer for f in m_6.root.faces.values()]
+
+    print("test_review_round2_regressions: OK (all 6 round-2 review points verified)")
+
+
 if __name__ == "__main__":
     main()
     test_layer_export()
@@ -994,3 +1318,4 @@ if __name__ == "__main__":
     test_native_collection_instances_export()
     test_nested_component_round_trip()
     test_blender_edge_cases_and_review_regressions()
+    test_review_round2_regressions()
