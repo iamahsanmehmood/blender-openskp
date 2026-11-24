@@ -882,6 +882,7 @@ def _place_node(
     keep_hierarchy=False,
     parent_object=None,
     is_root=False,
+    node_parents=None,
 ):
     """Walks one InstancedNode, placing an Empty (collection-instance) for
     its own mesh_resource_id and/or curve_resource_id (a definition can
@@ -929,12 +930,14 @@ def _place_node(
                 obj["sketchup_guid"] = node.guid
 
     own_parent = parent_object
+    rep_parent = None
     if keep_hierarchy and node.children and not is_root:
         group = bpy.data.objects.new(node.name or node.definition_name or "Group", None)
         group.empty_display_type = "PLAIN_AXES"
         group.empty_display_size = 0.1
         place(group, parent_object)
         own_parent = (group, world_bl)
+        rep_parent = own_parent
         stats["groups"] += 1
 
     if node.mesh_resource_id is not None:
@@ -946,6 +949,8 @@ def _place_node(
         empty.instance_type = "COLLECTION"
         empty.instance_collection = coll
         place(empty, own_parent)
+        if keep_hierarchy and not is_root and rep_parent is None:
+            rep_parent = (empty, world_bl)
         stats["placements"] += 1
 
     if node.curve_resource_id is not None:
@@ -958,7 +963,12 @@ def _place_node(
         curve_empty.instance_type = "COLLECTION"
         curve_empty.instance_collection = curve_coll
         place(curve_empty, own_parent)
+        if keep_hierarchy and not is_root and rep_parent is None:
+            rep_parent = (curve_empty, world_bl)
         stats["curve_placements"] += 1
+
+    if node_parents is not None and rep_parent is not None:
+        node_parents[id(node)] = rep_parent
 
     for child in node.children:
         _place_node(
@@ -978,6 +988,7 @@ def _place_node(
             stats,
             keep_hierarchy,
             own_parent,
+            node_parents=node_parents,
         )
 
 
@@ -1073,6 +1084,726 @@ def _import_scene_cameras(pages, root_collection, context):
     return len(cameras)
 
 
+def _tlv_headers_in_range(buf, start, end):
+    import struct
+
+    out = []
+    pos = start
+    while pos + 6 <= end:
+        ln = struct.unpack_from("<I", buf, pos + 2)[0]
+        if ln > end - pos - 6:
+            break
+        out.append((pos, ln))
+        pos += 6 + ln
+    return out
+
+
+_MAX_IMPORTED_ANNOTATIONS = 2000
+
+
+def _inspect_vff_annotations_tlv(filepath, model, include_components=False):
+    """Inspects ``model.dat`` inside a 2021+ VFF ``.skp`` ZIP container (#27):
+    - Classifies ``5BCC`` dimension records into component/nested-path vs root,
+      detects tag ``0x5BD1 != 0`` axis-constrained dimensions, and counts ``5BCC``
+      records whose endpoints did not resolve into ``model.dimensions``.
+    - Counts ``55F0`` VFF text records when ``openskp <= 1.6.0`` has not yet
+      parsed them.
+    """
+    import struct
+    import zipfile
+    from openskp import _core
+
+    model_dims = [d for d in (getattr(model, "dimensions", None) or ()) if d.a is not None and d.b is not None]
+    if not filepath or not os.path.isfile(filepath):
+        return [], (0 if include_components else len(model_dims)), 0, 0, 0
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            md = zf.read("model.dat")
+    except Exception:
+        return [], (0 if include_components else len(model_dims)), 0, 0, 0
+
+    def_spans = []
+    hs = _tlv_headers_in_range(md, 0, len(md))
+    if len(hs) == 1 and md[hs[0][0]] == 0xF4 and md[hs[0][0] + 1] == 0xF4 - 0xF3:
+        hs = _tlv_headers_in_range(md, hs[0][0] + 6, hs[0][0] + 6 + hs[0][1])
+    elif len(hs) == 1 and md[hs[0][0]] == 0xF4 and md[hs[0][0] + 1] == 0x01:
+        hs = _tlv_headers_in_range(md, hs[0][0] + 6, hs[0][0] + 6 + hs[0][1])
+    for h_off, h_sz in hs:
+        if md[h_off] == 0xF9 and md[h_off + 1] == 0x01:
+            lvl = _tlv_headers_in_range(md, h_off + 6, h_off + 6 + h_sz)
+            for tag_lo, tag_hi in ((0x70, 0x17), (0x71, 0x17)):
+                nxt = next(((o, s) for o, s in lvl if md[o] == tag_lo and md[o + 1] == tag_hi), None)
+                lvl = _tlv_headers_in_range(md, nxt[0] + 6, nxt[0] + 6 + nxt[1]) if nxt else []
+            for r_off, r_sz in lvl:
+                if md[r_off] == 0x7C and md[r_off + 1] == 0x15:
+                    def_spans.append((r_off, r_off + 6 + r_sz))
+
+    def _has_multi_instance_path(conn_payload):
+        if not conn_payload:
+            return False
+        blk = _core._tlv_find(_core._tlv_items(conn_payload) or [], 0x5208)
+        sub = _core._tlv_items(blk) or [] if blk else []
+        ref = _core._tlv_find(sub, 0x520B)
+        f53fc = _core._tlv_find(_core._tlv_items(ref) or [], 0x53FC) if ref else None
+        fi = _core._tlv_items(f53fc) or [] if f53fc else []
+        iid = _core._tlv_find(fi, 0x53FE)
+        if not iid or len(iid) == 0:
+            return False
+        return 1 + iid[0] < len(iid)
+
+    view = memoryview(md)
+    raw_5bcc = []
+    pos = 0
+    n = len(md)
+    while True:
+        j = md.find(b"\xcc\x5b", pos)
+        if j < 0:
+            break
+        pos = j + 1
+        if j + 6 > n:
+            continue
+        ln = struct.unpack_from("<I", md, j + 2)[0]
+        if ln < 40 or j + 6 + ln > n:
+            continue
+        body = _core._tlv_items(view[j + 6 : j + 6 + ln])
+        if not body:
+            continue
+        tags = [t for t, _ in body]
+        if 0x5BCD not in tags or 0x5BCE not in tags:
+            continue
+        in_def = any(s <= j < e for s, e in def_spans)
+        multi = _has_multi_instance_path(_core._tlv_find(body, 0x5BCD)) or _has_multi_instance_path(
+            _core._tlv_find(body, 0x5BCE)
+        )
+        xaxis = _core._tlv_find(body, 0x5BCF)
+        normal = _core._tlv_find(body, 0x5BD0)
+        axis_bytes = _core._tlv_find(body, 0x5BD1)
+        off_bytes = _core._tlv_find(body, 0x5BD2)
+        px_val = struct.unpack("<3d", xaxis) if xaxis and len(xaxis) == 24 else None
+        nm_val = struct.unpack("<3d", normal) if normal and len(normal) == 24 else None
+        off_val = struct.unpack("<d", off_bytes)[0] if off_bytes and len(off_bytes) == 8 else 0.0
+        axis_val = struct.unpack("<I", axis_bytes)[0] if axis_bytes and len(axis_bytes) == 4 else 0
+        raw_5bcc.append((in_def, multi, axis_val, (px_val, nm_val, off_val)))
+
+    vff_texts = 0
+    pos = 0
+    while True:
+        j = md.find(b"\xf0\x55", pos)
+        if j < 0:
+            break
+        pos = j + 1
+        if j + 6 > n:
+            continue
+        ln = struct.unpack_from("<I", md, j + 2)[0]
+        if ln < 10 or j + 6 + ln > n:
+            continue
+        body = _core._tlv_items(view[j + 6 : j + 6 + ln])
+        if not body:
+            continue
+        tags = [t for t, _ in body]
+        if 0x55F1 in tags and 0x55F4 in tags:
+            vff_texts += 1
+
+    # Match model_dims in order as a subsequence of raw_5bcc so any 5BCC record
+    # whose endpoint did not resolve in _core._parse_dimensions is counted as
+    # unresolved without shifting alignment of the remaining records.
+    matched = []
+    unresolved_count = 0
+    r_idx = 0
+    for d in model_dims:
+        sig = (
+            tuple(d.plane_x) if d.plane_x is not None else None,
+            tuple(d.normal) if d.normal is not None else None,
+            float(d.offset or 0.0),
+        )
+        found = None
+        scan = r_idx
+        while scan < len(raw_5bcc):
+            if raw_5bcc[scan][3] == sig:
+                found = scan
+                break
+            scan += 1
+        if found is None and r_idx < len(raw_5bcc):
+            found = r_idx
+        if found is not None:
+            for skipped_idx in range(r_idx, found):
+                s_in_def, s_multi, _, _ = raw_5bcc[skipped_idx]
+                if include_components or (not s_in_def and not s_multi):
+                    unresolved_count += 1
+            matched.append((d, raw_5bcc[found]))
+            r_idx = found + 1
+        else:
+            matched.append((d, (False, False, 0, sig)))
+    for skipped_idx in range(r_idx, len(raw_5bcc)):
+        s_in_def, s_multi, _, _ = raw_5bcc[skipped_idx]
+        if include_components or (not s_in_def and not s_multi):
+            unresolved_count += 1
+
+    kept_dims = []
+    skipped_comp = 0
+    skipped_constrained = 0
+    for d, (in_def, multi, axis_val, _) in matched:
+        if not include_components and (in_def or multi):
+            skipped_comp += 1
+            continue
+        if (
+            axis_val != 0
+            and not hasattr(d, "measured_direction")
+            and _is_vff_axis_misaligned(d.a, d.b, axis_val, d.plane_x, d.normal)
+        ):
+            skipped_constrained += 1
+            continue
+        kept_dims.append(d)
+
+    return kept_dims, skipped_comp, skipped_constrained, unresolved_count, vff_texts
+
+
+def _is_unpositioned_text(t) -> bool:
+    if getattr(t, "leader_type", None) == 0:
+        return True
+    return getattr(t, "point", None) is None and getattr(t, "label_point", None) is None
+
+
+def _is_vff_axis_misaligned(a, b, axis_val: int, p_norm, p_x) -> bool:
+    """Returns True when a 2021+ dimension has an axis constraint (5BD1 == 1 for
+    plane X axis ``5BD0``, 5BD1 == 2 for plane Y axis ``5BCF x 5BD0``) and
+    ``b - a`` is not parallel to that constraint axis."""
+    if axis_val == 0:
+        return False
+    if a is None or b is None or p_norm is None or p_x is None:
+        return True
+    if axis_val == 1:
+        cx, cy, cz = float(p_x[0]), float(p_x[1]), float(p_x[2])
+    elif axis_val == 2:
+        nx, ny, nz = float(p_norm[0]), float(p_norm[1]), float(p_norm[2])
+        xx, xy, xz = float(p_x[0]), float(p_x[1]), float(p_x[2])
+        cx = ny * xz - nz * xy
+        cy = nz * xx - nx * xz
+        cz = nx * xy - ny * xx
+    else:
+        return True
+    dx = float(b[0]) - float(a[0])
+    dy = float(b[1]) - float(a[1])
+    dz = float(b[2]) - float(a[2])
+    seg_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
+    if seg_len <= 1e-9 or c_len <= 1e-9:
+        return False
+    cos_ang = abs(dx * cx + dy * cy + dz * cz) / (seg_len * c_len)
+    return (1.0 - cos_ang) > 1e-4
+
+
+def _is_misaligned_constrained_dim(dim, is_vff: bool = False) -> bool:
+    """Detects an axis-constrained dimension whose ``b - a`` segment is not
+    parallel to its constraint axis before ``Dimension`` exposes
+    ``measured_direction``."""
+    if hasattr(dim, "measured_direction"):
+        return False
+    ov = getattr(dim, "offset_vector", None)
+    if ov is None or dim.a is None or dim.b is None:
+        return False
+    dx = float(dim.b[0]) - float(dim.a[0])
+    dy = float(dim.b[1]) - float(dim.a[1])
+    dz = float(dim.b[2]) - float(dim.a[2])
+    seg_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    ox, oy, oz = float(ov[0]), float(ov[1]), float(ov[2])
+    ov_len = math.sqrt(ox * ox + oy * oy + oz * oz)
+    if seg_len <= 1e-9 or ov_len <= 1e-9:
+        return False
+    p_norm = getattr(dim, "plane_x", None) if is_vff else getattr(dim, "normal", None)
+    if p_norm is not None:
+        nx, ny, nz = float(p_norm[0]), float(p_norm[1]), float(p_norm[2])
+        cx = ny * oz - nz * oy
+        cy = nz * ox - nx * oz
+        cz = nx * oy - ny * ox
+        c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
+        if c_len > 1e-9:
+            cos_ang = abs(dx * cx + dy * cy + dz * cz) / (seg_len * c_len)
+            return (1.0 - cos_ang) > 1e-4
+    dot = abs(dx * ox + dy * oy + dz * oz)
+    return dot > 1e-4 * seg_len * ov_len
+
+
+def _tag_dimension(dim, is_vff, extra=None):
+    from openskp.model import Dimension
+
+    kwargs = {
+        "text": getattr(dim, "text", "") or "",
+        "hidden": bool(getattr(dim, "hidden", False)),
+        "a": tuple(dim.a) if getattr(dim, "a", None) is not None else None,
+        "b": tuple(dim.b) if getattr(dim, "b", None) is not None else None,
+        "offset": float(getattr(dim, "offset", 0.0) or 0.0),
+        "plane_x": tuple(dim.plane_x) if getattr(dim, "plane_x", None) is not None else None,
+        "normal": tuple(dim.normal) if getattr(dim, "normal", None) is not None else None,
+    }
+    fields = getattr(Dimension, "__dataclass_fields__", {})
+    if "offset_vector" in fields:
+        ov = getattr(dim, "offset_vector", None)
+        kwargs["offset_vector"] = tuple(ov) if ov is not None else None
+    if "layer" in fields:
+        kwargs["layer"] = getattr(dim, "layer", "") or ""
+    wrapped = Dimension(**kwargs)
+    wrapped._is_vff = bool(is_vff)
+    if extra:
+        for k, v in extra.items():
+            if v is not None and not hasattr(wrapped, k):
+                setattr(wrapped, k, v)
+    return wrapped
+
+
+def _extract_model_annotations(model, skp_parsed=None, filepath=None, stats=None):
+    """Collects positioned texts and linear dimensions per definition (including
+    ``model.root``), plus verified root-only VFF ``model.dimensions`` when
+    running against an ``openskp`` wheel older than ``openskp#623`` (#27).
+    """
+    import zipfile
+    from openskp.model import Dimension
+
+    is_vff = bool(filepath and os.path.isfile(filepath) and zipfile.is_zipfile(filepath))
+    defs_dict = (skp_parsed or {}).get("defs_dict") or {}
+    layer_id_to_name = (skp_parsed or {}).get("layer_id_to_name") or {}
+
+    dim_fields = getattr(Dimension, "__dataclass_fields__", {})
+    has_vff_owner_annotations = "layer" in dim_fields
+    has_model_def_dims = (
+        has_vff_owner_annotations
+        or "offset_vector" in dim_fields
+        or any(
+            d.a is not None and d.b is not None
+            for defn in [model.root, *model.definitions.values()]
+            for d in (getattr(defn, "dimensions", None) or ())
+        )
+    )
+
+    by_def_id = {}
+    all_entries = [("ROOT", model.root), *list(model.definitions.items())]
+    for raw_key, defn in all_entries:
+        texts = []
+        for t in getattr(defn, "texts", None) or ():
+            if not (t.text or "").strip():
+                continue
+            if _is_unpositioned_text(t):
+                if stats is not None:
+                    stats["texts_skipped_no_position"] = stats.get("texts_skipped_no_position", 0) + 1
+                continue
+            texts.append(t)
+
+        dims = []
+        if has_model_def_dims and (not is_vff or has_vff_owner_annotations):
+            for d in getattr(defn, "dimensions", None) or ():
+                if d.a is None or d.b is None:
+                    if stats is not None:
+                        stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+                    continue
+                if _is_misaligned_constrained_dim(d, is_vff=is_vff):
+                    if stats is not None:
+                        stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
+                    continue
+                dims.append(_tag_dimension(d, is_vff))
+        elif not is_vff:
+            raw_entry = defs_dict.get(raw_key)
+            builder = raw_entry.get("builder") if isinstance(raw_entry, dict) else None
+            b_dims = getattr(builder, "dimensions", None) or ()
+            if b_dims:
+                for bd in b_dims:
+                    if not isinstance(bd, dict):
+                        continue
+                    if bd.get("a") is None or bd.get("b") is None:
+                        if stats is not None:
+                            stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+                        continue
+                    raw_lid = bd.get("layer_id", bd.get("layer"))
+                    resolved_layer = ""
+                    if isinstance(raw_lid, int) and raw_lid != 0:
+                        resolved_layer = layer_id_to_name.get(raw_lid, "")
+                    elif isinstance(raw_lid, str):
+                        resolved_layer = raw_lid
+                    base_d = Dimension(
+                        text=bd.get("text", ""),
+                        hidden=bool(bd.get("hidden", False)),
+                        a=tuple(bd["a"]),
+                        b=tuple(bd["b"]),
+                        offset=float(bd.get("offset", 0.0)),
+                        plane_x=tuple(bd["plane_x"]) if bd.get("plane_x") is not None else None,
+                        normal=tuple(bd["normal"]) if bd.get("normal") is not None else None,
+                    )
+                    ov = tuple(bd["offset_vector"]) if bd.get("offset_vector") is not None else None
+                    tagged = _tag_dimension(base_d, False, {"offset_vector": ov, "layer": resolved_layer})
+                    if _is_misaligned_constrained_dim(tagged):
+                        if stats is not None:
+                            stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
+                        continue
+                    dims.append(tagged)
+            else:
+                for d in getattr(defn, "dimensions", None) or ():
+                    if d.a is None or d.b is None:
+                        if stats is not None:
+                            stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+        by_def_id[id(defn)] = (texts, dims)
+
+    vff_world_dims = []
+    if is_vff and not has_vff_owner_annotations:
+        root_vff, skipped_comp_dims, skipped_constrained, skipped_unres, skipped_vff_txts = (
+            _inspect_vff_annotations_tlv(filepath, model, include_components=False)
+        )
+        if stats is not None:
+            stats["vff_component_dimensions_skipped"] = (
+                stats.get("vff_component_dimensions_skipped", 0) + skipped_comp_dims
+            )
+            stats["constrained_dimensions_skipped"] = (
+                stats.get("constrained_dimensions_skipped", 0) + skipped_constrained
+            )
+            stats["dimensions_skipped_unresolved"] = (
+                stats.get("dimensions_skipped_unresolved", 0) + skipped_unres
+            )
+            stats["vff_texts_skipped"] = stats.get("vff_texts_skipped", 0) + skipped_vff_txts
+        vff_world_dims = [_tag_dimension(d, True) for d in root_vff]
+
+    return by_def_id, vff_world_dims
+
+
+def _transform_inch_point(pt, m13):
+    if m13 is None:
+        return (float(pt[0]), float(pt[1]), float(pt[2]))
+    from openskp._core import transform_point
+
+    return transform_point(pt, m13)
+
+
+def _transform_inch_vec(vec, m13):
+    if m13 is None:
+        return mathutils.Vector((float(vec[0]), float(vec[1]), float(vec[2])))
+    s = m13[12] if len(m13) > 12 else 1.0
+    vx, vy, vz = vec
+    return mathutils.Vector((
+        (m13[0] * vx + m13[1] * vy + m13[2] * vz) * s,
+        (m13[3] * vx + m13[4] * vy + m13[5] * vz) * s,
+        (m13[6] * vx + m13[7] * vy + m13[8] * vz) * s,
+    ))
+
+
+def _dimension_offset_vec_m(dim, p1_m, p2_m, world_m13):
+    """Returns the world-space offset vector in metres only when ``openskp``
+    supplies an explicit ``Dimension.offset_vector`` (#621/#623); with
+    ``openskp`` 1.6.0 (or when ``offset_vector`` is ``None``), draws the
+    dimension line directly along ``a``-``b`` without guessing a plane side."""
+    seg = p2_m - p1_m
+    if seg.length <= 1e-9:
+        return mathutils.Vector((0.0, 0.0, 0.0))
+    offset_vec = getattr(dim, "offset_vector", None)
+    if offset_vec is not None:
+        return _transform_inch_vec(offset_vec, world_m13) * _INCH_TO_M
+    return mathutils.Vector((0.0, 0.0, 0.0))
+
+
+def _format_dimension_meters(dist_m):
+    text = f"{dist_m:.4f}".rstrip("0").rstrip(".")
+    return f"{text or '0'} m"
+
+
+def _format_dimension_label(raw_text, dist_m):
+    formatted = _format_dimension_meters(dist_m)
+    stripped = (raw_text or "").strip()
+    if not stripped:
+        return formatted
+    if "<>" in raw_text:
+        return raw_text.replace("<>", formatted).strip()
+    return stripped
+
+
+def _get_or_build_annotations_collection(
+    layer_name, layer_collection_cache, annotations_collection_cache, root_collection
+):
+    key = layer_name or "Layer0"
+    if key in annotations_collection_cache:
+        return annotations_collection_cache[key]
+    layer_coll = _get_or_build_layer_collection(key, layer_collection_cache, root_collection)
+    annot_coll = bpy.data.collections.new("Annotations")
+    layer_coll.children.link(annot_coll)
+    annotations_collection_cache[key] = annot_coll
+    return annot_coll
+
+
+def _place_annotation_object(obj, world_matrix_bl, annot_coll, keep_hierarchy, parent_rep):
+    annot_coll.objects.link(obj)
+    if keep_hierarchy and parent_rep is not None:
+        local = parent_rep[1].inverted_safe() @ world_matrix_bl
+        obj.parent = parent_rep[0]
+        obj.matrix_basis = local
+        obj.matrix_parent_inverse = local @ obj.matrix_basis.inverted_safe()
+    else:
+        obj.matrix_world = world_matrix_bl
+
+
+def _record_annotation_failure(stats, exc):
+    stats["annotation_failures"] = stats.get("annotation_failures", 0) + 1
+    if not stats.get("_first_annotation_error"):
+        stats["_first_annotation_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _create_blender_text_annotation(
+    txt, world_m13, get_annot_coll, keep_hierarchy, parent_rep, stats, force_hidden=False
+):
+    if _is_unpositioned_text(txt):
+        stats["texts_skipped_no_position"] = stats.get("texts_skipped_no_position", 0) + 1
+        return None
+    font_data = None
+    text_obj = None
+    try:
+        pos_in = txt.label_point if txt.label_point is not None else txt.point
+        anchor_in = txt.point if txt.point is not None else pos_in
+        pos_m = mathutils.Vector(tuple(c * _INCH_TO_M for c in _transform_inch_point(pos_in, world_m13)))
+        anchor_m = tuple(c * _INCH_TO_M for c in _transform_inch_point(anchor_in, world_m13))
+        kind = "leader_text" if (txt.point is not None and txt.label_point is not None) else "point_text"
+
+        first_line = ((txt.text or "").splitlines() or [txt.text or ""])[0].strip()[:60] or "Text"
+        font_data = bpy.data.curves.new(first_line, type="FONT")
+        font_data.body = txt.text
+        font_data.size = 0.08
+        text_obj = bpy.data.objects.new(first_line, font_data)
+        text_obj["sketchup_annotation"] = kind
+        text_obj["sketchup_anchor_m"] = anchor_m
+        _place_annotation_object(
+            text_obj, mathutils.Matrix.Translation(pos_m), get_annot_coll(), keep_hierarchy, parent_rep
+        )
+        if txt.hidden or force_hidden:
+            text_obj.hide_viewport = True
+            text_obj.hide_render = True
+        stats["texts_imported"] += 1
+        return text_obj
+    except Exception as exc:
+        if text_obj is not None:
+            try:
+                bpy.data.objects.remove(text_obj, do_unlink=True)
+            except Exception:
+                pass
+        if font_data is not None:
+            try:
+                bpy.data.curves.remove(font_data, do_unlink=True)
+            except Exception:
+                pass
+        _record_annotation_failure(stats, exc)
+        return None
+
+
+def _create_blender_dimension_annotation(
+    dim, world_m13, get_annot_coll, keep_hierarchy, parent_rep, stats, force_hidden=False
+):
+    if dim.a is None or dim.b is None:
+        return None
+    curve_data = None
+    font_data = None
+    line_obj = None
+    val_obj = None
+    try:
+        p1_m = mathutils.Vector(tuple(c * _INCH_TO_M for c in _transform_inch_point(dim.a, world_m13)))
+        p2_m = mathutils.Vector(tuple(c * _INCH_TO_M for c in _transform_inch_point(dim.b, world_m13)))
+        seg = p2_m - p1_m
+        if seg.length <= 1e-9:
+            return None
+        dist_m = seg.length
+        dist_in = dist_m / _INCH_TO_M
+        offset_m = _dimension_offset_vec_m(dim, p1_m, p2_m, world_m13)
+        d1_m = p1_m + offset_m
+        d2_m = p2_m + offset_m
+        mid_m = (d1_m + d2_m) * 0.5
+
+        display_value = _format_dimension_label(dim.text, dist_m)
+        base_name = f"Dimension ({display_value})"
+
+        curve_data = bpy.data.curves.new(f"{base_name} (line)", type="CURVE")
+        curve_data.dimensions = "3D"
+        main_sp = curve_data.splines.new("POLY")
+        main_sp.points.add(1)
+        r1 = d1_m - mid_m
+        r2 = d2_m - mid_m
+        main_sp.points[0].co = (r1.x, r1.y, r1.z, 1.0)
+        main_sp.points[1].co = (r2.x, r2.y, r2.z, 1.0)
+        if offset_m.length > 1e-6:
+            for pa, da in ((p1_m, d1_m), (p2_m, d2_m)):
+                ext_sp = curve_data.splines.new("POLY")
+                ext_sp.points.add(1)
+                ra = pa - mid_m
+                rd = da - mid_m
+                ext_sp.points[0].co = (ra.x, ra.y, ra.z, 1.0)
+                ext_sp.points[1].co = (rd.x, rd.y, rd.z, 1.0)
+
+        annot_coll = get_annot_coll()
+        line_obj = bpy.data.objects.new(f"{base_name} (line)", curve_data)
+        line_obj["sketchup_annotation"] = "dimension_line"
+        line_obj["sketchup_distance_m"] = dist_m
+        line_obj["sketchup_distance_inches"] = dist_in
+        line_obj["sketchup_start_m"] = (p1_m.x, p1_m.y, p1_m.z)
+        line_obj["sketchup_end_m"] = (p2_m.x, p2_m.y, p2_m.z)
+        _place_annotation_object(line_obj, mathutils.Matrix.Translation(mid_m), annot_coll, keep_hierarchy, parent_rep)
+
+        font_data = bpy.data.curves.new(base_name, type="FONT")
+        font_data.body = display_value
+        font_data.align_x = "CENTER"
+        font_data.size = 0.08
+        val_obj = bpy.data.objects.new(base_name, font_data)
+        val_obj["sketchup_annotation"] = "dimension_text"
+        val_obj["sketchup_distance_m"] = dist_m
+        val_obj["sketchup_distance_inches"] = dist_in
+        val_obj["sketchup_start_m"] = (p1_m.x, p1_m.y, p1_m.z)
+        val_obj["sketchup_end_m"] = (p2_m.x, p2_m.y, p2_m.z)
+        val_obj["sketchup_text_override"] = dim.text or ""
+        annot_coll.objects.link(val_obj)
+        val_obj.parent = line_obj
+        val_obj.matrix_basis = mathutils.Matrix.Identity(4)
+
+        if dim.hidden or force_hidden:
+            line_obj.hide_viewport = True
+            line_obj.hide_render = True
+            val_obj.hide_viewport = True
+            val_obj.hide_render = True
+
+        stats["dimensions_imported"] += 1
+        return line_obj, val_obj
+    except Exception as exc:
+        for o in (val_obj, line_obj):
+            if o is not None:
+                try:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                except Exception:
+                    pass
+        for c in (font_data, curve_data):
+            if c is not None:
+                try:
+                    bpy.data.curves.remove(c, do_unlink=True)
+                except Exception:
+                    pass
+        _record_annotation_failure(stats, exc)
+        return None
+
+
+def _skp_m13_to_blender(m13):
+    s = m13[12] if len(m13) > 12 else 1.0
+    return mathutils.Matrix((
+        (m13[0] * s, m13[1] * s, m13[2] * s, m13[9] * s * _INCH_TO_M),
+        (m13[3] * s, m13[4] * s, m13[5] * s, m13[10] * s * _INCH_TO_M),
+        (m13[6] * s, m13[7] * s, m13[8] * s, m13[11] * s * _INCH_TO_M),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+
+
+def _import_model_annotations(
+    model,
+    skp_parsed,
+    scene_root_node,
+    node_parents,
+    layer_collection_cache,
+    root_collection,
+    keep_hierarchy,
+    stats,
+    filepath=None,
+):
+    """Walks the placed SketchUp hierarchy, creating Blender text objects and
+    thin-line + measured-value dimension pairs in an 'Annotations' collection
+    per tag, placed in world space and parented to component Empties when
+    ``keep_hierarchy`` is enabled (#27)."""
+    from openskp._core import multiply_matrices
+
+    annots_by_def, vff_world_dims = _extract_model_annotations(
+        model, skp_parsed, filepath=filepath, stats=stats
+    )
+    annotations_collection_cache = {}
+    subtree_has_annots_cache = {}
+
+    def subtree_has_annots(defn, visiting_check=frozenset()):
+        did = id(defn)
+        if did in subtree_has_annots_cache:
+            return subtree_has_annots_cache[did]
+        if did in visiting_check:
+            return False
+        texts, dims = annots_by_def.get(did, ((), ()))
+        if texts or dims:
+            subtree_has_annots_cache[did] = True
+            return True
+        nxt = visiting_check | {did}
+        for inst in defn.instances:
+            child_d = model.definitions.get(inst.ref_idx)
+            if child_d is not None and subtree_has_annots(child_d, nxt):
+                subtree_has_annots_cache[did] = True
+                return True
+        subtree_has_annots_cache[did] = False
+        return False
+
+    def coll_getter(tag_name):
+        return lambda: _get_or_build_annotations_collection(
+            tag_name, layer_collection_cache, annotations_collection_cache, root_collection
+        )
+
+    def built_total():
+        return stats.get("texts_imported", 0) + stats.get("dimensions_imported", 0)
+
+    def emit_for_def(defn, world_m13, layer_name, parent_rep, force_hidden):
+        texts, dims = annots_by_def.get(id(defn), ((), ()))
+        for txt in texts:
+            if built_total() >= _MAX_IMPORTED_ANNOTATIONS:
+                stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+                continue
+            t_layer = getattr(txt, "layer", "") or layer_name or "Layer0"
+            _create_blender_text_annotation(
+                txt, world_m13, coll_getter(t_layer), keep_hierarchy, parent_rep, stats, force_hidden=force_hidden
+            )
+        for dim in dims:
+            if built_total() >= _MAX_IMPORTED_ANNOTATIONS:
+                stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+                continue
+            d_layer = getattr(dim, "layer", "") or layer_name or "Layer0"
+            _create_blender_dimension_annotation(
+                dim, world_m13, coll_getter(d_layer), keep_hierarchy, parent_rep, stats, force_hidden=force_hidden
+            )
+
+    def walk_defs(defn, inst_node, world_m13, layer_name, parent_rep, force_hidden, visiting):
+        if id(defn) in visiting or not subtree_has_annots(defn):
+            return
+        emit_for_def(defn, world_m13, layer_name, parent_rep, force_hidden)
+        next_visiting = visiting | {id(defn)}
+        inst_children = list(inst_node.children) if inst_node is not None else []
+        for idx, skp_inst in enumerate(defn.instances):
+            child_defn = model.definitions.get(skp_inst.ref_idx)
+            if child_defn is None or not subtree_has_annots(child_defn):
+                continue
+            child_node = inst_children[idx] if idx < len(inst_children) else None
+            child_m13 = multiply_matrices(world_m13, skp_inst.matrix) if world_m13 is not None else list(skp_inst.matrix)
+            inst_tag = skp_inst.layer or ""
+            if not inst_tag or inst_tag == "Layer0":
+                inst_tag = (child_node.layer if child_node is not None else "") or ""
+            child_layer = inst_tag if (inst_tag and inst_tag != "Layer0") else (layer_name or "Layer0")
+            child_hidden = force_hidden or bool(skp_inst.hidden)
+            child_rep = node_parents.get(id(child_node)) if child_node is not None else None
+            if keep_hierarchy and child_rep is None and built_total() < _MAX_IMPORTED_ANNOTATIONS:
+                world_bl = _skp_m13_to_blender(child_m13)
+                grp_name = skp_inst.name or child_defn.name or "Group"
+                grp = bpy.data.objects.new(grp_name, None)
+                grp.empty_display_type = "PLAIN_AXES"
+                grp.empty_display_size = 0.1
+                layer_coll = _get_or_build_layer_collection(child_layer, layer_collection_cache, root_collection)
+                _place_annotation_object(grp, world_bl, layer_coll, True, parent_rep)
+                if child_defn.name:
+                    grp["sketchup_definition"] = child_defn.name
+                if skp_inst.guid:
+                    grp["sketchup_guid"] = skp_inst.guid
+                child_rep = (grp, world_bl)
+                if child_node is not None:
+                    node_parents[id(child_node)] = child_rep
+                stats["groups"] += 1
+            walk_defs(child_defn, child_node, child_m13, child_layer, child_rep, child_hidden, next_visiting)
+
+    walk_defs(model.root, scene_root_node, None, "Layer0", None, False, set())
+
+    for vff_dim in vff_world_dims:
+        if built_total() >= _MAX_IMPORTED_ANNOTATIONS:
+            stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+            continue
+        d_layer = getattr(vff_dim, "layer", "") or "Layer0"
+        _create_blender_dimension_annotation(
+            vff_dim, None, coll_getter(d_layer), False, None, stats, force_hidden=bool(vff_dim.hidden)
+        )
+
+
 # Libraries openskp needs that ship as wheels inside this extension. Blender 4.2.0 to
 # 4.2.3 can install the wrong build of them (see blender_manifest.toml), and openskp
 # only prints a warning and falls back to fan triangulation without mapbox_earcut,
@@ -1158,10 +1889,12 @@ def check_bundled_libraries():
         )
 
 
-def import_skp(filepath, context=None, keep_hierarchy=False):
+def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=False):
     """Imports a .skp file into the current (or given) Blender context's
     scene, returning a stats dict. ``keep_hierarchy`` keeps SketchUp's
-    group/component nesting as parented Empties (see _place_node)."""
+    group/component nesting as parented Empties (see _place_node).
+    ``import_annotations`` imports SketchUp texts and linear dimensions into
+    per-tag 'Annotations' collections (#27)."""
     check_bundled_libraries()
     import openskp
 
@@ -1169,6 +1902,9 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
 
     print(f"openskp: parsing {os.path.basename(filepath)}...")
     t0 = time.time()
+    annot_model = None
+    annot_parsed = None
+    early_annot_exc = None
     with _capture_library_warnings() as library_warnings:
         skp = openskp.SkpFile.open(filepath)
         # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp 1.6.0 and newer
@@ -1181,6 +1917,12 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         # Saved scenes come from InstancedScene.pages (openskp#593) so the file is
         # never parsed twice; older wheels without the attribute leave it off.
         pages = getattr(scene, "pages", None) or []
+        if import_annotations:
+            try:
+                annot_model = skp.parse()
+                annot_parsed = getattr(skp, "_parsed", None)
+            except Exception as exc:
+                early_annot_exc = exc
     for index, texture in enumerate(getattr(scene, "textures", None) or []):
         if texture.mime_type in _UNLOADABLE_TEXTURES:
             name = os.path.basename(texture.filename) if texture.filename else f"number {index}"
@@ -1198,7 +1940,14 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
     curve_resources_by_id = {r.id: r for r in getattr(scene, "curve_resources", None) or []}
     curve_collection_cache = {}
     layer_collection_cache = {}
-    layer_hidden = getattr(scene, "layer_hidden", None) or {}
+    layer_hidden = dict(getattr(scene, "layer_hidden", None) or {})
+    if annot_model is not None:
+        try:
+            for lyr in getattr(annot_model, "layers", None) or ():
+                layer_hidden.setdefault(lyr.name, bool(lyr.hidden))
+        except Exception as exc:
+            if early_annot_exc is None:
+                early_annot_exc = exc
     gltf_materials = getattr(scene, "gltf_materials", None) or []
     material_cache = {}
     textures = getattr(scene, "textures", None) or []
@@ -1211,6 +1960,15 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         "curve_placements": 0,
         "curve_runs": 0,
         "groups": 0,
+        "texts_imported": 0,
+        "dimensions_imported": 0,
+        "texts_skipped_no_position": 0,
+        "vff_component_dimensions_skipped": 0,
+        "vff_texts_skipped": 0,
+        "constrained_dimensions_skipped": 0,
+        "dimensions_skipped_unresolved": 0,
+        "annotations_capped": 0,
+        "annotation_failures": 0,
         "unread_root_entities": unread_root_entities,
         # what the library warned about while building the scene (a partial
         # classic read, a texture it could not carry, ...); the operator shows
@@ -1234,6 +1992,7 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
     root_collection.children.link(sources_collection)
 
     t0 = time.time()
+    node_parents = {}
     _place_node(
         scene.scene_hierarchy,
         mathutils.Matrix.Identity(4),
@@ -1251,7 +2010,71 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         stats,
         keep_hierarchy,
         is_root=True,
+        node_parents=node_parents,
     )
+    if import_annotations:
+        if early_annot_exc is not None:
+            _record_annotation_failure(stats, early_annot_exc)
+        elif annot_model is not None:
+            try:
+                _import_model_annotations(
+                    annot_model,
+                    annot_parsed,
+                    scene.scene_hierarchy,
+                    node_parents,
+                    layer_collection_cache,
+                    root_collection,
+                    keep_hierarchy,
+                    stats,
+                    filepath=filepath,
+                )
+            except Exception as exc:
+                _record_annotation_failure(stats, exc)
+        base_file = os.path.basename(filepath)
+        vff_parts = []
+        if stats["vff_texts_skipped"]:
+            vff_parts.append(f"{stats['vff_texts_skipped']} 2021+ text(s)")
+        if stats["vff_component_dimensions_skipped"]:
+            vff_parts.append(f"{stats['vff_component_dimensions_skipped']} 2021+ component dimension(s)")
+        if vff_parts:
+            msg = (
+                f"{base_file}: skipped {', '.join(vff_parts)} "
+                "(requires a newer openskp release with 2021+ owner-local annotations)"
+            )
+            library_warnings.append(msg)
+            print(f"openskp: warning: {msg}")
+        if stats["constrained_dimensions_skipped"]:
+            msg = (
+                f"{base_file}: skipped {stats['constrained_dimensions_skipped']} "
+                "axis-constrained dimension(s)"
+            )
+            library_warnings.append(msg)
+            print(f"openskp: warning: {msg}")
+        if stats["dimensions_skipped_unresolved"]:
+            msg = (
+                f"{base_file}: skipped {stats['dimensions_skipped_unresolved']} "
+                "dimension(s) with unresolved endpoints"
+            )
+            library_warnings.append(msg)
+            print(f"openskp: warning: {msg}")
+        if stats["texts_skipped_no_position"]:
+            msg = f"{base_file}: skipped {stats['texts_skipped_no_position']} text(s) without a 3D position"
+            library_warnings.append(msg)
+            print(f"openskp: warning: {msg}")
+        if stats["annotations_capped"]:
+            msg = (
+                f"{base_file}: capped imported annotations at {_MAX_IMPORTED_ANNOTATIONS} "
+                f"(skipped {stats['annotations_capped']} additional placement(s))"
+            )
+            library_warnings.append(msg)
+            print(f"openskp: warning: {msg}")
+        if stats["annotation_failures"]:
+            err_detail = stats.pop("_first_annotation_error", "error")
+            msg = f"{base_file}: failed to create {stats['annotation_failures']} annotation(s) ({err_detail})"
+            library_warnings.append(msg)
+            print(f"openskp: warning: {msg}")
+        else:
+            stats.pop("_first_annotation_error", None)
     stats["textures_loaded"] = len(image_cache)
     stats["scenes_imported"] = _import_scene_cameras(pages, root_collection, context)
     print(
@@ -1260,7 +2083,8 @@ def import_skp(filepath, context=None, keep_hierarchy=False):
         f"{stats['unique_curve_meshes']} unique loose-edge groups "
         f"({stats['curve_runs']} runs), {stats['curve_placements']} placed; "
         f"{len(layer_collection_cache)} layers, {stats['textures_loaded']} textures, "
-        f"{stats['scenes_imported']} scene cameras "
+        f"{stats['scenes_imported']} scene cameras, "
+        f"{stats['texts_imported']} texts, {stats['dimensions_imported']} dimensions "
         f"in {time.time() - t0:.1f}s"
     )
 
