@@ -25,23 +25,38 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
         ),
         default=True,
     )
+    import_annotations: BoolProperty(
+        name="Import Annotations",
+        description=(
+            "Import SketchUp texts and linear dimensions as Blender text and line "
+            "objects in an Annotations collection per tag"
+        ),
+        default=False,
+    )
 
     def execute(self, context):
         from . import import_skp
 
         try:
-            stats = import_skp.import_skp(self.filepath, context, keep_hierarchy=self.keep_hierarchy)
+            stats = import_skp.import_skp(
+                self.filepath,
+                context,
+                keep_hierarchy=self.keep_hierarchy,
+                import_annotations=self.import_annotations,
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             self.report({"ERROR"}, f"OpenSKP import failed: {exc}")
             return {"CANCELLED"}
 
         scenes_note = f", {stats['scenes_imported']} scene cameras" if stats.get("scenes_imported") else ""
+        annot_total = stats.get("texts_imported", 0) + stats.get("dimensions_imported", 0)
+        annot_note = f", {annot_total} annotations" if annot_total else ""
         self.report(
             {"INFO"},
             f"Imported {stats['unique_meshes']} unique meshes "
             f"({stats['placements']} placed), "
             f"{stats['unique_curve_meshes']} loose-edge groups "
-            f"({stats['curve_placements']} placed){scenes_note}",
+            f"({stats['curve_placements']} placed){scenes_note}{annot_note}",
         )
         warnings = stats.get("warnings") or []
         if warnings:

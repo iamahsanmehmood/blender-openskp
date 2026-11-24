@@ -58,6 +58,10 @@ EXPECTED = {
     "two_scenes_2021.skp": (1, 1, 12, 0, 0, 0, 1, 0, 0),
     # 3-level nested components (Bolt -> Bracket -> Frame) across 4 tags (#28).
     "nested_components_2021.skp": (4, 15, 8, 0, 0, 0, 4, 0, 0),
+    # Annotations fixtures (#27): 36x12" root slab + 24x6" Beam component on
+    # Framing, 1 leader text, 1 screen text, and 2 linear dimensions (2017 & 2021).
+    "annotations_2017.skp": (2, 2, 4, 0, 0, 0, 1, 0, 0),
+    "annotations_2021.skp": (2, 2, 4, 0, 0, 0, 2, 0, 0),
 }
 TEXTURE_FIXTURES = ("texture_tiff_2021.skp", "texture_tga_2021.skp", "texture_gif_2021.skp")
 
@@ -92,6 +96,12 @@ def check(fixture_name):
     assert parse_calls == 0, (
         f"{fixture_name}: import_skp() called SkpFile.parse() {parse_calls} times (must not parse twice)"
     )
+    assert stats["texts_imported"] == 0 and stats["dimensions_imported"] == 0, (
+        f"{fixture_name}: annotations must stay off by default, got {stats}"
+    )
+    assert not [o for o in new_objects if o.type == "FONT"], (
+        f"{fixture_name}: unexpected FONT objects when import_annotations=False"
+    )
 
     got = (
         stats["unique_meshes"], stats["placements"], stats["triangles"],
@@ -103,6 +113,10 @@ def check(fixture_name):
     if fixture_name in TEXTURE_FIXTURES:
         loaded = 1 if _library_keeps_original_textures() and fixture_name != "texture_gif_2021.skp" else 0
         expected = expected[:8] + (loaded,)
+    elif fixture_name == "annotations_2017.skp":
+        sh = openskp.SkpFile.open(path).build_instanced_scene().scene_hierarchy
+        expected_layers = len({n.layer or "Layer0" for n in [sh, *sh.children]})
+        expected = expected[:6] + (expected_layers,) + expected[7:]
     if expected is not None:
         assert got == expected, f"{fixture_name}: expected {expected}, got {got}"
     if stats["unique_meshes"]:
@@ -1296,6 +1310,353 @@ def check_cameraless_page_is_skipped():
     print("cameraless/coincident Page skipped and InstancedScene.pages wired with 0 parse() calls - OK")
 
 
+def _base_name(name):
+    return re.sub(r"\.\d{3}$", "", name)
+
+
+def _spline_world_endpoints(curve_obj, spline_idx=0):
+    import mathutils
+
+    sp = curve_obj.data.splines[spline_idx]
+    mw = curve_obj.matrix_world
+    p0 = mw @ mathutils.Vector(sp.points[0].co[:3])
+    p1 = mw @ mathutils.Vector(sp.points[1].co[:3])
+    return p0, p1
+
+
+def _scan_fixture_no_private_paths(path):
+    """Scans raw bytes (ASCII + UTF-16) and every ZIP entry (including
+    meta/meta.dat) for host paths, usernames, temp dirs, and email addresses."""
+    import zipfile
+
+    blobs = [("RAW", open(path, "rb").read())]
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path, "r") as zf:
+            for name in zf.namelist():
+                blobs.append((name, zf.read(name)))
+    email_re = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    bad_tokens = (
+        "Users", "Admin", "Devs", "lanes", ".gemini",
+        "Temp\\", "Temp/", "scratch", "AppData", "C:\\", "G:\\",
+    )
+    for entry_name, data in blobs:
+        for tok in bad_tokens:
+            for enc in ("ascii", "utf-16-le", "utf-16-be"):
+                needle = tok.encode(enc)
+                assert needle.lower() not in data.lower(), (path, entry_name, tok, enc)
+        assert not email_re.search(data), (path, entry_name, email_re.search(data).group(0))
+
+
+def check_annotations_import():
+    """Verifies SDK-written annotations_2017.skp and annotations_2021.skp (#27):
+    - Raw + ZIP-entry path/email scan on annotations_2017.skp & annotations_2021.skp,
+    - Positioned leader text ('Apex label' at (24, 14, 10)" anchored to (18, 6, 0)"),
+    - Positionless screen text ('Title block note', including openskp#623
+      leader_type == 0 / screen_position with (0,0,0) points) skipped & counted,
+    - Offset rule: zero offset with openskp 1.6.0 (drawn along a-b), explicit
+      offset_vector used when the library provides it,
+    - Axis-constrained 5BD1 VFF dimensions and unresolved endpoints skipped & counted,
+    - '<>' placeholder replacement in custom dimension text,
+    - Error isolation across skp.parse(), _extract_model_annotations, and per-item
+      creation without cancelling the geometry import."""
+    import struct
+    import tempfile
+    import zipfile
+    import mathutils
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, "annotations_2017.skp")
+    path_2021 = os.path.join(FIXTURES_DIR, "annotations_2021.skp")
+    _scan_fixture_no_private_paths(path)
+    _scan_fixture_no_private_paths(path_2021)
+
+    has_offset_vec = "offset_vector" in getattr(openskp.model.Dimension, "__dataclass_fields__", {})
+
+    # 1. Hierarchy mode (keep_hierarchy=True, import_annotations=True)
+    colls_before = set(bpy.data.collections)
+    objs_before = set(bpy.data.objects)
+    stats = import_skp.import_skp(path, keep_hierarchy=True, import_annotations=True)
+    new_colls = set(bpy.data.collections) - colls_before
+    new_objs = set(bpy.data.objects) - objs_before
+    bpy.context.view_layer.update()
+
+    assert stats["texts_imported"] == 1, stats
+    assert stats["texts_skipped_no_position"] == 1, stats
+    assert stats["dimensions_imported"] == 2, stats
+    assert any("without a 3D position" in w for w in stats["warnings"]), stats["warnings"]
+
+    root_coll = next(
+        c for c in new_colls
+        if _base_name(c.name) == "annotations_2017" and c in set(bpy.context.scene.collection.children)
+    )
+    tag_colls = {_base_name(c.name): c for c in root_coll.children}
+    assert "Layer0" in tag_colls and "Framing" in tag_colls, list(tag_colls)
+
+    layer0_annots = [c for c in tag_colls["Layer0"].children if _base_name(c.name) == "Annotations"]
+    framing_annots = [c for c in tag_colls["Framing"].children if _base_name(c.name) == "Annotations"]
+    assert len(layer0_annots) == 1 and len(framing_annots) == 1, (layer0_annots, framing_annots)
+
+    l0_objs = list(layer0_annots[0].objects)
+    fr_objs = list(framing_annots[0].objects)
+
+    # Positioned leader text ("Apex label") on Layer0; screen text skipped
+    l0_texts = {o.data.body: o for o in l0_objs if o.type == "FONT" and o.get("sketchup_annotation") != "dimension_text"}
+    assert set(l0_texts) == {"Apex label"}, set(l0_texts)
+
+    apex = l0_texts["Apex label"]
+    assert apex["sketchup_annotation"] == "leader_text"
+    assert apex.parent is None
+    want_apex_pos = mathutils.Vector((24.0 * 0.0254, 14.0 * 0.0254, 10.0 * 0.0254))
+    assert (apex.matrix_world.translation - want_apex_pos).length < 1e-5, (
+        tuple(apex.matrix_world.translation), tuple(want_apex_pos)
+    )
+    want_anchor = mathutils.Vector((18.0 * 0.0254, 6.0 * 0.0254, 0.0))
+    got_anchor = mathutils.Vector(tuple(apex["sketchup_anchor_m"]))
+    assert (got_anchor - want_anchor).length < 1e-5, (tuple(got_anchor), tuple(want_anchor))
+
+    # Root 36" (0.9144 m) linear dimension on Layer0: on segment with openskp 1.6.0
+    l0_dim_lines = [o for o in l0_objs if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"]
+    l0_dim_texts = [o for o in l0_objs if o.type == "FONT" and o.get("sketchup_annotation") == "dimension_text"]
+    assert len(l0_dim_lines) == 1 and len(l0_dim_texts) == 1, (l0_dim_lines, l0_dim_texts)
+    root_line, root_val = l0_dim_lines[0], l0_dim_texts[0]
+    assert root_line.parent is None
+    assert root_val.parent == root_line
+    assert root_val.data.body == "0.9144 m", root_val.data.body
+    assert abs(root_line["sketchup_distance_m"] - 0.9144) < 1e-5
+    assert abs(root_line["sketchup_distance_inches"] - 36.0) < 1e-4
+    d1, d2 = _spline_world_endpoints(root_line, 0)
+    assert abs((d2 - d1).length - 0.9144) < 1e-5, ((d2 - d1).length,)
+    want_root_mid = mathutils.Vector((18.0 * 0.0254, 0.0, 0.0))
+    if not has_offset_vec:
+        assert len(root_line.data.splines) == 1
+        assert (root_line.matrix_world.translation - want_root_mid).length < 1e-5, tuple(root_line.matrix_world.translation)
+        assert (root_val.matrix_world.translation - want_root_mid).length < 1e-5, tuple(root_val.matrix_world.translation)
+
+    # Component 24" (0.6096 m) linear dimension inside "Beam" placed at (40, 10, 0)" on Framing
+    fr_dim_lines = [o for o in fr_objs if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"]
+    fr_dim_texts = [o for o in fr_objs if o.type == "FONT" and o.get("sketchup_annotation") == "dimension_text"]
+    assert len(fr_dim_lines) == 1 and len(fr_dim_texts) == 1, (fr_dim_lines, fr_dim_texts)
+    beam_line, beam_val = fr_dim_lines[0], fr_dim_texts[0]
+    assert beam_val.parent == beam_line
+    assert beam_val.data.body == "0.6096 m", beam_val.data.body
+    assert abs(beam_line["sketchup_distance_m"] - 0.6096) < 1e-5
+    assert abs(beam_line["sketchup_distance_inches"] - 24.0) < 1e-4
+    bd1, bd2 = _spline_world_endpoints(beam_line, 0)
+    assert abs((bd2 - bd1).length - 0.6096) < 1e-5, ((bd2 - bd1).length,)
+    want_beam_mid = mathutils.Vector((52.0 * 0.0254, 10.0 * 0.0254, 0.0))
+    if not has_offset_vec:
+        assert (beam_line.matrix_world.translation - want_beam_mid).length < 1e-5, (
+            tuple(beam_line.matrix_world.translation), tuple(want_beam_mid)
+        )
+        assert (beam_val.matrix_world.translation - want_beam_mid).length < 1e-5
+
+    # Follows component hierarchy: parented to the "Beam 1" placement Empty and moves with it
+    beam_empty = next(o for o in new_objs if o.type == "EMPTY" and _base_name(o.name) == "Beam 1")
+    assert beam_line.parent == beam_empty, (beam_line.parent, beam_empty)
+    orig_beam_mid = beam_line.matrix_world.translation.copy()
+    delta = mathutils.Vector((1.25, -0.5, 0.75))
+    beam_empty.location = beam_empty.location + delta
+    bpy.context.view_layer.update()
+    assert (beam_line.matrix_world.translation - (orig_beam_mid + delta)).length < 1e-5
+    assert (beam_val.matrix_world.translation - (orig_beam_mid + delta)).length < 1e-5
+
+    # 2. Flat mode (keep_hierarchy=False, import_annotations=True)
+    objs_before = set(bpy.data.objects)
+    stats_flat = import_skp.import_skp(path, keep_hierarchy=False, import_annotations=True)
+    flat_objs = set(bpy.data.objects) - objs_before
+    bpy.context.view_layer.update()
+    assert stats_flat["texts_imported"] == 1 and stats_flat["dimensions_imported"] == 2
+    assert stats_flat["texts_skipped_no_position"] == 1
+    flat_beam_line = next(
+        o for o in flat_objs
+        if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"
+        and abs(o["sketchup_distance_inches"] - 24.0) < 1e-4
+    )
+    assert flat_beam_line.parent is None
+    if not has_offset_vec:
+        assert (flat_beam_line.matrix_world.translation - want_beam_mid).length < 1e-5
+
+    # 3. Real SDK-saved SketchUp 2021 fixture (annotations_2021.skp, zero parse() monkeypatching)
+    has_623 = "layer" in getattr(openskp.model.Dimension, "__dataclass_fields__", {})
+    objs_before = set(bpy.data.objects)
+    stats_2021 = import_skp.import_skp(path_2021, keep_hierarchy=True, import_annotations=True)
+    objs_2021 = set(bpy.data.objects) - objs_before
+    bpy.context.view_layer.update()
+    lines_2021 = [o for o in objs_2021 if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"]
+    if has_623:
+        assert stats_2021["dimensions_imported"] == 2 and stats_2021["texts_imported"] == 1, stats_2021
+        assert stats_2021["texts_skipped_no_position"] == 1, stats_2021
+        assert len(lines_2021) == 2
+    else:
+        assert stats_2021["dimensions_imported"] == 1, stats_2021
+        assert stats_2021["vff_component_dimensions_skipped"] == 1, stats_2021
+        assert stats_2021["vff_texts_skipped"] == 2, stats_2021
+        assert any("2021+ component dimension" in w for w in stats_2021["warnings"]), stats_2021["warnings"]
+        assert len(lines_2021) == 1
+        assert abs(lines_2021[0]["sketchup_distance_inches"] - 36.0) < 1e-4
+        assert (lines_2021[0].matrix_world.translation - want_root_mid).length < 1e-5
+
+    # 3b. Axis-constrained 5BD1 VFF dimensions:
+    # - axis=1 (plane X = (1,0,0), parallel to a=(0,0,0)..b=(36,0,0)): kept & imported!
+    # - axis=2 (plane Y = (0,1,0), perpendicular to a-b): skipped & counted!
+    with tempfile.TemporaryDirectory() as tmp:
+        import io
+
+        raw_2021 = open(path_2021, "rb").read()
+        pk_off = raw_2021.index(b"PK\x03\x04")
+        for axis_code, want_imp, want_skip in ((1, 1, 0), (2, 0, 1)):
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(path_2021, "r") as zin, zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    if item.filename == "model.dat":
+                        needle = b"\xd1\x5b\x04\x00\x00\x00\x00\x00\x00\x00"
+                        rpos = data.rfind(needle)
+                        assert rpos > 0
+                        data = data[:rpos + 6] + struct.pack("<I", axis_code) + data[rpos + 10:]
+                    zout.writestr(item.filename, data)
+            constrained_vff = os.path.join(tmp, f"constrained_axis{axis_code}_2021.skp")
+            with open(constrained_vff, "wb") as f:
+                f.write(raw_2021[:pk_off] + zbuf.getvalue())
+            if not has_623:
+                st_con = import_skp.import_skp(constrained_vff, keep_hierarchy=True, import_annotations=True)
+                assert st_con["dimensions_imported"] == want_imp, (axis_code, st_con)
+                assert st_con["constrained_dimensions_skipped"] == want_skip, (axis_code, st_con)
+                if want_skip:
+                    assert any("axis-constrained" in w for w in st_con["warnings"]), st_con["warnings"]
+
+    # 4. capilla_quiroz_v17.skp: with openskp 1.6.0, all 26 dimensions sit directly on a-b (zero offset)
+    cap_path = os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp")
+    objs_before = set(bpy.data.objects)
+    stats_cap = import_skp.import_skp(cap_path, keep_hierarchy=True, import_annotations=True)
+    cap_objs = set(bpy.data.objects) - objs_before
+    bpy.context.view_layer.update()
+    if stats_cap["texts_skipped_no_position"]:
+        cap_leader_txts = [
+            o for o in cap_objs if o.type == "FONT" and o.get("sketchup_annotation") != "dimension_text"
+        ]
+        assert not cap_leader_txts, cap_leader_txts
+    assert stats_cap["dimensions_imported"] == 26, stats_cap
+    if not has_offset_vec:
+        for dline in (o for o in cap_objs if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"):
+            s_m = mathutils.Vector(tuple(dline["sketchup_start_m"]))
+            e_m = mathutils.Vector(tuple(dline["sketchup_end_m"]))
+            assert len(dline.data.splines) == 1
+            assert (dline.matrix_world.translation - (s_m + e_m) * 0.5).length < 1e-5
+
+    # Explicit offset_vector (openskp #621/#623) is applied when present; scalar offset alone gives 0
+    dim_scalar_only = import_skp._tag_dimension(
+        openskp.model.Dimension(text="", hidden=False, a=(0.0, 20.0, 10.0), b=(-12.0, 20.0, 10.0), offset=-5.0),
+        is_vff=False,
+    )
+    p1_e = mathutils.Vector((0.0, 20.0 * 0.0254, 10.0 * 0.0254))
+    p2_e = mathutils.Vector((-12.0 * 0.0254, 20.0 * 0.0254, 10.0 * 0.0254))
+    assert import_skp._dimension_offset_vec_m(dim_scalar_only, p1_e, p2_e, None).length == 0.0
+
+    dim_with_ov = import_skp._tag_dimension(
+        openskp.model.Dimension(text="Span <> TYP", hidden=False, a=(0.0, 20.0, 10.0), b=(-12.0, 20.0, 10.0), offset=5.0),
+        is_vff=False,
+        extra={"offset_vector": (0.0, 0.0, -5.0)},
+    )
+    off_ov = import_skp._dimension_offset_vec_m(dim_with_ov, p1_e, p2_e, None)
+    assert abs(off_ov.x) < 1e-6 and abs(off_ov.y) < 1e-6 and abs(off_ov.z - (-5.0 * 0.0254)) < 1e-6, tuple(off_ov)
+
+    # '<>' replacement in dimension text
+    assert import_skp._format_dimension_label("<>", 0.9144) == "0.9144 m"
+    assert import_skp._format_dimension_label("Span <> TYP", 0.9144) == "Span 0.9144 m TYP"
+    assert import_skp._format_dimension_label("Custom", 0.9144) == "Custom"
+
+    # openskp#623 TextEntity contract: placed texts from real files carry
+    # screen_position=(0.0, 0.0) and leader_type=2, while screen texts carry
+    # point=(0,0,0), label_point=(0,0,0), screen_position=(u,v), leader_type=0.
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Real623TextEntity:
+        text: str = ""
+        hidden: bool = False
+        layer: str = ""
+        point: object = None
+        label_point: object = None
+        screen_position: object = (0.0, 0.0)
+        leader_type: int = 2
+        arrow_type: int = 3
+        display_leader: bool = True
+
+    parsed_2017 = openskp.SkpFile.open(path).parse()
+    real_texts_623 = [
+        _Real623TextEntity(
+            text=t.text,
+            hidden=t.hidden,
+            point=t.point if t.point is not None else (0.0, 0.0, 0.0),
+            label_point=t.label_point if t.label_point is not None else (0.0, 0.0, 0.0),
+            screen_position=(0.0, 0.0) if t.point is not None else (0.15, 0.85),
+            leader_type=2 if t.point is not None else 0,
+        )
+        for t in parsed_2017.root.texts
+    ]
+    st_scr = {"texts_imported": 0, "texts_skipped_no_position": 0}
+    for rt in real_texts_623:
+        import_skp._create_blender_text_annotation(rt, None, lambda: layer0_annots[0], False, None, st_scr)
+    assert st_scr["texts_imported"] == 1 and st_scr["texts_skipped_no_position"] == 1, st_scr
+
+    # 5. Errors in per-annotation creation, skp.parse(), and _extract_model_annotations never cancel geometry import
+    orig_fmt = import_skp._format_dimension_meters
+    try:
+        def boom_fmt(_dist):
+            raise RuntimeError("simulated dimension failure")
+
+        import_skp._format_dimension_meters = boom_fmt
+        stats_err = import_skp.import_skp(path, keep_hierarchy=True, import_annotations=True)
+        assert stats_err["placements"] == 2, stats_err
+        assert stats_err["texts_imported"] == 1, stats_err
+        assert stats_err["dimensions_imported"] == 0, stats_err
+        assert stats_err["annotation_failures"] == 2, stats_err
+        assert sum("failed to create 2 annotation(s)" in w for w in stats_err["warnings"]) == 1, stats_err["warnings"]
+    finally:
+        import_skp._format_dimension_meters = orig_fmt
+
+    orig_parse = openskp.SkpFile.parse
+    try:
+        def boom_parse(_self):
+            raise RuntimeError("simulated parse crash")
+
+        openskp.SkpFile.parse = boom_parse
+        stats_p = import_skp.import_skp(path, keep_hierarchy=True, import_annotations=True)
+        assert stats_p["placements"] == 2 and stats_p["annotation_failures"] == 1, stats_p
+        assert any("simulated parse crash" in w for w in stats_p["warnings"]), stats_p["warnings"]
+    finally:
+        openskp.SkpFile.parse = orig_parse
+
+    orig_parse = openskp.SkpFile.parse
+    try:
+        class BrokenLayersModel:
+            @property
+            def layers(self):
+                raise RuntimeError("simulated annot_model.layers crash")
+
+        openskp.SkpFile.parse = lambda _self: BrokenLayersModel()
+        stats_l = import_skp.import_skp(path, keep_hierarchy=True, import_annotations=True)
+        assert stats_l["placements"] == 2 and stats_l["annotation_failures"] == 1, stats_l
+        assert any("simulated annot_model.layers crash" in w for w in stats_l["warnings"]), stats_l["warnings"]
+    finally:
+        openskp.SkpFile.parse = orig_parse
+
+    orig_ext = import_skp._extract_model_annotations
+    try:
+        def boom_ext(*_a, **_kw):
+            raise RuntimeError("simulated extract crash")
+
+        import_skp._extract_model_annotations = boom_ext
+        stats_x = import_skp.import_skp(path, keep_hierarchy=True, import_annotations=True)
+        assert stats_x["placements"] == 2 and stats_x["annotation_failures"] == 1, stats_x
+        assert any("simulated extract crash" in w for w in stats_x["warnings"]), stats_x["warnings"]
+    finally:
+        import_skp._extract_model_annotations = orig_ext
+
+    print("annotations_2017.skp & annotations_2021.skp: texts, dimensions, offset rule, and error isolation - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -1312,6 +1673,7 @@ def main():
     check_solid_view_shows_painted_side()
     check_concave_surfaces_keep_one_orientation()
     check_cameraless_page_is_skipped()
+    check_annotations_import()
     check_library_warnings_are_collected()
     check_import_reports_no_warnings_for_a_clean_file()
     check_partial_read_warning_is_reported()

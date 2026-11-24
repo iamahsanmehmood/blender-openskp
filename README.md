@@ -162,6 +162,31 @@ active `Scene.camera`. Requires the next OpenSKP release (after 1.6.0, with
 `InstancedScene.pages` from openskp#593) to be bundled; with the currently
 bundled OpenSKP 1.6.0 no extra parse runs and scene cameras stay off.
 
+**Annotations (texts and dimensions)** (import only, opt-in via *Import
+Annotations*, off by default so standard imports never run an extra model
+parse, #27): SketchUp positioned texts (`Definition.texts`) and linear
+dimensions (`Definition.dimensions` in classic files; root
+`SkpModel.dimensions` or owner-local `Definition.dimensions` in 2021+ VFF
+files) import into an `Annotations` child Collection under each SketchUp
+tag's Collection. Texts become Blender `FONT` text objects placed at their
+world-space `label_point` without drawing a separate leader arrow line
+(`sketchup_anchor_m` records the anchor). Each linear dimension becomes a thin
+3D `CURVE` line paired with a centered `FONT` text object showing the custom
+override text (with `"<>"` replaced by the measured distance) or the placed
+world-space measured distance in metres; with OpenSKP 1.6.0 the dimension line
+sits directly on `a`–`b` without an offset, and uses `Dimension.offset_vector`
+(with witness lines) when the bundled library provides it. With *Keep SketchUp
+Hierarchy* on, annotations inside a component or group are parented to that
+placement's Empty so moving or hiding the component moves or hides its
+annotations with it. Screen texts (`leader_type == 0`), texts with no 3D position, 2021+ VFF
+axis-constrained dimensions (`5BD1`) whose `a`–`b` segment is not parallel to
+the constraint axis, 2021+ VFF texts, and 2021+ dimensions inside components
+(until openskp#623 is bundled) are skipped rather than misplaced and counted in
+the import report (with OpenSKP 1.6.0, an axis-constrained dimension in a
+classic pre-2021 file shows the `a`–`b` distance because the library does not
+give the constraint axis); errors anywhere in the annotation pass are caught
+and reported once without stopping the geometry import.
+
 **Layers** (SketchUp calls them "tags", import only) carry over too, as
 Collections: every placement lands in a Collection named for its own
 layer, one per distinct layer in the file, and a layer switched off in
@@ -279,6 +304,14 @@ fully uninstalled, its dependencies removed from Blender's own embedded
 interpreter, then reinstalled from a freshly-built `.zip` and imported
 against a real fixture with zero manual setup — not just "the manifest
 looks right."
+
+Annotations (`Import Annotations`) are verified against `annotations_2017.skp`
+and `annotations_2021.skp` (saved with SketchUp's own C library in 2017 and
+2021 formats: a leader text, a screen text skipped with no 3D position, and
+two linear dimensions, one inside a placed component on its own tag), checking
+text strings, world-space positions, dimension planes, segment lengths and
+measured values, per-tag `Annotations` Collections, component-Empty parenting,
+and error isolation.
 
 **Not yet measured:** performance on a large, real production file (the
 FreeCAD addon's README has real numbers for a 358K-face file; this one
