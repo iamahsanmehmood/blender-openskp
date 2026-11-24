@@ -57,16 +57,18 @@ behave, and a real architectural improvement over a flat triangle-soup
 import.
 
 **Export** (File → Export → SketchUp) writes selected objects (or every
-visible object when nothing is selected) to a native `.skp` file, preserving
-component structure (#28): each instanced Collection (and each *Keep SketchUp
-Hierarchy* parented group/component Empty tree) is written once in bottom-up
+visible object when nothing exportable is selected) to a native `.skp` file,
+preserving component structure (#28): each instanced Collection (including child
+collections, `instance_offset`, and parented objects) and each imported *Keep
+SketchUp Hierarchy* group/component Empty tree is written once in bottom-up
 order as a SketchUp component definition, and each placement Empty
-(`instance_type='COLLECTION'` or hierarchy group Empty) becomes a component
-instance carrying its 4x4 transform (position, rotation, non-uniform scale and
-mirroring) and SketchUp tag (Collection membership). Standalone mesh objects
-outside instanced definitions stay loose geometry at the file's root, keeping
-planar n-gons whole and triangulating only genuinely non-planar faces (see
-`tests/test_export.py`).
+(`instance_type='COLLECTION'` or imported hierarchy group Empty) becomes a
+component instance carrying its 4x4 transform (position, rotation, non-uniform
+scale and mirroring) and SketchUp tag (Collection membership). Standalone mesh
+objects outside instanced definitions (including meshes parented under ordinary
+Blender Empties or armatures, and visible collections that are also instanced)
+stay loose geometry at the file's root, keeping planar n-gons whole and
+triangulating only genuinely non-planar faces (see `tests/test_export.py`).
 
 **Layer export**: each exported object's own Collection becomes its
 SketchUp layer/tag — the first Collection it's linked into other than the
