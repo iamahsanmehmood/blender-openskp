@@ -128,6 +128,22 @@ definition name (`sketchup_definition`) and instance GUID
 (`sketchup_guid`) as custom properties. Switch it off for the previous
 flat result, every placement at the top level.
 
+**Components as Linked Duplicates** (opt-in via *Components as Linked
+Duplicates*, off by default so existing workflows stay unchanged, #35):
+instead of Collection-Instance Empties backed by an excluded `<filename>
+(source geometry)` library collection, each component's parts are imported
+directly where they belong as `MESH` objects sharing one `Mesh` datablock
+(`Alt+D`-style linked duplicates — Tab into Edit Mode on any copy in context
+and every copy sharing that paint updates at once; placements that inherit
+different instance-level paints get distinct `Mesh` datablocks so one never
+repaints another). An `Empty` is created only when a component contains other
+components or groups, named after the component, with its own geometry and
+nested children parented under it so **Select → Select Grouped → Children**
+picks all its parts; SketchUp groups keep their own unshared meshes and follow
+*Keep SketchUp Hierarchy*. Export (#28/#36) recognises linked-duplicate component meshes, modified copies
+(sharing one SketchUp definition per evaluated mesh), group meshes, and nested
+component Empties, writing SketchUp definitions and instances back out.
+
 **Textured materials** (import only) carry over too: each mesh's own UV
 coordinates (already resolved by openskp per vertex, previously unread by
 this addon) land in a real UV layer, and a material with an image texture

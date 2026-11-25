@@ -1310,6 +1310,461 @@ def test_review_round2_regressions():
     print("test_review_round2_regressions: OK (all 6 round-2 review points verified)")
 
 
+def test_linked_duplicates_export_round_trip():
+    """Verifies export (#36) recognises ``linked_duplicates=True`` imports (#35)
+    and writes one SketchUp component definition with instances across a full
+    import -> export -> import round-trip:
+    1. Leaf components (20 placements across 3 tags, with mirroring, rotation,
+       non-uniform scale, named instance, plus an Alt+D duplicate added in
+       Blender) -> 1 definition + 21 instances -> re-imported cleanly.
+    2. Nested assembly components (``nested_components_2021.skp``: Bolt ->
+       Bracket -> Frame, plus hiding 'Brackets' tag -> 22 world faces) ->
+       3 definitions -> re-imported cleanly.
+    3. Instance-inherited paint (2 Red + 2 Blue placements of unpainted Tile) ->
+       2 painted definitions with 2 instances each -> re-imported cleanly."""
+    import math
+    import tempfile
+
+    import mathutils
+    import openskp
+
+    import_skp = _load_module("import_skp")
+
+    def find_layer_coll(lc, name):
+        if lc.collection.name == name:
+            return lc
+        for ch in lc.children:
+            res = find_layer_coll(ch, name)
+            if res is not None:
+                return res
+        return None
+
+    def assert_matches_depsgraph(skp_model, tmp_dir, tag, tol=2e-3):
+        dg_file = os.path.join(tmp_dir, f"dg_ld_{tag}.skp")
+        _depsgraph_export_scene_to_skp(dg_file, bpy.context)
+        dg_m = openskp.SkpFile.open(dg_file).parse()
+        got = _model_world_face_signature(skp_model)
+        want = _model_world_face_signature(dg_m)
+        assert got[0] == want[0], f"{tag}: face count {got[0]} != depsgraph {want[0]}"
+        assert abs(got[1] - want[1]) <= 1e-4 * max(1.0, want[1]), f"{tag}: area {got[1]} != {want[1]}"
+        _assert_same_vertices(got[2], want[2], tol=tol, label=tag)
+        return want
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # --- 1. Leaf component linked duplicates + Alt+D: import -> export -> import ---
+        b = openskp.create()
+        copper_rgb = (196, 110, 52)
+        mat_copper = b.add_material("Copper", copper_rgb)
+        tag_north = b.add_layer("NorthWall")
+        tag_south = b.add_layer("SouthWall")
+        with b.add_component_definition("BracketPart") as bp:
+            bp.add_face([(0, 0, 0), (10, 0, 0), (10, 6, 0), (0, 6, 0)], material=mat_copper)
+            bp.add_face([(0, 0, 0), (0, 6, 0), (0, 6, 8), (0, 0, 8)], material=mat_copper)
+            bp.add_face([(0, 0, 0), (10, 0, 0), (0, 0, 8)], material=mat_copper)
+            bp.add_face([(0, 6, 0), (0, 6, 8), (10, 6, 0)], material=mat_copper)
+            bp.add_face([(10, 0, 0), (10, 6, 0), (0, 6, 8), (0, 0, 8)], material=mat_copper)
+
+        ang = math.radians(37.0)
+        ca, sa = math.cos(ang), math.sin(ang)
+        transforms = [
+            ("KeystoneBracket", (0.0, 0.0, 0.0), None, None),
+            ("", (25.0, 0.0, 0.0), (-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0), tag_north),
+            ("", (50.0, 0.0, 0.0), (-1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0), tag_south),
+            ("", (75.0, 0.0, 0.0), (2.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 1.5), tag_north),
+            ("", (100.0, 10.0, 5.0), (ca, -sa, 0.0, sa, ca, 0.0, 0.0, 0.0, 1.0), tag_south),
+        ]
+        for k in range(15):
+            transforms.append((
+                "",
+                (float((k % 5) * 30), float(40 + (k // 5) * 25), float(k * 2)),
+                None,
+                tag_north if k % 2 == 0 else tag_south,
+            ))
+        for iname, tr, m3, lyr in transforms:
+            b.add_instance(bp, name=iname, translation=tr, matrix3x3=m3, layer=lyr)
+
+        leaf_src = os.path.join(tmp, "leaf_linked_src.skp")
+        leaf_rt = os.path.join(tmp, "leaf_linked_rt.skp")
+        with open(leaf_src, "wb") as f:
+            f.write(b.to_bytes())
+
+        _reset_clean_scene()
+        import_skp.import_skp(leaf_src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        placed = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+        assert len(placed) == 20
+        assert not [o for o in bpy.context.scene.objects if o.type == "EMPTY"]
+        assert len({o.data for o in placed}) == 1
+
+        # Assign two placements to NorthWall / SouthWall Blender Collections (and add an Alt+D copy)
+        for tag_cname, target_obj in (("NorthWall", placed[1]), ("SouthWall", placed[2])):
+            tcoll = bpy.data.collections.get(tag_cname)
+            if tcoll is None:
+                tcoll = bpy.data.collections.new(tag_cname)
+                bpy.context.scene.collection.children.link(tcoll)
+            for uc in list(target_obj.users_collection):
+                uc.objects.unlink(target_obj)
+            tcoll.objects.link(target_obj)
+
+        # Simulate user pressing Alt+D (Duplicate Linked) on one placement in Blender
+        for o in bpy.context.scene.objects:
+            o.select_set(False)
+        placed[0].select_set(True)
+        bpy.context.view_layer.objects.active = placed[0]
+        bpy.ops.object.duplicate(linked=True)
+        alt_d_copy = bpy.context.active_object
+        alt_d_copy.name = "UserAltDBracket"
+        alt_d_copy.location = mathutils.Vector((-1.5, -1.0, 0.5))
+        alt_d_copy.rotation_euler = (0.2, -0.3, 0.7)
+        for o in bpy.context.scene.objects:
+            o.select_set(False)
+        bpy.context.view_layer.update()
+
+        st_leaf = export_skp.export_skp(leaf_rt, bpy.context)
+        assert st_leaf["definitions_written"] == 1, st_leaf
+        assert st_leaf["instances_written"] == 21, st_leaf
+
+        m_leaf = openskp.SkpFile.open(leaf_rt).parse()
+        leaf_defs = [d for d in m_leaf.definitions.values() if d is not m_leaf.root]
+        assert len(leaf_defs) == 1 and leaf_defs[0].name == "BracketPart", [d.name for d in leaf_defs]
+        assert len(m_leaf.root.instances) == 21
+        inst_names = sorted(i.name for i in m_leaf.root.instances if i.name)
+        assert inst_names == ["KeystoneBracket", "UserAltDBracket"], inst_names
+        assert {l.name for l in m_leaf.layers} >= {"Layer0", "NorthWall", "SouthWall"}
+        assert len(m_leaf.materials) == 1 and tuple(m_leaf.materials[0].color[:3]) == copper_rgb
+        want_leaf_sig = assert_matches_depsgraph(m_leaf, tmp, "leaf_21")
+
+        # Complete the round-trip: re-import the exported .skp with linked_duplicates=True
+        _reset_clean_scene()
+        import_skp.import_skp(leaf_rt, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        reimp_meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+        assert len(reimp_meshes) == 21
+        assert len({o.data for o in reimp_meshes}) == 1
+        dg_reimp = os.path.join(tmp, "dg_leaf_reimp.skp")
+        _depsgraph_export_scene_to_skp(dg_reimp, bpy.context)
+        got_reimp_sig = _model_world_face_signature(openskp.SkpFile.open(dg_reimp).parse())
+        assert got_reimp_sig[0] == want_leaf_sig[0]
+        _assert_same_vertices(got_reimp_sig[2], want_leaf_sig[2], tol=2e-3, label="leaf_reimported")
+
+        # --- 2. Nested assembly components (nested_components_2021.skp): import -> export -> import ---
+        fixtures_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+        nested_fixture = os.path.join(fixtures_dir, "nested_components_2021.skp")
+
+        _reset_clean_scene()
+        import_skp.import_skp(nested_fixture, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        nested_rt = os.path.join(tmp, "nested_linked_rt.skp")
+        st_nested = export_skp.export_skp(nested_rt, bpy.context)
+        assert st_nested["definitions_written"] == 3, st_nested  # Bolt, Bracket, Frame
+        m_nested = openskp.SkpFile.open(nested_rt).parse()
+        nested_def_names = sorted(d.name for d in m_nested.definitions.values() if d is not m_nested.root)
+        assert nested_def_names == ["Bolt", "Bracket", "Frame"], nested_def_names
+        want_nested_sig = assert_matches_depsgraph(m_nested, tmp, "nested_full")
+
+        # Re-import nested_rt with linked_duplicates=True
+        _reset_clean_scene()
+        import_skp.import_skp(nested_rt, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        re_bolts = [o for o in bpy.context.scene.objects if o.type == "MESH" and o.get("sketchup_definition") == "Bolt"]
+        re_frames = [o for o in bpy.context.scene.objects if o.type == "EMPTY" and o.get("sketchup_definition") == "Frame"]
+        assert len(re_bolts) == 8 and len({o.data for o in re_bolts}) == 1
+        assert len(re_frames) == 2
+        dg_nested_reimp = os.path.join(tmp, "dg_nested_reimp.skp")
+        _depsgraph_export_scene_to_skp(dg_nested_reimp, bpy.context)
+        got_nested_reimp = _model_world_face_signature(openskp.SkpFile.open(dg_nested_reimp).parse())
+        assert got_nested_reimp[0] == want_nested_sig[0]
+        _assert_same_vertices(got_nested_reimp[2], want_nested_sig[2], tol=2e-3, label="nested_reimported")
+
+        # Hiding "Brackets" tag on linked_duplicates=True import keeps visible Bolts below it (22 world faces)
+        _reset_clean_scene()
+        import_skp.import_skp(nested_fixture, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        lc_brackets = find_layer_coll(bpy.context.view_layer.layer_collection, "Brackets")
+        assert lc_brackets is not None
+        lc_brackets.hide_viewport = True
+        bpy.context.view_layer.update()
+        nested_hid_out = os.path.join(tmp, "nested_linked_brackets_hidden.skp")
+        export_skp.export_skp(nested_hid_out, bpy.context)
+        m_nhid = openskp.SkpFile.open(nested_hid_out).parse()
+        sig_nhid = _model_world_face_signature(m_nhid)
+        assert sig_nhid[0] == 22, sig_nhid
+        assert_matches_depsgraph(m_nhid, tmp, "nested_brackets_hidden")
+
+        # --- 3. Instance-inherited paint round-trip (inherited_paint_2021.skp: 5 visible placements, matching main) ---
+        paint_src = os.path.join(fixtures_dir, "linked_duplicates", "inherited_paint_2021.skp")
+        paint_rt = os.path.join(tmp, "panel_inherited_rt.skp")
+
+        _reset_clean_scene()
+        import_skp.import_skp(paint_src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        vis_panels = [o for o in bpy.context.scene.objects if o.type == "MESH" and o.visible_get()]
+        # Visible placements: RedA, RedMirroredX, HiddenInst (share 1 Red mesh),
+        # BlueScaled (1 Blue mesh), UnpaintedMirroredZ (1 unpainted mesh); OnHiddenTag is in hidden HiddenTag.
+        assert len(vis_panels) == 5 and len({o.data for o in vis_panels}) == 3
+
+        st_paint = export_skp.export_skp(paint_rt, bpy.context)
+        assert st_paint["definitions_written"] == 3 and st_paint["instances_written"] == 5, st_paint
+        m_prt = openskp.SkpFile.open(paint_rt).parse()
+        assert {tuple(m.color[:3]) for m in m_prt.materials} == {(220, 30, 40), (30, 80, 220)}
+        want_paint_sig = assert_matches_depsgraph(m_prt, tmp, "inherited_paint_rt")
+
+        _reset_clean_scene()
+        import_skp.import_skp(paint_rt, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        panel_reimp = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+        assert len(panel_reimp) == 5 and len({o.data for o in panel_reimp}) == 3
+        dg_paint_reimp = os.path.join(tmp, "dg_paint_reimp.skp")
+        _depsgraph_export_scene_to_skp(dg_paint_reimp, bpy.context)
+        got_paint_reimp = _model_world_face_signature(openskp.SkpFile.open(dg_paint_reimp).parse())
+        assert got_paint_reimp[0] == want_paint_sig[0]
+        _assert_same_vertices(got_paint_reimp[2], want_paint_sig[2], tol=2e-3, label="inherited_paint_reimported")
+
+        # --- 4. Leaf groups & root groups exported as definitions + instances (never dissolved) ---
+        # 4a. Cabinet component containing a leaf group "Handle" (HandleDef)
+        b_cab = openskp.create()
+        with b_cab.add_component_definition("HandleDef") as hdef:
+            hdef.add_face([(0, 0, 0), (4, 0, 0), (4, 1, 0), (0, 1, 0)])
+            hdef.add_face([(0, 0, 1), (0, 1, 1), (4, 1, 1), (4, 0, 1)])
+            hdef.add_face([(0, 0, 0), (0, 0, 1), (4, 0, 1), (4, 0, 0)])
+            hdef.add_face([(4, 0, 0), (4, 0, 1), (4, 1, 1), (4, 1, 0)])
+            hdef.add_face([(4, 1, 0), (4, 1, 1), (0, 1, 1), (0, 1, 0)])
+            hdef.add_face([(0, 1, 0), (0, 1, 1), (0, 0, 1), (0, 0, 0)])
+        with b_cab.add_component_definition("Cabinet") as cab_def:
+            cab_def.add_face([(0, 0, 0), (24, 0, 0), (24, 18, 0), (0, 18, 0)])
+            cab_def.add_face([(0, 0, 30), (0, 18, 30), (24, 18, 30), (24, 0, 30)])
+            cab_def.add_group_instance(hdef, name="Handle", translation=(10.0, 0.0, 15.0))
+        b_cab.add_instance(cab_def, translation=(0.0, 0.0, 0.0))
+        cab_src = os.path.join(tmp, "cabinet_handle_src.skp")
+        cab_off_out = os.path.join(tmp, "cabinet_handle_off.skp")
+        cab_on_out = os.path.join(tmp, "cabinet_handle_on.skp")
+        with open(cab_src, "wb") as f:
+            f.write(b_cab.to_bytes())
+
+        _reset_clean_scene()
+        import_skp.import_skp(cab_src, bpy.context, keep_hierarchy=True, linked_duplicates=False)
+        bpy.context.view_layer.update()
+        st_cab_off = export_skp.export_skp(cab_off_out, bpy.context)
+
+        _reset_clean_scene()
+        import_skp.import_skp(cab_src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        st_cab_on = export_skp.export_skp(cab_on_out, bpy.context)
+        assert st_cab_on["definitions_written"] == st_cab_off["definitions_written"] == 2, (st_cab_on, st_cab_off)
+        assert st_cab_on["instances_written"] == st_cab_off["instances_written"] == 2, (st_cab_on, st_cab_off)
+        m_cab = openskp.SkpFile.open(cab_on_out).parse()
+        cab_defs_by_name = {d.name: d for d in m_cab.definitions.values() if d is not m_cab.root}
+        assert sorted(cab_defs_by_name) == ["Cabinet", "HandleDef"], list(cab_defs_by_name)
+        assert len(cab_defs_by_name["Cabinet"].instances) == 1
+        assert cab_defs_by_name["Cabinet"].instances[0].name == "Handle"
+        assert_matches_depsgraph(m_cab, tmp, "cabinet_handle")
+
+        # 4b. nesting_2021.skp (3 defs) and gondola_v20.skp (18 defs) match linked_duplicates=False
+        for fx_name, want_defs in (("nesting_2021.skp", 3), ("gondola_v20.skp", 18)):
+            fx_p = os.path.join(fixtures_dir, fx_name)
+            out_off = os.path.join(tmp, f"off_{fx_name}")
+            out_on = os.path.join(tmp, f"on_{fx_name}")
+
+            _reset_clean_scene()
+            import_skp.import_skp(fx_p, bpy.context, keep_hierarchy=True, linked_duplicates=False)
+            bpy.context.view_layer.update()
+            st_fx_off = export_skp.export_skp(out_off, bpy.context)
+
+            _reset_clean_scene()
+            import_skp.import_skp(fx_p, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+            bpy.context.view_layer.update()
+            st_fx_on = export_skp.export_skp(out_on, bpy.context)
+
+            assert st_fx_off["definitions_written"] == want_defs, (fx_name, st_fx_off)
+            assert st_fx_on["definitions_written"] == want_defs, (fx_name, st_fx_on)
+            assert st_fx_on["instances_written"] == st_fx_off["instances_written"], (fx_name, st_fx_on, st_fx_off)
+            m_fx_off = openskp.SkpFile.open(out_off).parse()
+            m_fx_on = openskp.SkpFile.open(out_on).parse()
+            sig_off = _model_world_face_signature(m_fx_off)
+            sig_on = _model_world_face_signature(m_fx_on)
+            assert sig_on[0] == sig_off[0], (fx_name, sig_on[0], sig_off[0])
+            assert abs(sig_on[1] - sig_off[1]) <= 1e-4 * max(1.0, sig_off[1]), (fx_name, sig_on[1], sig_off[1])
+            _assert_same_vertices(sig_on[2], sig_off[2], tol=2e-3, label=f"off_vs_on_{fx_name}")
+            if fx_name == "gondola_v20.skp":
+                dg_fx = os.path.join(tmp, f"dg_grp_{fx_name}")
+                _depsgraph_export_scene_to_skp(dg_fx, bpy.context)
+                sig_dg = _model_world_face_signature(openskp.SkpFile.open(dg_fx).parse(), min_area_sq_in=1e-3)
+                sig_on_ns = _model_world_face_signature(m_fx_on, min_area_sq_in=1e-3)
+                assert sig_on_ns[0] == sig_dg[0], (fx_name, sig_on_ns[0], sig_dg[0])
+                _assert_same_vertices(sig_on_ns[2], sig_dg[2], tol=5e-3, label=f"grp_{fx_name}")
+            else:
+                assert_matches_depsgraph(m_fx_on, tmp, f"grp_{fx_name}")
+
+        # 4c. Two touching root groups (sharing the face at x=10") keep separate definitions/instances
+        # and never dissolve into loose root_faces (tested with Keep Hierarchy both on and off).
+        b_touch = openskp.create()
+        for gname, x0 in (("LeftBoxGrp", 0.0), ("RightBoxGrp", 10.0)):
+            with b_touch.add_group(gname) as tg:
+                tg.add_face([(x0, 0, 0), (x0 + 10, 0, 0), (x0 + 10, 10, 0), (x0, 10, 0)])
+                tg.add_face([(x0, 0, 10), (x0, 10, 10), (x0 + 10, 10, 10), (x0 + 10, 0, 10)])
+                tg.add_face([(x0, 0, 0), (x0, 0, 10), (x0 + 10, 0, 10), (x0 + 10, 0, 0)])
+                tg.add_face([(x0 + 10, 0, 0), (x0 + 10, 0, 10), (x0 + 10, 10, 10), (x0 + 10, 10, 0)])
+                tg.add_face([(x0 + 10, 10, 0), (x0 + 10, 10, 10), (x0, 10, 10), (x0, 10, 0)])
+                tg.add_face([(x0, 10, 0), (x0, 10, 10), (x0, 0, 10), (x0, 0, 0)])
+        touch_src = os.path.join(tmp, "touching_root_groups_src.skp")
+        with open(touch_src, "wb") as f:
+            f.write(b_touch.to_bytes())
+
+        for kh in (True, False):
+            _reset_clean_scene()
+            import_skp.import_skp(touch_src, bpy.context, keep_hierarchy=kh, linked_duplicates=True)
+            bpy.context.view_layer.update()
+            touch_out = os.path.join(tmp, f"touching_root_groups_kh{int(kh)}.skp")
+            st_touch = export_skp.export_skp(touch_out, bpy.context)
+            assert st_touch["definitions_written"] == 2 and st_touch["instances_written"] == 2, (kh, st_touch)
+            m_touch = openskp.SkpFile.open(touch_out).parse()
+            assert len(m_touch.root.faces) == 0, (kh, len(m_touch.root.faces))
+            assert len(m_touch.root.instances) == 2, (kh, m_touch.root.instances)
+            assert_matches_depsgraph(m_touch, tmp, f"touching_groups_kh{int(kh)}")
+
+        # --- 5. Assembly edits, single-user copy, modifier (200 of 2,000), object-level material, & 300x1,500 speed ---
+        # 5a. Child moved and one child deleted inside ONE placement of nested_components_2021.skp
+        _reset_clean_scene()
+        import_skp.import_skp(nested_fixture, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        frames = sorted(
+            [o for o in bpy.context.scene.objects if o.type == "EMPTY" and o.get("sketchup_definition") == "Frame"],
+            key=lambda o: o.name,
+        )
+        edit_bracket = sorted(
+            [ch for ch in frames[0].children if ch.type == "EMPTY" and ch.get("sketchup_definition") == "Bracket"],
+            key=lambda o: o.name,
+        )[0]
+        edit_bolts = sorted(
+            [ch for ch in edit_bracket.children if ch.type == "MESH" and ch.get("sketchup_definition") == "Bolt"],
+            key=lambda o: o.name,
+        )
+        assert len(edit_bolts) == 2
+        edit_bolts[0].location = edit_bolts[0].location + mathutils.Vector((0.15, -0.1, 0.05))
+        bpy.data.objects.remove(edit_bolts[1], do_unlink=True)
+        bpy.context.view_layer.update()
+
+        edited_nested_out = os.path.join(tmp, "nested_one_moved_one_deleted.skp")
+        st_ed = export_skp.export_skp(edited_nested_out, bpy.context)
+        # Bolt (1) + untouched Bracket (1) + edited Bracket#1 (1) + untouched Frame (1) + edited Frame#1 (1) = 5
+        assert st_ed["definitions_written"] == 5, st_ed
+        m_ed = openskp.SkpFile.open(edited_nested_out).parse()
+        assert len(m_ed.root.faces) == 2 and len(m_ed.root.instances) == 2, (len(m_ed.root.faces), len(m_ed.root.instances))
+        assert_matches_depsgraph(m_ed, tmp, "nested_moved_deleted")
+
+        # 5b. Single-user copy + Object-level material slot on leaf linked duplicates
+        _reset_clean_scene()
+        import_skp.import_skp(leaf_src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+        leaf_objs = sorted([o for o in bpy.context.scene.objects if o.type == "MESH"], key=lambda o: o.name)
+        assert len(leaf_objs) == 20
+
+        # Make leaf_objs[0] single-user and stretch one vertex
+        leaf_objs[0].data = leaf_objs[0].data.copy()
+        leaf_objs[0].data.vertices[0].co = leaf_objs[0].data.vertices[0].co + mathutils.Vector((0.2, 0.0, 0.0))
+        leaf_objs[0].data.update()
+
+        # Assign an OBJECT-level material slot ("Gold") to leaf_objs[1] and leaf_objs[2] (still sharing Mesh data!)
+        gold_rgb = (235, 190, 40)
+        gold_mat = bpy.data.materials.new("GoldSlot")
+        glr, glg, glb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in gold_rgb))
+        gold_mat.diffuse_color = (glr, glg, glb, 1.0)
+        for tgt in (leaf_objs[1], leaf_objs[2]):
+            tgt.material_slots[0].link = "OBJECT"
+            tgt.material_slots[0].material = gold_mat
+        bpy.context.view_layer.update()
+
+        su_mat_out = os.path.join(tmp, "leaf_single_user_and_obj_mat.skp")
+        st_sum = export_skp.export_skp(su_mat_out, bpy.context)
+        # 17 original Copper + 2 OBJECT-slot Gold + 1 single-user edited = 3 definitions, 20 instances, 0 root faces
+        assert st_sum["definitions_written"] == 3 and st_sum["instances_written"] == 20, st_sum
+        m_sum = openskp.SkpFile.open(su_mat_out).parse()
+        assert len(m_sum.root.faces) == 0 and len(m_sum.root.instances) == 20
+        assert {tuple(m.color[:3]) for m in m_sum.materials} == {copper_rgb, gold_rgb}
+        assert_matches_depsgraph(m_sum, tmp, "single_user_and_obj_mat")
+
+        # 5c. Modifier on 200 of 2,000 copies -> 2 definitions (unmodified + beveled), 2,000 instances, 0 loose faces
+        b_bev = openskp.create()
+        with b_bev.add_component_definition("Post") as post_d:
+            post_d.add_face([(0, 0, 0), (8, 0, 0), (8, 8, 0), (0, 8, 0)])
+            post_d.add_face([(0, 0, 12), (0, 8, 12), (8, 8, 12), (8, 0, 12)])
+            post_d.add_face([(0, 0, 0), (0, 0, 12), (8, 0, 12), (8, 0, 0)])
+            post_d.add_face([(8, 0, 0), (8, 0, 12), (8, 8, 12), (8, 8, 0)])
+            post_d.add_face([(8, 8, 0), (8, 8, 12), (0, 8, 12), (0, 8, 0)])
+            post_d.add_face([(0, 8, 0), (0, 8, 12), (0, 0, 12), (0, 0, 0)])
+        for k in range(2000):
+            b_bev.add_instance(post_d, translation=((k % 50) * 16.0, (k // 50) * 16.0, 0.0))
+        bev_src = os.path.join(tmp, "posts_2000_src.skp")
+        bev_out = os.path.join(tmp, "posts_2000_bevel200.skp")
+        with open(bev_src, "wb") as f:
+            f.write(b_bev.to_bytes())
+
+        _reset_clean_scene()
+        import_skp.import_skp(bev_src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        posts = sorted([o for o in bpy.context.scene.objects if o.type == "MESH"], key=lambda o: o.name)
+        assert len(posts) == 2000
+        for p_obj in posts[:200]:
+            mod = p_obj.modifiers.new(name="Bevel", type="BEVEL")
+            mod.width = 0.015
+            mod.segments = 1
+        bpy.context.view_layer.update()
+
+        st_bev = export_skp.export_skp(bev_out, bpy.context)
+        assert st_bev["definitions_written"] == 2 and st_bev["instances_written"] == 2000, st_bev
+        m_bev = openskp.SkpFile.open(bev_out).parse()
+        assert len(m_bev.root.faces) == 0 and len(m_bev.root.instances) == 2000
+        # Verify geometric accuracy on a small subset check against depsgraph for the beveled definition
+        bev_defs = {d_id: d for d_id, d in m_bev.definitions.items() if d is not m_bev.root}
+        assert len(bev_defs) == 2
+        face_counts = sorted(len(d.faces) for d in bev_defs.values())
+        assert face_counts[0] == 12 and face_counts[1] > 12, face_counts  # 12 imported tris vs beveled faces
+
+        # 5d. Speed & single-extraction check: 300 assemblies of 1,500 own faces
+        import time
+
+        b_asm = openskp.create()
+        with b_asm.add_component_definition("Pin") as pin_d:
+            pin_d.add_face([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)])
+        with b_asm.add_component_definition("HeavyPanel") as hp_d:
+            # 750 quads -> 1,500 triangles in Blender's imported own-geometry mesh
+            for i in range(750):
+                ox = float((i % 30) * 2)
+                oy = float((i // 30) * 2)
+                hp_d.add_face([(ox, oy, 0.0), (ox + 1.5, oy, 0.0), (ox + 1.5, oy + 1.5, 0.0), (ox, oy + 1.5, 0.0)])
+            hp_d.add_instance(pin_d, translation=(0.5, 0.5, 1.0))
+        for k in range(300):
+            b_asm.add_instance(hp_d, translation=((k % 20) * 70.0, (k // 20) * 70.0, 0.0))
+        asm_src = os.path.join(tmp, "heavy_asm_300x1500_src.skp")
+        asm_out = os.path.join(tmp, "heavy_asm_300x1500_out.skp")
+        with open(asm_src, "wb") as f:
+            f.write(b_asm.to_bytes())
+
+        _reset_clean_scene()
+        import_skp.import_skp(asm_src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+        bpy.context.view_layer.update()
+
+        local_build_calls = []
+        orig_build_local = export_skp._build_local_mesh_polys
+
+        def count_local_builds(mesh):
+            local_build_calls.append(mesh.name)
+            return orig_build_local(mesh)
+
+        export_skp._build_local_mesh_polys = count_local_builds
+        try:
+            t0_asm = time.perf_counter()
+            st_asm = export_skp.export_skp(asm_out, bpy.context)
+            dt_asm = time.perf_counter() - t0_asm
+        finally:
+            export_skp._build_local_mesh_polys = orig_build_local
+
+        assert st_asm["definitions_written"] == 2 and st_asm["instances_written"] == 301, st_asm
+        assert len(local_build_calls) == 2, local_build_calls  # HeavyPanel + Pin extracted ONCE, not 300 times!
+        assert dt_asm < 2.0, f"300 assemblies x 1,500 faces took {dt_asm:.2f}s (expected < 2.0s)"
+        print(f"  300 assemblies x 1,500 own faces: exported 2 defs / 301 instances in {dt_asm:.2f}s")
+
+    print("test_linked_duplicates_export_round_trip: OK (groups, edits, modifiers, single-user, object slots, 300x1,500 speed)")
+
+
 if __name__ == "__main__":
     main()
     test_layer_export()
@@ -1319,3 +1774,4 @@ if __name__ == "__main__":
     test_nested_component_round_trip()
     test_blender_edge_cases_and_review_regressions()
     test_review_round2_regressions()
+    test_linked_duplicates_export_round_trip()

@@ -115,6 +115,8 @@ def _collect_import_collections(all_collection_names):
     imported_roots = set()
     source_roots = []
     for coll in bpy.data.collections:
+        if coll.get("openskp_imported_root", False):
+            imported_roots.add(coll.name)
         for child in coll.children:
             if _is_source_geom_name(child.name):
                 imported_roots.add(coll.name)
@@ -481,9 +483,15 @@ def _instance_name_for(
 
 
 def _faces_approx_equal(faces_a, faces_b, pos_tol_in=2e-3) -> bool:
+    if faces_a is faces_b:
+        return True
     if len(faces_a) != len(faces_b):
         return False
-    for (pts_a, spec_a, lay_a), (pts_b, spec_b, lay_b) in zip(faces_a, faces_b):
+    for fa, fb in zip(faces_a, faces_b):
+        if fa is fb:
+            continue
+        pts_a, spec_a, lay_a = fa
+        pts_b, spec_b, lay_b = fb
         if len(pts_a) != len(pts_b):
             return False
         if (spec_a[0] if spec_a else None) != (spec_b[0] if spec_b else None):
@@ -793,9 +801,23 @@ def export_skp(filepath, context):
         return obj_layer_cache[cache_key]
 
     def uses_skp_yup_frame(obj) -> bool:
+        if obj.get("openskp_zup_frame", False):
+            return False
         if _is_collection_empty(obj):
             return obj.instance_collection.name in source_collections
         return "sketchup_definition" in obj
+
+    def is_linked_component_mesh(obj) -> bool:
+        return (
+            obj.type == "MESH"
+            and obj.data is not None
+            and not obj.get("sketchup_own_geometry", False)
+            and (
+                bool(obj.get("sketchup_is_component", False))
+                or bool(obj.get("sketchup_is_group", False))
+                or ("sketchup_component_definition" in obj.data)
+            )
+        )
 
     def coll_coord_matrix(coll):
         return _YUP_TO_ZUP if coll.name in source_collections else mathutils.Matrix.Identity(4)
@@ -823,6 +845,10 @@ def export_skp(filepath, context):
     coll_faces_cache = {}
     coll_own_radius_cache = {}
     visiting_colls = set()
+    linked_mesh_def_cache = {}
+    mesh_defs_by_bucket = {}
+    own_mesh_faces_cache = {}
+    own_mesh_radius_cache = {}
 
     def alloc_def_name(base_name: str) -> str:
         clean = base_name or "Component"
@@ -835,6 +861,141 @@ def export_skp(filepath, context):
         candidate = f"{clean}#{idx}"
         used_def_names.add(candidate)
         return candidate
+
+    def linked_mesh_base_name(obj) -> str:
+        hint = obj.get("sketchup_definition") or obj.data.get("sketchup_component_definition")
+        if hint:
+            return str(hint)
+        if obj.get("sketchup_is_group", False):
+            return _strip_blender_dup_suffix(obj.name, all_object_names) or "Group"
+        return _strip_blender_dup_suffix(obj.data.name, all_object_names) or "Component"
+
+    def _object_unmodified_specs(obj):
+        mats = [slot.material for slot in obj.material_slots]
+        if not mats and obj.data.materials:
+            mats = list(obj.data.materials)
+        specs = [cached_material_spec(m) for m in mats]
+        specs_key = tuple(s[0] if s is not None else None for s in specs)
+        return specs, specs_key
+
+    def _local_polys_to_inch_faces(local_polys, specs, face_layer=None):
+        num_specs = len(specs)
+        faces = []
+        skipped = 0
+        for cos, mat_index in local_polys:
+            pts = [
+                (co.x * METRES_TO_INCHES, co.y * METRES_TO_INCHES, co.z * METRES_TO_INCHES)
+                for co in cos
+            ]
+            if _polygon_area_sq(pts) == 0.0:
+                skipped += 1
+                continue
+            spec = specs[mat_index] if 0 <= mat_index < num_specs else None
+            faces.append((pts, spec, face_layer))
+        return faces, skipped
+
+    def extract_own_mesh_faces_cached(ch, own_face_layer):
+        specs, specs_key = _object_unmodified_specs(ch)
+        cache_key = (ch.data.as_pointer(), specs_key, own_face_layer)
+        if cache_key in own_mesh_faces_cache:
+            return own_mesh_faces_cache[cache_key], own_mesh_radius_cache[cache_key]
+        local_polys, local_skipped, _ = _get_mesh_polys_and_materials(
+            ch, depsgraph, local_mesh_cache
+        )
+        faces_list, area_skipped = _local_polys_to_inch_faces(local_polys, specs, own_face_layer)
+        stats["faces_skipped"] += local_skipped + area_skipped
+        faces_tup = tuple(faces_list)
+        radius_in = _faces_max_radius_in(faces_tup)
+        own_mesh_faces_cache[cache_key] = faces_tup
+        own_mesh_radius_cache[cache_key] = radius_in
+        return faces_tup, radius_in
+
+    def resolve_linked_mesh_def(obj):
+        is_group_mesh = bool(obj.get("sketchup_is_group", False))
+        has_mods = bool(obj.modifiers)
+
+        if not has_mods:
+            specs, specs_key = _object_unmodified_specs(obj)
+            ptr_key = (obj.data.as_pointer(), specs_key)
+            if ptr_key in linked_mesh_def_cache:
+                return linked_mesh_def_cache[ptr_key]
+
+            local_polys, local_skipped, _ = _get_mesh_polys_and_materials(
+                obj, depsgraph, local_mesh_cache
+            )
+            if not local_polys:
+                stats["faces_skipped"] += local_skipped
+                linked_mesh_def_cache[ptr_key] = None
+                return None
+
+            faces, area_skipped = _local_polys_to_inch_faces(local_polys, specs, None)
+            if not faces:
+                stats["faces_skipped"] += local_skipped + area_skipped
+                linked_mesh_def_cache[ptr_key] = None
+                return None
+
+            base_name = linked_mesh_base_name(obj)
+            if is_group_mesh:
+                bucket_key = ("group_mesh", base_name, len(faces), specs_key)
+                for existing_key in mesh_defs_by_bucket.get(bucket_key, ()):
+                    if _faces_approx_equal(faces, definitions[existing_key]["faces"]):
+                        linked_mesh_def_cache[ptr_key] = existing_key
+                        return existing_key
+
+            stats["faces_skipped"] += local_skipped + area_skipped
+            def_key = ("mesh", len(definitions))
+            definitions[def_key] = {
+                "base_name": base_name,
+                "name": alloc_def_name(base_name),
+                "faces": faces,
+                "children": [],
+                "max_radius_in": _compute_def_max_radius_in(faces, [], definitions),
+            }
+            def_order.append(def_key)
+            linked_mesh_def_cache[ptr_key] = def_key
+            if is_group_mesh:
+                mesh_defs_by_bucket.setdefault(
+                    ("group_mesh", base_name, len(faces), specs_key), []
+                ).append(def_key)
+            return def_key
+
+        local_polys, local_skipped, mats = _get_mesh_polys_and_materials(
+            obj, depsgraph, local_mesh_cache
+        )
+        if not local_polys:
+            stats["faces_skipped"] += local_skipped
+            return None
+        specs = [cached_material_spec(m) for m in mats]
+        specs_key = tuple(s[0] if s is not None else None for s in specs)
+        faces, area_skipped = _local_polys_to_inch_faces(local_polys, specs, None)
+        if not faces:
+            stats["faces_skipped"] += local_skipped + area_skipped
+            return None
+
+        base_name = linked_mesh_base_name(obj)
+        if not is_group_mesh:
+            unmod_key = linked_mesh_def_cache.get((obj.data.as_pointer(), specs_key))
+            if unmod_key is not None and _faces_approx_equal(faces, definitions[unmod_key]["faces"]):
+                return unmod_key
+
+        kind = "group_mesh" if is_group_mesh else "mod_comp_mesh"
+        bucket_key = (kind, base_name, len(faces), specs_key)
+        for existing_key in mesh_defs_by_bucket.get(bucket_key, ()):
+            if _faces_approx_equal(faces, definitions[existing_key]["faces"]):
+                return existing_key
+
+        stats["faces_skipped"] += local_skipped + area_skipped
+        def_key = ("mesh", len(definitions))
+        definitions[def_key] = {
+            "base_name": base_name,
+            "name": alloc_def_name(base_name),
+            "faces": faces,
+            "children": [],
+            "max_radius_in": _compute_def_max_radius_in(faces, [], definitions),
+        }
+        def_order.append(def_key)
+        mesh_defs_by_bucket.setdefault(bucket_key, []).append(def_key)
+        return def_key
 
     def flatten_collection_faces(coll, world_prefix_bl, fallback_layer, out_faces, visited=frozenset()):
         """Bakes a collection's hierarchy into ``out_faces`` under ``world_prefix_bl``
@@ -1013,6 +1174,7 @@ def export_skp(filepath, context):
         if _try_invert(m_grp) is None:
             return None
         def_base_name = grp_obj.get("sketchup_definition") or grp_obj.name or "Group"
+        grp_layer = layer_of(grp_obj)
 
         faces = []
         children = []
@@ -1080,6 +1242,48 @@ def export_skp(filepath, context):
                                     tr,
                                     ch_layer,
                                 ))
+                    elif ch.parent == grp_obj and ch.type == "MESH" and ch.get("sketchup_own_geometry", False):
+                        if ch.data is not None:
+                            m_rel = relative_mesh_matrix(grp_obj, ch)
+                            ch_layer = layer_of(ch)
+                            own_face_layer = None if ch_layer == grp_layer else ch_layer
+                            if not ch.modifiers:
+                                own_faces_tup, own_r = extract_own_mesh_faces_cached(ch, own_face_layer)
+                                if _is_identity_matrix(m_rel, radius_in=own_r):
+                                    faces.extend(own_faces_tup)
+                                else:
+                                    for pts, spec in _extract_mesh_faces(
+                                        ch, m_rel, stats, depsgraph, local_mesh_cache, cached_material_spec
+                                    ):
+                                        faces.append((pts, spec, own_face_layer))
+                            else:
+                                for pts, spec in _extract_mesh_faces(
+                                    ch, m_rel, stats, depsgraph, local_mesh_cache, cached_material_spec
+                                ):
+                                    faces.append((pts, spec, own_face_layer))
+                    elif is_linked_component_mesh(ch):
+                        m_rel = relative_skp_matrix(grp_obj, ch)
+                        ch_layer = layer_of(ch)
+                        if _try_invert(m_rel) is None:
+                            m_rel_bl = relative_mesh_matrix(grp_obj, ch)
+                            for pts, spec in _extract_mesh_faces(
+                                ch, m_rel_bl, stats, depsgraph, local_mesh_cache, cached_material_spec
+                            ):
+                                faces.append((pts, spec, ch_layer))
+                        else:
+                            child_key = resolve_linked_mesh_def(ch)
+                            if child_key is not None:
+                                m3, tr = _matrix_to_skp_args(m_rel)
+                                child_base = definitions[child_key]["base_name"]
+                                children.append((
+                                    child_key,
+                                    _instance_name_for(
+                                        ch, child_base, is_imported=True, all_object_names=all_object_names
+                                    ),
+                                    m3,
+                                    tr,
+                                    ch_layer,
+                                ))
                     elif ch.type == "MESH" and ch.data is not None:
                         m_rel = relative_mesh_matrix(grp_obj, ch)
                         ch_layer = layer_of(ch)
@@ -1129,7 +1333,36 @@ def export_skp(filepath, context):
     root_instances = []   # [(def_key, inst_name, m3, tr, layer_name)]
 
     for obj in top_items:
-        if obj.type == "MESH":
+        if is_linked_component_mesh(obj):
+            m_skp = empty_skp_world_matrix(obj)
+            obj_layer = layer_of(obj)
+            if _try_invert(m_skp) is None:
+                obj_faces = _extract_mesh_faces(
+                    obj, obj.matrix_world, stats, depsgraph, local_mesh_cache, cached_material_spec
+                )
+                if obj_faces:
+                    for pts, spec in obj_faces:
+                        root_faces.append((pts, spec, obj_layer))
+                    stats["objects_exported"] += 1
+                else:
+                    stats["objects_skipped"] += 1
+                continue
+
+            def_key = resolve_linked_mesh_def(obj)
+            if def_key is None:
+                stats["objects_skipped"] += 1
+                continue
+            m3, tr = _matrix_to_skp_args(m_skp)
+            def_base = definitions[def_key]["base_name"]
+            root_instances.append((
+                def_key,
+                _instance_name_for(obj, def_base, is_imported=True, all_object_names=all_object_names),
+                m3,
+                tr,
+                obj_layer,
+            ))
+            stats["objects_exported"] += 1
+        elif obj.type == "MESH":
             if obj.data is None or (not obj.modifiers and len(obj.data.polygons) == 0):
                 stats["objects_skipped"] += 1
                 continue

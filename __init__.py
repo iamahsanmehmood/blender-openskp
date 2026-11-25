@@ -25,6 +25,14 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
         ),
         default=True,
     )
+    linked_duplicates: BoolProperty(
+        name="Components as Linked Duplicates",
+        description=(
+            "Import component parts as mesh objects sharing their mesh data, placed "
+            "directly in the scene instead of as collection instances"
+        ),
+        default=False,
+    )
     import_annotations: BoolProperty(
         name="Import Annotations",
         description=(
@@ -43,6 +51,7 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
                 context,
                 keep_hierarchy=self.keep_hierarchy,
                 import_annotations=self.import_annotations,
+                linked_duplicates=self.linked_duplicates,
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             self.report({"ERROR"}, f"OpenSKP import failed: {exc}")
