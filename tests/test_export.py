@@ -1765,6 +1765,51 @@ def test_linked_duplicates_export_round_trip():
     print("test_linked_duplicates_export_round_trip: OK (groups, edits, modifiers, single-user, object slots, 300x1,500 speed)")
 
 
+def test_small_edit_in_scaled_linked_group_is_kept():
+    """Group meshes share a definition only when they are identical: 0.0015 in
+    in the group's own frame is 0.15 in where the group is placed at 100x."""
+    import tempfile
+
+    import openskp
+
+    import_skp = _load_module("import_skp")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        b = openskp.create()
+        for x in (0.0, 500.0):
+            with b.add_group(
+                "Handle", translation=(x, 0.0, 0.0), matrix3x3=(100.0, 0, 0, 0, 100.0, 0, 0, 0, 100.0)
+            ) as g:
+                g.add_face([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)])
+                g.add_face([(0, 0, 0), (0, 1, 0), (0, 1, 1), (0, 0, 1)])
+        src = os.path.join(tmp, "scaled_groups.skp")
+        with open(src, "wb") as f:
+            f.write(b.to_bytes())
+
+        for edited in (False, True):
+            _reset_clean_scene()
+            import_skp.import_skp(src, bpy.context, keep_hierarchy=True, linked_duplicates=True)
+            groups = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+            assert len(groups) == 2 and groups[0].data is not groups[1].data, groups
+            if edited:
+                far = max(groups[1].data.vertices, key=lambda v: v.co.x + v.co.y)
+                far.co.x += 0.0015 * 0.0254
+            out = os.path.join(tmp, f"scaled_groups_{edited}.skp")
+            st = export_skp.export_skp(out, bpy.context)
+            assert st["instances_written"] == 2, st
+            assert st["definitions_written"] == (2 if edited else 1), (edited, st)
+            model = openskp.SkpFile.open(out).parse()
+            widths = sorted(
+                max(v.x for v in model.definitions[i.ref_idx].vertices.values()) * 100.0
+                for i in model.root.instances
+            )
+            want = 100.15 if edited else 100.0
+            assert abs(widths[0] - 100.0) < 1e-3 and abs(widths[1] - want) < 1e-3, widths
+    _reset_clean_scene()
+
+    print("test_small_edit_in_scaled_linked_group_is_kept: OK")
+
+
 if __name__ == "__main__":
     main()
     test_layer_export()
@@ -1775,3 +1820,4 @@ if __name__ == "__main__":
     test_blender_edge_cases_and_review_regressions()
     test_review_round2_regressions()
     test_linked_duplicates_export_round_trip()
+    test_small_edit_in_scaled_linked_group_is_kept()

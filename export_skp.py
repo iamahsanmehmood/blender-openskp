@@ -508,6 +508,15 @@ def _faces_approx_equal(faces_a, faces_b, pos_tol_in=2e-3) -> bool:
     return True
 
 
+def _faces_exact_key(faces):
+    """Hashable identity of a face list. Copies made by the importer have exactly
+    the same coordinates, and a tolerance in the mesh's own frame would swallow an
+    edit that a scaled placement makes visible (0.0015 in at 100x is 0.15 in)."""
+    return tuple(
+        (tuple(pts), spec[0] if spec else None, layer or "") for pts, spec, layer in faces
+    )
+
+
 def _children_approx_equal(
     ch_a,
     ch_b,
@@ -846,7 +855,7 @@ def export_skp(filepath, context):
     coll_own_radius_cache = {}
     visiting_colls = set()
     linked_mesh_def_cache = {}
-    mesh_defs_by_bucket = {}
+    mesh_def_by_faces = {}
     own_mesh_faces_cache = {}
     own_mesh_radius_cache = {}
 
@@ -936,11 +945,11 @@ def export_skp(filepath, context):
 
             base_name = linked_mesh_base_name(obj)
             if is_group_mesh:
-                bucket_key = ("group_mesh", base_name, len(faces), specs_key)
-                for existing_key in mesh_defs_by_bucket.get(bucket_key, ()):
-                    if _faces_approx_equal(faces, definitions[existing_key]["faces"]):
-                        linked_mesh_def_cache[ptr_key] = existing_key
-                        return existing_key
+                group_key = ("group_mesh", base_name, _faces_exact_key(faces))
+                existing_key = mesh_def_by_faces.get(group_key)
+                if existing_key is not None:
+                    linked_mesh_def_cache[ptr_key] = existing_key
+                    return existing_key
 
             stats["faces_skipped"] += local_skipped + area_skipped
             def_key = ("mesh", len(definitions))
@@ -954,9 +963,7 @@ def export_skp(filepath, context):
             def_order.append(def_key)
             linked_mesh_def_cache[ptr_key] = def_key
             if is_group_mesh:
-                mesh_defs_by_bucket.setdefault(
-                    ("group_mesh", base_name, len(faces), specs_key), []
-                ).append(def_key)
+                mesh_def_by_faces[group_key] = def_key
             return def_key
 
         local_polys, local_skipped, mats = _get_mesh_polys_and_materials(
@@ -975,14 +982,16 @@ def export_skp(filepath, context):
         base_name = linked_mesh_base_name(obj)
         if not is_group_mesh:
             unmod_key = linked_mesh_def_cache.get((obj.data.as_pointer(), specs_key))
-            if unmod_key is not None and _faces_approx_equal(faces, definitions[unmod_key]["faces"]):
+            if unmod_key is not None and _faces_exact_key(faces) == _faces_exact_key(
+                definitions[unmod_key]["faces"]
+            ):
                 return unmod_key
 
         kind = "group_mesh" if is_group_mesh else "mod_comp_mesh"
-        bucket_key = (kind, base_name, len(faces), specs_key)
-        for existing_key in mesh_defs_by_bucket.get(bucket_key, ()):
-            if _faces_approx_equal(faces, definitions[existing_key]["faces"]):
-                return existing_key
+        faces_key = (kind, base_name, _faces_exact_key(faces))
+        existing_key = mesh_def_by_faces.get(faces_key)
+        if existing_key is not None:
+            return existing_key
 
         stats["faces_skipped"] += local_skipped + area_skipped
         def_key = ("mesh", len(definitions))
@@ -994,7 +1003,7 @@ def export_skp(filepath, context):
             "max_radius_in": _compute_def_max_radius_in(faces, [], definitions),
         }
         def_order.append(def_key)
-        mesh_defs_by_bucket.setdefault(bucket_key, []).append(def_key)
+        mesh_def_by_faces[faces_key] = def_key
         return def_key
 
     def flatten_collection_faces(coll, world_prefix_bl, fallback_layer, out_faces, visited=frozenset()):
