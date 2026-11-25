@@ -109,9 +109,12 @@ than reimplementing SketchUp's material-inheritance rules here.
 - **Front and back paint**: a face painted differently on its two sides
   is imported as one polygon whose material mixes the two paints on
   Geometry > Backfacing (named `Front | Back`), so EEVEE and Cycles show
-  each side's own paint and nothing overlaps. Solid shading cannot read
+  each side's own paint and nothing overlaps. Unpainted faces and unpainted
+  sides receive the SketchUp model style's front and back face colours (#16).
+  Solid shading cannot read
   node trees, so it shows the painted side's colour when the other side is
-  unpainted, and the front paint when both sides are painted. A texture on
+  unpainted, and the front paint when both sides are painted (or the style's
+  front colour when neither side is painted). A texture on
   the back side is read from a second UV layer, `UVMap_back`. Export writes
   the front paint only; the back paint is not exported yet.
 - **Colorized textures** (SketchUp's `[Name]1` copies of a texture
@@ -158,7 +161,7 @@ grainy. Cycles ignores the setting. The same source image shared by
 several materials loads once, not once per material. SketchUp keeps a
 TIFF, TGA or GIF texture in the format it was imported in (BMP it converts to
 PNG), and a scene carries only PNG and JPEG unless the library is asked to
-keep the original: the bundled library (OpenSKP 1.6.0) can, so a TIFF or
+keep the original: the bundled library (OpenSKP 1.7.0) can, so a TIFF or
 TGA texture comes in like any other, packed into the `.blend`. A GIF does not: Blender opens it as a movie, so a material with a
 GIF texture is built without it. When a texture is left out for any reason,
 the import says so: a warning in Blender's status bar and, with every
@@ -174,34 +177,30 @@ after its scene tab, positioned and oriented from SketchUp's `eye`, `target`
 and `up` vectors (converted from inches to metres), configured as perspective
 (`PERSP`, vertical FOV matching `Page.fov`) or parallel (`ORTHO`, vertical
 frustum height matching `Page.ortho_height`), with the first scene set as the
-active `Scene.camera`. Requires the next OpenSKP release (after 1.6.0, with
-`InstancedScene.pages` from openskp#593) to be bundled; with the currently
-bundled OpenSKP 1.6.0 no extra parse runs and scene cameras stay off.
+active `Scene.camera`. Scenes whose `Save Camera Location` flag is unchecked
+(`Page.use_camera is False`) are skipped so tag-only or shadow-only scenes do
+not create extra cameras.
 
 **Annotations (texts and dimensions)** (import only, opt-in via *Import
 Annotations*, off by default so standard imports never run an extra model
 parse, #27): SketchUp positioned texts (`Definition.texts`) and linear
-dimensions (`Definition.dimensions` in classic files; root
-`SkpModel.dimensions` or owner-local `Definition.dimensions` in 2021+ VFF
-files) import into an `Annotations` child Collection under each SketchUp
+dimensions (`Definition.dimensions` in both classic and 2021+ VFF files) import
+into an `Annotations` child Collection under each SketchUp
 tag's Collection. Texts become Blender `FONT` text objects placed at their
 world-space `label_point` without drawing a separate leader arrow line
 (`sketchup_anchor_m` records the anchor). Each linear dimension becomes a thin
 3D `CURVE` line paired with a centered `FONT` text object showing the custom
 override text (with `"<>"` replaced by the measured distance) or the placed
-world-space measured distance in metres; with OpenSKP 1.6.0 the dimension line
-sits directly on `a`–`b` without an offset, and uses `Dimension.offset_vector`
-(with witness lines) when the bundled library provides it. With *Keep SketchUp
+world-space measured distance in metres, using `Dimension.offset_vector` (with
+witness lines) when the source dimension carries an offset and sitting directly
+on `a`–`b` otherwise. With *Keep SketchUp
 Hierarchy* on, annotations inside a component or group are parented to that
 placement's Empty so moving or hiding the component moves or hides its
-annotations with it. Screen texts (`leader_type == 0`), texts with no 3D position, 2021+ VFF
-axis-constrained dimensions (`5BD1`) whose `a`–`b` segment is not parallel to
-the constraint axis, 2021+ VFF texts, and 2021+ dimensions inside components
-(until openskp#623 is bundled) are skipped rather than misplaced and counted in
-the import report (with OpenSKP 1.6.0, an axis-constrained dimension in a
-classic pre-2021 file shows the `a`–`b` distance because the library does not
-give the constraint axis); errors anywhere in the annotation pass are caught
-and reported once without stopping the geometry import.
+annotations with it. Screen texts (`leader_type == 0`), texts with no 3D
+position, and axis-constrained dimensions whose `a`–`b` segment is not parallel
+to the constraint axis are skipped rather than misplaced and counted in the
+import report; errors anywhere in the annotation pass are caught and reported
+once without stopping the geometry import.
 
 **Layers** (SketchUp calls them "tags", import only) carry over too, as
 Collections: every placement lands in a Collection named for its own

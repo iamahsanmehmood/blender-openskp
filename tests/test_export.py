@@ -1243,7 +1243,7 @@ def test_review_round2_regressions():
                 bpy.data.objects.remove(o, do_unlink=True)
             else:
                 o.select_set(False)
-        mat0 = bpy.data.materials["openskp_material_0"]
+        mat0 = bpy.data.materials["openskp_material_0 | openskp_material_1"]
         want_rgb = (220, 40, 60)
         lr, lg, lb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in want_rgb))
         mat0.diffuse_color = (lr, lg, lb, 1.0)
@@ -1255,6 +1255,7 @@ def test_review_round2_regressions():
         m_5a = openskp.SkpFile.open(p_r2_5a).parse()
         assert len(m_5a.materials) == 1
         got_mat = m_5a.materials[0]
+        assert got_mat.name == "openskp_material_0", got_mat.name
         assert tuple(got_mat.color[:3]) == want_rgb, got_mat.color
 
         # --- R2.5b: Geometry Nodes 'Set Material' on evaluated mesh ---
