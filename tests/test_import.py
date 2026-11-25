@@ -1657,6 +1657,494 @@ def check_annotations_import():
     print("annotations_2017.skp & annotations_2021.skp: texts, dimensions, offset rule, and error isolation - OK")
 
 
+def _scene_snapshot():
+    """Deterministic snapshot of the current Blender scene for verifying that
+    ``linked_duplicates=False`` produces the exact same scene as ``main``."""
+    bpy.context.view_layer.update()
+
+    def find_lc(lc, coll):
+        if lc.collection == coll:
+            return lc
+        for ch in lc.children:
+            got = find_lc(ch, coll)
+            if got is not None:
+                return got
+        return None
+
+    colls = []
+    for c in sorted(bpy.data.collections, key=lambda x: x.name):
+        lc = find_lc(bpy.context.view_layer.layer_collection, c)
+        props = sorted((k, repr(v)) for k, v in c.items() if k != "_RNA_UI")
+        colls.append((
+            c.name,
+            sorted(ch.name for ch in c.children),
+            sorted(o.name for o in c.objects),
+            bool(c.hide_viewport),
+            bool(c.hide_render),
+            bool(lc.exclude) if lc is not None else None,
+            props,
+        ))
+
+    objs = []
+    for o in sorted(bpy.data.objects, key=lambda x: x.name):
+        mw = tuple(round(float(v), 6) for row in o.matrix_world for v in row)
+        props = sorted((k, repr(v)) for k, v in o.items() if k != "_RNA_UI")
+        objs.append((
+            o.name,
+            o.type,
+            o.instance_type,
+            o.instance_collection.name if o.instance_collection else None,
+            o.parent.name if o.parent else None,
+            o.data.name if o.data else None,
+            mw,
+            bool(o.hide_viewport),
+            bool(o.hide_render),
+            props,
+        ))
+
+    meshes = []
+    for m in sorted(bpy.data.meshes, key=lambda x: x.name):
+        props = sorted((k, repr(v)) for k, v in m.items() if k != "_RNA_UI")
+        mats = [
+            (mat.name, tuple(round(float(c), 5) for c in mat.diffuse_color)) if mat else None
+            for mat in m.materials
+        ]
+        meshes.append((
+            m.name,
+            len(m.vertices),
+            len(m.edges),
+            len(m.polygons),
+            mats,
+            [uv.name for uv in m.uv_layers],
+            props,
+        ))
+
+    return colls, objs, meshes
+
+
+def _reset_empty_scene():
+    for obj in list(bpy.data.objects):
+        bpy.data.objects.remove(obj, do_unlink=True)
+    for coll in list(bpy.data.collections):
+        bpy.data.collections.remove(coll)
+    for mesh in list(bpy.data.meshes):
+        bpy.data.meshes.remove(mesh)
+    for mat in list(bpy.data.materials):
+        bpy.data.materials.remove(mat)
+    for cam in list(bpy.data.cameras):
+        bpy.data.cameras.remove(cam)
+    for crv in list(bpy.data.curves):
+        bpy.data.curves.remove(crv)
+    for img in list(bpy.data.images):
+        bpy.data.images.remove(img)
+
+
+BASELINE_COMMIT = "28248002293a15eee0529ecdc7b88ad9c20c0691"
+
+
+def check_linked_duplicates_off_matches_main():
+    """With ``linked_duplicates`` off (the default), every fixture in both flat
+    and ``keep_hierarchy=True`` modes must produce the exact same Blender scene
+    and stats as the pinned pre-#35 baseline commit (#35)."""
+    import importlib.util
+    import subprocess
+    import tempfile
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    main_src = subprocess.check_output(
+        ["git", "-C", repo_root, "show", f"{BASELINE_COMMIT}:import_skp.py"],
+        stderr=subprocess.PIPE,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        main_mod_path = os.path.join(tmp, "_main_import_skp_ref.py")
+        with open(main_mod_path, "wb") as f:
+            f.write(main_src)
+        spec = importlib.util.spec_from_file_location("_main_import_skp_ref", main_mod_path)
+        main_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(main_mod)
+
+        fixture_paths = [
+            os.path.join(FIXTURES_DIR, f)
+            for f in sorted(os.listdir(FIXTURES_DIR))
+            if f.endswith(".skp")
+        ]
+        ld_fixture = os.path.join(FIXTURES_DIR, "linked_duplicates", "inherited_paint_2021.skp")
+        assert os.path.isfile(ld_fixture), ld_fixture
+        fixture_paths.append(ld_fixture)
+
+        comparisons = 0
+        for fpath in fixture_paths:
+            fname = os.path.basename(fpath)
+            for kh in (False, True):
+                _reset_empty_scene()
+                st_main = main_mod.import_skp(fpath, keep_hierarchy=kh)
+                snap_main = _scene_snapshot()
+
+                _reset_empty_scene()
+                st_curr = import_skp.import_skp(fpath, keep_hierarchy=kh)
+                snap_curr = _scene_snapshot()
+
+                assert st_curr == st_main, f"{fname} (kh={kh}): stats {st_curr} != baseline {st_main}"
+                assert snap_curr == snap_main, f"{fname} (kh={kh}): scene differs from {BASELINE_COMMIT[:12]}"
+                comparisons += 1
+
+        assert comparisons == len(fixture_paths) * 2 and comparisons > 0, comparisons
+    print(f"linked_duplicates=False parity: {comparisons} imports match {BASELINE_COMMIT[:12]} identically - OK")
+
+
+def _evaluated_world_triangles():
+    """List of world-space triangle corner triples ``((x,y,z), (x,y,z), (x,y,z))``
+    across all evaluated visible mesh instances in the current scene."""
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    tris = []
+    for inst in depsgraph.object_instances:
+        eval_obj = inst.object
+        if eval_obj.type != "MESH":
+            continue
+        vis_owner = inst.parent.original if inst.is_instance and inst.parent is not None else eval_obj.original
+        if not vis_owner.visible_get():
+            continue
+        mesh = eval_obj.to_mesh()
+        try:
+            mesh.calc_loop_triangles()
+            mw = inst.matrix_world.copy()
+            verts = mesh.vertices
+            for lt in mesh.loop_triangles:
+                pts = tuple(
+                    tuple(float(c) for c in (mw @ verts[vi].co))
+                    for vi in lt.vertices
+                )
+                tris.append(pts)
+        finally:
+            eval_obj.to_mesh_clear()
+    return tris
+
+
+def _assert_same_world_triangles(tris_a, tris_b, tol_m=1e-5, label=""):
+    """Verifies identical triangle count and <= ``tol_m`` (10 um) bidirectional
+    Hausdorff match on both triangle centroids and corner vertices (immune to
+    float32 decimal rounding boundaries)."""
+    import bisect
+
+    assert len(tris_a) == len(tris_b), f"{label}: triangle count {len(tris_a)} != {len(tris_b)}"
+    if not tris_a:
+        return
+
+    def check_cloud(pts_src, pts_dst, kind):
+        dst = sorted(pts_dst)
+        xs = [p[0] for p in dst]
+        worst = 0.0
+        for px, py, pz in pts_src:
+            lo = bisect.bisect_left(xs, px - tol_m * 2.0)
+            hi = bisect.bisect_right(xs, px + tol_m * 2.0)
+            best = float("inf")
+            for qx, qy, qz in dst[lo:hi]:
+                d2 = (px - qx) ** 2 + (py - qy) ** 2 + (pz - qz) ** 2
+                if d2 < best:
+                    best = d2
+            d = best ** 0.5
+            if d > worst:
+                worst = d
+        assert worst <= tol_m, f"{label} ({kind}): max world deviation {worst:.2e} m > {tol_m:.2e} m"
+
+    verts_a = {p for tri in tris_a for p in tri}
+    verts_b = {p for tri in tris_b for p in tri}
+    cents_a = [
+        ((t[0][0] + t[1][0] + t[2][0]) / 3.0, (t[0][1] + t[1][1] + t[2][1]) / 3.0, (t[0][2] + t[1][2] + t[2][2]) / 3.0)
+        for t in tris_a
+    ]
+    cents_b = [
+        ((t[0][0] + t[1][0] + t[2][0]) / 3.0, (t[0][1] + t[1][1] + t[2][1]) / 3.0, (t[0][2] + t[1][2] + t[2][2]) / 3.0)
+        for t in tris_b
+    ]
+    check_cloud(verts_a, verts_b, "verts a->b")
+    check_cloud(verts_b, verts_a, "verts b->a")
+    check_cloud(cents_a, cents_b, "centroids a->b")
+    check_cloud(cents_b, cents_a, "centroids b->a")
+
+
+def check_linked_duplicates_import():
+    """Verifies ``linked_duplicates=True`` (#35):
+    - Single parse (0 ``SkpFile.parse()`` calls, 1 ``_core.full_parse()`` call),
+    - No ``instance_type == 'COLLECTION'`` Empties and no ``(source geometry)``
+      collection, while world-space triangles match ``linked_duplicates=False``,
+    - Leaf components have no Empty and share one ``bpy.types.Mesh`` datablock
+      (editing a vertex updates every placement),
+    - Assembly components get an Empty named after the component and
+      ``Select Grouped > Children`` picks all parts,
+    - Groups keep today's ``keep_hierarchy`` tree with unshared ``Mesh`` data,
+    - Mirrored & non-uniformly scaled placements, hidden instances & hidden tags,
+      loose-edge curves, annotations, and instance-inherited paint (same paint
+      shares one mesh; different inherited paint gets distinct meshes)."""
+    import tempfile
+    import mathutils
+    import openskp
+    from openskp import _core
+
+    # 1. Single-parse verification + nested_components_2021.skp structure
+    nested_path = os.path.join(FIXTURES_DIR, "nested_components_2021.skp")
+    _reset_empty_scene()
+    import_skp.import_skp(nested_path, keep_hierarchy=True, linked_duplicates=False)
+    ref_nested_tris = _evaluated_world_triangles()
+    assert len(ref_nested_tris) > 0
+
+    _reset_empty_scene()
+    orig_parse = openskp.SkpFile.parse
+    orig_full_parse = _core.full_parse
+    parse_calls = 0
+    full_parse_calls = 0
+
+    def count_parse(self, *a, **kw):
+        nonlocal parse_calls
+        parse_calls += 1
+        return orig_parse(self, *a, **kw)
+
+    def count_full_parse(*a, **kw):
+        nonlocal full_parse_calls
+        full_parse_calls += 1
+        return orig_full_parse(*a, **kw)
+
+    openskp.SkpFile.parse = count_parse
+    _core.full_parse = count_full_parse
+    try:
+        st_ld = import_skp.import_skp(nested_path, keep_hierarchy=True, linked_duplicates=True)
+    finally:
+        openskp.SkpFile.parse = orig_parse
+        _core.full_parse = orig_full_parse
+
+    assert parse_calls == 0, f"expected 0 SkpFile.parse() calls, got {parse_calls}"
+    assert full_parse_calls == 1, f"expected 1 _core.full_parse() call, got {full_parse_calls}"
+    assert not [o for o in bpy.data.objects if o.instance_type == "COLLECTION"]
+    assert not [c for c in bpy.data.collections if c.name.endswith("(source geometry)")]
+    got_nested_tris = _evaluated_world_triangles()
+    _assert_same_world_triangles(got_nested_tris, ref_nested_tris, label="nested_components_2021.skp")
+
+    # Leaf component Bolt: zero Empties, all Bolt MESH objects share ONE Mesh datablock
+    bolt_empties = [o for o in bpy.data.objects if o.type == "EMPTY" and _base_name(o.name) == "Bolt"]
+    bolt_meshes = [o for o in bpy.data.objects if o.type == "MESH" and o.get("sketchup_definition") == "Bolt"]
+    assert not bolt_empties, bolt_empties
+    assert len(bolt_meshes) == 8, len(bolt_meshes)
+    assert len({o.data for o in bolt_meshes}) == 1, {o.data.name for o in bolt_meshes}
+
+    # Assembly components Frame and Bracket: each gets a PLAIN_AXES Empty, and
+    # Select Grouped > Children on Frame selects its own mesh + Brackets + Bolts
+    frame_empties = [o for o in bpy.data.objects if o.type == "EMPTY" and o.get("sketchup_definition") == "Frame"]
+    bracket_empties = [o for o in bpy.data.objects if o.type == "EMPTY" and o.get("sketchup_definition") == "Bracket"]
+    assert len(frame_empties) == 2 and len(bracket_empties) == 4, (len(frame_empties), len(bracket_empties))
+
+    for o in bpy.data.objects:
+        o.select_set(False)
+    f0 = frame_empties[0]
+    f0.select_set(True)
+    bpy.context.view_layer.objects.active = f0
+    bpy.ops.object.select_grouped(extend=True, type="CHILDREN_RECURSIVE")
+    selected = set(bpy.context.selected_objects)
+    # 1 Frame Empty + 1 Frame own mesh + 2 Bracket Empties + 2 Bracket own meshes + 4 Bolt meshes = 10
+    assert len(selected) == 10, sorted((o.name, o.type) for o in selected)
+    assert sum(1 for o in selected if o.get("sketchup_definition") == "Bolt") == 4
+
+    # Editing 1 vertex on Bolt's shared Mesh moves that vertex on all 8 Bolt placements
+    shared_bolt_data = bolt_meshes[0].data
+    before_world_v0 = [o.matrix_world @ o.data.vertices[0].co for o in bolt_meshes]
+    shared_bolt_data.vertices[0].co = shared_bolt_data.vertices[0].co + mathutils.Vector((0.25, 0.0, 0.0))
+    bpy.context.view_layer.update()
+    after_world_v0 = [o.matrix_world @ o.data.vertices[0].co for o in bolt_meshes]
+    assert all((a - b).length > 0.2 for a, b in zip(after_world_v0, before_world_v0))
+
+    # 2. World-triangle parity on capilla_quiroz_v17.skp (textures + curves) & gondola_v20.skp (81 placements + curves)
+    for fx in ("capilla_quiroz_v17.skp", "gondola_v20.skp"):
+        fx_path = os.path.join(FIXTURES_DIR, fx)
+        _reset_empty_scene()
+        import_skp.import_skp(fx_path, keep_hierarchy=True, linked_duplicates=False)
+        tris_ref = _evaluated_world_triangles()
+
+        _reset_empty_scene()
+        import_skp.import_skp(fx_path, keep_hierarchy=True, linked_duplicates=True)
+        assert not [o for o in bpy.data.objects if o.instance_type == "COLLECTION"], fx
+        assert not [c for c in bpy.data.collections if c.name.endswith("(source geometry)")], fx
+        tris_ld = _evaluated_world_triangles()
+        _assert_same_world_triangles(tris_ld, tris_ref, label=fx)
+
+    # 3. Groups keep today's hierarchy & get independent unshared Mesh datablocks
+    # In nesting_2021.skp, Outer (is_group=True) > Shelf (component, is_group=False) > Inner (is_group=True):
+    nest_path = os.path.join(FIXTURES_DIR, "nesting_2021.skp")
+    _reset_empty_scene()
+    import_skp.import_skp(nest_path, keep_hierarchy=False, linked_duplicates=False)
+    nest_ref_tris = _evaluated_world_triangles()
+
+    _reset_empty_scene()
+    st_nest_kh = import_skp.import_skp(nest_path, keep_hierarchy=True, linked_duplicates=True)
+    assert st_nest_kh["groups"] == 2, st_nest_kh
+    _assert_same_world_triangles(_evaluated_world_triangles(), nest_ref_tris, label="nesting_2021 (kh=True)")
+    grp_empties = [o for o in bpy.data.objects if o.type == "EMPTY"]
+    grp_meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+    assert len(grp_empties) == 2 and len(grp_meshes) == 3, (grp_empties, grp_meshes)
+    assert len({o.data for o in grp_meshes}) == 3
+    outer_e = next(o for o in grp_empties if o.parent is None)
+    shelf_e = next(o for o in grp_empties if o.parent == outer_e)
+    inner_m = next(o for o in grp_meshes if _base_name(o.name) == "Inner")
+    assert _base_name(outer_e.name) == "Outer" and _base_name(shelf_e.name) == "Shelf"
+    assert inner_m.parent == shelf_e  # leaf group has no Empty of its own
+
+    # With keep_hierarchy=False on nesting_2021.skp: Outer (group) has NO Empty,
+    # while Shelf (component containing group Inner) DOES get an Empty with Shelf+Inner parented under it!
+    _reset_empty_scene()
+    st_nest_flat = import_skp.import_skp(nest_path, keep_hierarchy=False, linked_duplicates=True)
+    assert st_nest_flat["groups"] == 1, st_nest_flat
+    (shelf_only_e,) = [o for o in bpy.data.objects if o.type == "EMPTY"]
+    assert _base_name(shelf_only_e.name) == "Shelf" and shelf_only_e.parent is None
+    flat_meshes_by_name = {_base_name(o.name): o for o in bpy.data.objects if o.type == "MESH"}
+    assert flat_meshes_by_name["Outer"].parent is None
+    assert flat_meshes_by_name["Shelf"].parent == shelf_only_e
+    assert flat_meshes_by_name["Inner"].parent == shelf_only_e
+    _assert_same_world_triangles(_evaluated_world_triangles(), nest_ref_tris, label="nesting_2021 (kh=False)")
+
+    # Pure nested groups (OuterGrp > InnerGrp, plus two placements of one group def -> unshared meshes):
+    with tempfile.TemporaryDirectory() as tmp_grp:
+        bg = openskp.create()
+        with bg.add_component_definition("InnerGrpDef") as ig_def:
+            ig_def.add_face([(0, 0, 0), (6, 0, 0), (6, 6, 0), (0, 6, 0)])
+        with bg.add_group("OuterGrp") as og:
+            og.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
+            og.add_group_instance(ig_def, name="InnerGrpA", translation=(2.0, 2.0, 4.0))
+            og.add_group_instance(ig_def, name="InnerGrpB", translation=(10.0, 2.0, 4.0))
+        pure_grp_skp = os.path.join(tmp_grp, "pure_groups.skp")
+        with open(pure_grp_skp, "wb") as f:
+            f.write(bg.to_bytes())
+
+        _reset_empty_scene()
+        st_pg_kh = import_skp.import_skp(pure_grp_skp, keep_hierarchy=True, linked_duplicates=True)
+        assert st_pg_kh["groups"] == 1  # OuterGrp Empty only; leaf groups InnerGrpA/B have no Empty
+        pg_meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+        assert len(pg_meshes) == 3 and len({o.data for o in pg_meshes}) == 3  # unshared group meshes!
+
+        _reset_empty_scene()
+        st_pg_flat = import_skp.import_skp(pure_grp_skp, keep_hierarchy=False, linked_duplicates=True)
+        assert st_pg_flat["groups"] == 0
+        assert not [o for o in bpy.data.objects if o.type == "EMPTY"]
+        pg_flat_meshes = [o for o in bpy.data.objects if o.type == "MESH"]
+        assert len(pg_flat_meshes) == 3 and len({o.data for o in pg_flat_meshes}) == 3
+
+    # 4. Mirrored, non-uniformly scaled, hidden instances/tags, and instance-inherited paint
+    # Uses SDK-saved 2021 VFF fixture (so D107 instance paint, D207 tags, and 8E3C hidden tags
+    # are exercised with openskp 1.6.0 as well as newer releases).
+    synth_skp = os.path.join(FIXTURES_DIR, "linked_duplicates", "inherited_paint_2021.skp")
+    _scan_fixture_no_private_paths(synth_skp)
+
+    # Reference world geometry from linked_duplicates=False (HiddenInst stays visible, matching main)
+    _reset_empty_scene()
+    import_skp.import_skp(synth_skp, keep_hierarchy=True, linked_duplicates=False)
+    synth_ref_tris = _evaluated_world_triangles()
+    assert len(synth_ref_tris) == 20, len(synth_ref_tris)  # 5 visible placements x 4 triangles
+
+    _reset_empty_scene()
+    st_inh = import_skp.import_skp(synth_skp, keep_hierarchy=True, linked_duplicates=True)
+    bpy.context.view_layer.update()
+    assert st_inh["unique_meshes"] == 3 and st_inh["placements"] == 6, st_inh
+    assert st_inh["unique_layers"] == 3 and st_inh["hidden_layers"] == 1, st_inh
+
+    by_name = {_base_name(o.name): o for o in bpy.data.objects if o.type == "MESH"}
+    red_a = by_name["RedA"]
+    red_mir = by_name["RedMirroredX"]
+    blue_sc = by_name["BlueScaled"]
+    unp_mir = by_name["UnpaintedMirroredZ"]
+    hid_inst = by_name["HiddenInst"]
+    hid_tag_obj = by_name["OnHiddenTag"]
+
+    # Same inherited paint -> shared Mesh datablock; different paint -> distinct Mesh datablocks
+    assert red_a.data is red_mir.data and red_a.data is hid_inst.data
+    assert blue_sc.data is hid_tag_obj.data
+    assert red_a.data is not blue_sc.data
+    assert red_a.data is not unp_mir.data
+    assert blue_sc.data is not unp_mir.data
+
+    # Mirrored determinants (< 0), non-uniform scale, visible HiddenInst, and hidden tag preserved
+    assert red_mir.matrix_world.determinant() < 0.0
+    assert unp_mir.matrix_world.determinant() < 0.0
+    assert abs(blue_sc.matrix_world.determinant() - 1.5) < 1e-5
+    assert not hid_inst.hide_viewport and not hid_inst.hide_render and hid_inst.visible_get()
+    hid_coll = bpy.data.collections["HiddenTag"]
+    assert hid_coll.hide_viewport and hid_coll.hide_render
+    assert not hid_tag_obj.visible_get()
+    _assert_same_world_triangles(_evaluated_world_triangles(), synth_ref_tris, label="inherited_paint_2021")
+
+    # 5. Annotations with linked_duplicates=True:
+    # (a) component dimension parented to leaf MESH "Beam 1"
+    _reset_empty_scene()
+    annot_path = os.path.join(FIXTURES_DIR, "annotations_2017.skp")
+    st_ann = import_skp.import_skp(annot_path, keep_hierarchy=True, import_annotations=True, linked_duplicates=True)
+    bpy.context.view_layer.update()
+    assert st_ann["texts_imported"] == 1 and st_ann["dimensions_imported"] == 2
+    beam_mesh = next(o for o in bpy.data.objects if o.type == "MESH" and _base_name(o.name) == "Beam 1")
+    beam_dim = next(
+        o for o in bpy.data.objects
+        if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"
+        and abs(o["sketchup_distance_inches"] - 24.0) < 1e-4
+    )
+    assert beam_dim.parent == beam_mesh
+    orig_mid = beam_dim.matrix_world.translation.copy()
+    beam_mesh.location = beam_mesh.location + mathutils.Vector((0.5, -0.25, 0.1))
+    bpy.context.view_layer.update()
+    assert (beam_dim.matrix_world.translation - (orig_mid + mathutils.Vector((0.5, -0.25, 0.1)))).length < 1e-5
+
+    # (b) With Keep Hierarchy off and Import Annotations on, a root group containing a text
+    # gets NO extra Empty, and moving the root group moves its text with it.
+    with tempfile.TemporaryDirectory() as tmp_rg:
+        brg = openskp.create()
+        with brg.add_group("RootAnnotatedGrp", translation=(10.0, 20.0, 0.0)) as rg:
+            rg.add_face([(0, 0, 0), (12, 0, 0), (12, 12, 0), (0, 12, 0)])
+            rg.add_text("Root group note", point=(2.0, 3.0, 4.0), leader=(3.0, 3.0, 4.0))
+        rg_skp = os.path.join(tmp_rg, "root_grp_text.skp")
+        with open(rg_skp, "wb") as f:
+            f.write(brg.to_bytes())
+
+        _reset_empty_scene()
+        st_rg = import_skp.import_skp(
+            rg_skp,
+            keep_hierarchy=False,
+            import_annotations=True,
+            linked_duplicates=True,
+        )
+        bpy.context.view_layer.update()
+        assert st_rg["groups"] == 0, st_rg
+        assert st_rg["texts_imported"] == 1, st_rg
+        assert not [o for o in bpy.data.objects if o.type == "EMPTY"], [o.name for o in bpy.data.objects]
+        (rg_mesh,) = [o for o in bpy.data.objects if o.type == "MESH"]
+        (rg_txt,) = [o for o in bpy.data.objects if o.type == "FONT"]
+        assert rg_txt.parent == rg_mesh
+        want_txt_pos = mathutils.Vector(((10.0 + 5.0) * 0.0254, (20.0 + 6.0) * 0.0254, (4.0 + 4.0) * 0.0254))
+        assert (rg_txt.matrix_world.translation - want_txt_pos).length < 1e-5, (
+            tuple(rg_txt.matrix_world.translation), tuple(want_txt_pos)
+        )
+        move_delta = mathutils.Vector((1.2, -0.8, 0.4))
+        rg_mesh.location = rg_mesh.location + move_delta
+        bpy.context.view_layer.update()
+        assert (rg_txt.matrix_world.translation - (want_txt_pos + move_delta)).length < 1e-5
+
+    # Also test operator property wiring directly
+    already_registered = hasattr(bpy.types, "IMPORT_SCENE_OT_openskp")
+    addon_pkg = _load_module("__init__")
+    if not already_registered:
+        addon_pkg.register()
+    try:
+        _reset_empty_scene()
+        res = bpy.ops.import_scene.openskp(
+            filepath=nested_path,
+            keep_hierarchy=True,
+            linked_duplicates=True,
+            import_annotations=False,
+        )
+        assert res == {"FINISHED"}, res
+        assert not [o for o in bpy.data.objects if o.instance_type == "COLLECTION"]
+    finally:
+        if not already_registered:
+            addon_pkg.unregister()
+
+    print("linked_duplicates=True import: sharing, Empties, Select Grouped > Children, groups, mirror/scale, hidden & paint - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -1681,7 +2169,9 @@ def main():
     check_original_textures_are_loaded()
     check_hierarchy("capilla_quiroz_v17.skp", expected_groups=0)
     check_nesting_tree()
-    print("test_import: all fixtures OK (including source-geometry discoverability)")
+    check_linked_duplicates_off_matches_main()
+    check_linked_duplicates_import()
+    print("test_import: all fixtures OK (including source-geometry discoverability and linked duplicates)")
 
 
 if __name__ == "__main__":

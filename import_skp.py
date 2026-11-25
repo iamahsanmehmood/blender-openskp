@@ -134,6 +134,7 @@ _YUP_TO_ZUP = mathutils.Matrix(
         (0.0, 0.0, 0.0, 1.0),
     )
 )
+_ZUP_TO_YUP = _YUP_TO_ZUP.transposed()
 
 
 def _gltf_matrix_to_blender(m):
@@ -628,24 +629,10 @@ def _choose_front_triangles(verts, tris, twin_of):
     return chosen
 
 
-def _build_mesh_object(name, resource, gltf_materials, material_cache, textures, image_cache):
-    """Builds one Mesh Object (local space, at the origin) from an
-    InstancedMeshResource's primitives - already-triangulated, so this is
-    a direct from_pydata() with no triangulation of its own to do.
-
-    Each primitive is already grouped by a single resolved material (see
-    openskp.instanced_scene.mesh_resource_for's own docstring) - its
-    material_index is used both to pick/build the right Blender Material
-    and to set each of its triangles' own polygon.material_index, so the
-    mesh's material slots and per-face assignment match the source file's
-    own per-face paint, not just one flat color for the whole object.
-
-    A face painted differently on its two sides arrives as two single-sided
-    triangle sets with identical vertices and opposite winding (see this
-    module's "Front and back paint" section). Each such pair becomes one
-    polygon with a front/back material (_get_or_build_pair_material), and
-    the twin is dropped, so nothing overlaps.
-    """
+def _build_mesh_datablock(
+    name, resource, gltf_materials, material_cache, textures, image_cache, zup_vertices=False
+):
+    """Builds one ``bpy.types.Mesh`` datablock from an ``InstancedMeshResource``."""
     verts = []
     vert_uvs = []
     tris = []  # (a, b, c, material_index) per source triangle, in order
@@ -721,6 +708,9 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache, textures,
             corners.append(index)
         out_tris.append(tuple(corners))
 
+    if zup_vertices:
+        out_verts = [(vx, -vz, vy) for vx, vy, vz in out_verts]
+
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(out_verts, [], out_tris)
     for mat in mesh_materials:
@@ -748,8 +738,15 @@ def _build_mesh_object(name, resource, gltf_materials, material_cache, textures,
             back_layer.data.foreach_set("uv", back_uvs)
 
     mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    return mesh
+
+
+def _build_mesh_object(name, resource, gltf_materials, material_cache, textures, image_cache):
+    """Builds one Mesh Object (local space, at the origin) from an
+    InstancedMeshResource's primitives - already-triangulated, so this is
+    a direct from_pydata() with no triangulation of its own to do."""
+    mesh = _build_mesh_datablock(name, resource, gltf_materials, material_cache, textures, image_cache)
+    return bpy.data.objects.new(name, mesh)
 
 
 def _get_or_build_layer_collection(layer_name, layer_collection_cache, root_collection):
@@ -808,26 +805,18 @@ def _get_or_build_collection(
     return coll
 
 
-def _build_curve_object(name, resource):
-    """Builds one edges-only Mesh Object (local space, at the origin) from
-    an InstancedCurveResource's runs - no faces, so Blender renders these
-    as plain construction lines, matching what the source file actually
-    stores for loose edges (a light-gauge-steel/structural-framing member
-    drawn as a line, not a solid).
-
-    Renders each run's own chords (LocalCurve.points_m) rather than
-    reconstructing a true circular arc from LocalCurve.arc when present -
-    a well-tessellated arc's chords are visually indistinguishable at any
-    reasonable zoom, and a genuine smooth-curve (bpy.data.curves) import
-    for the analytic-arc case is future scope, not required for loose
-    edges to stop being silently invisible.
-    """
+def _build_curve_datablock(name, resource, zup_vertices=False):
+    """Builds one edges-only ``bpy.types.Mesh`` datablock from an
+    ``InstancedCurveResource``."""
     verts = []
     edges = []
     for curve in resource.curves:
         base = len(verts)
         pts = curve.points_m
-        verts.extend(pts)
+        if zup_vertices:
+            verts.extend((px, -pz, py) for px, py, pz in pts)
+        else:
+            verts.extend(pts)
         for i in range(len(pts) - 1):
             edges.append((base + i, base + i + 1))
         if curve.closed and len(pts) > 2:
@@ -836,8 +825,15 @@ def _build_curve_object(name, resource):
     mesh = bpy.data.meshes.new(name)
     mesh.from_pydata(verts, edges, [])
     mesh.update()
-    obj = bpy.data.objects.new(name, mesh)
-    return obj
+    return mesh
+
+
+def _build_curve_object(name, resource):
+    """Builds one edges-only Mesh Object (local space, at the origin) from
+    an InstancedCurveResource's runs - no faces, so Blender renders these
+    as plain construction lines."""
+    mesh = _build_curve_datablock(name, resource)
+    return bpy.data.objects.new(name, mesh)
 
 
 def _get_or_build_curve_collection(
@@ -988,6 +984,311 @@ def _place_node(
             stats,
             keep_hierarchy,
             own_parent,
+            node_parents=node_parents,
+        )
+
+
+def _collect_linked_duplicates_node_meta(scene_root, raw_parsed):
+    """Maps ``id(node) -> is_group`` by walking ``scene_root`` in lockstep with
+    ``raw_parsed["defs_dict"]`` (same 1-to-1 ``builder.instances`` order
+    ``openskp.instanced_scene.build_instanced_scene`` emits), falling back to
+    ``InstancedNode.is_group`` when ``raw_parsed`` is absent."""
+    defs_dict = (raw_parsed or {}).get("defs_dict") or {}
+    meta = {}
+
+    def walk_meta(node, def_id):
+        d = defs_dict.get(def_id) if def_id is not None else None
+        builder = d.get("builder") if isinstance(d, dict) else None
+        inst_list = getattr(builder, "instances", None) or ()
+        for idx, child_node in enumerate(node.children):
+            if idx < len(inst_list):
+                inst_dict = inst_list[idx]
+                ref_idx = inst_dict.get("ref_idx")
+                child_d = defs_dict.get(ref_idx) or {}
+                is_group = bool(child_d.get("is_group", getattr(child_node, "is_group", False)))
+                meta[id(child_node)] = is_group
+                walk_meta(child_node, ref_idx)
+            else:
+                meta[id(child_node)] = bool(getattr(child_node, "is_group", False))
+                walk_meta(child_node, None)
+
+    walk_meta(scene_root, "ROOT")
+    return meta
+
+
+def _mesh_resource_paint_signature(resource):
+    """Key capturing a definition's resolved per-primitive materials and UVs so
+    component placements on differently coloured tags whose faces are already
+    painted share one ``Mesh`` datablock, while placements that genuinely
+    inherit different instance/tag paints get distinct ``Mesh`` datablocks."""
+    return (
+        resource.definition_id,
+        tuple((p.material_index, tuple(p.indices), tuple(p.uvs)) for p in resource.primitives),
+    )
+
+
+def _place_node_linked_duplicates(
+    node,
+    parent_matrix,
+    resources_by_id,
+    comp_mesh_by_res_id,
+    comp_mesh_by_paint_sig,
+    group_mesh_templates,
+    curve_resources_by_id,
+    comp_curve_by_def_id,
+    group_curve_templates,
+    layer_collection_cache,
+    root_collection,
+    gltf_materials,
+    material_cache,
+    textures,
+    image_cache,
+    stats,
+    node_meta,
+    keep_hierarchy=False,
+    parent_object=None,
+    is_root=False,
+    node_parents=None,
+):
+    """Places one ``InstancedNode`` for ``linked_duplicates=True`` (#35):
+    - Component parts become ``MESH`` objects sharing their ``bpy.types.Mesh``
+      datablock (per resolved paint signature), placed directly in SketchUp Z-up
+      local space with zero collection instances.
+    - An ``Empty`` is created for a component ONLY when ``node.children`` is
+      non-empty (it contains nested components or groups); it gets the
+      component's name, and its own geometry plus nested children are parented
+      under it so ``Select Grouped > Children`` selects all parts.
+    - Groups keep today's ``keep_hierarchy`` behaviour, with an independent
+      unshared ``Mesh`` datablock per group placement."""
+    local_matrix = _gltf_matrix_to_blender(node.matrix)
+    world_matrix = parent_matrix @ local_matrix
+    world_bl = _YUP_TO_ZUP @ world_matrix
+    world_zup = mathutils.Matrix.Identity(4) if is_root else (world_bl @ _ZUP_TO_YUP)
+    sketchup_layer_coll = _get_or_build_layer_collection(node.layer, layer_collection_cache, root_collection)
+
+    is_group = bool(node_meta.get(id(node), False))
+
+    def place_zup(obj, parent):
+        sketchup_layer_coll.objects.link(obj)
+        obj["openskp_zup_frame"] = True
+        if parent is not None:
+            local = parent[1].inverted_safe() @ world_zup
+            obj.parent = parent[0]
+            obj.matrix_basis = local
+            obj.matrix_parent_inverse = local @ obj.matrix_basis.inverted_safe()
+        else:
+            obj.matrix_world = world_zup
+
+    def get_component_mesh(res_id, def_name):
+        if res_id in comp_mesh_by_res_id:
+            return comp_mesh_by_res_id[res_id]
+        resource = resources_by_id[res_id]
+        sig = _mesh_resource_paint_signature(resource)
+        if sig in comp_mesh_by_paint_sig:
+            mesh = comp_mesh_by_paint_sig[sig]
+            comp_mesh_by_res_id[res_id] = mesh
+            return mesh
+        mesh_name = def_name or resource.definition_name or res_id
+        mesh = _build_mesh_datablock(
+            mesh_name, resource, gltf_materials, material_cache, textures, image_cache, zup_vertices=True
+        )
+        mesh["sketchup_component_definition"] = def_name or resource.definition_name or mesh_name
+        comp_mesh_by_res_id[res_id] = mesh
+        comp_mesh_by_paint_sig[sig] = mesh
+        stats["unique_meshes"] += 1
+        stats["triangles"] += sum(len(p.indices) // 3 for p in resource.primitives)
+        return mesh
+
+    def get_unshared_mesh(res_id):
+        resource = resources_by_id[res_id]
+        mesh_name = resource.definition_name or res_id
+        if res_id not in group_mesh_templates:
+            mesh = _build_mesh_datablock(
+                mesh_name, resource, gltf_materials, material_cache, textures, image_cache, zup_vertices=True
+            )
+            group_mesh_templates[res_id] = (mesh, False)
+        tmpl, used_once = group_mesh_templates[res_id]
+        if not used_once:
+            group_mesh_templates[res_id] = (tmpl, True)
+            out_mesh = tmpl
+        else:
+            out_mesh = tmpl.copy()
+        stats["unique_meshes"] += 1
+        stats["triangles"] += sum(len(p.indices) // 3 for p in resource.primitives)
+        return out_mesh
+
+    def get_component_curve_mesh(curve_id, def_name):
+        resource = curve_resources_by_id[curve_id]
+        def_key = resource.definition_id
+        if def_key in comp_curve_by_def_id:
+            return comp_curve_by_def_id[def_key]
+        cname = (def_name or resource.definition_name or curve_id) + " (lines)"
+        mesh = _build_curve_datablock(cname, resource, zup_vertices=True)
+        comp_curve_by_def_id[def_key] = mesh
+        stats["unique_curve_meshes"] += 1
+        stats["curve_runs"] += len(resource.curves)
+        return mesh
+
+    def get_unshared_curve_mesh(curve_id):
+        resource = curve_resources_by_id[curve_id]
+        cname = (resource.definition_name or curve_id) + " (lines)"
+        if curve_id not in group_curve_templates:
+            mesh = _build_curve_datablock(cname, resource, zup_vertices=True)
+            group_curve_templates[curve_id] = (mesh, False)
+        tmpl, used_once = group_curve_templates[curve_id]
+        if not used_once:
+            group_curve_templates[curve_id] = (tmpl, True)
+            out_mesh = tmpl
+        else:
+            out_mesh = tmpl.copy()
+        stats["unique_curve_meshes"] += 1
+        stats["curve_runs"] += len(resource.curves)
+        return out_mesh
+
+    own_parent = parent_object
+    rep_parent = None
+
+    if is_root:
+        if node.mesh_resource_id is not None:
+            root_mesh = get_unshared_mesh(node.mesh_resource_id)
+            root_obj = bpy.data.objects.new(root_mesh.name, root_mesh)
+            place_zup(root_obj, None)
+            stats["placements"] += 1
+        if node.curve_resource_id is not None:
+            root_cmesh = get_unshared_curve_mesh(node.curve_resource_id)
+            root_cobj = bpy.data.objects.new(root_cmesh.name, root_cmesh)
+            place_zup(root_cobj, None)
+            stats["curve_placements"] += 1
+    elif not is_group:
+        comp_display_name = (
+            (node.definition_name if getattr(node, "name_is_generated", False) and node.definition_name else node.name)
+            or node.definition_name
+            or "Component"
+        )
+        def_name = node.definition_name or comp_display_name
+
+        if node.children:
+            comp_empty = bpy.data.objects.new(comp_display_name, None)
+            comp_empty.empty_display_type = "PLAIN_AXES"
+            comp_empty.empty_display_size = 0.1
+            comp_empty["sketchup_definition"] = def_name
+            comp_empty["sketchup_is_component"] = True
+            if getattr(node, "guid", ""):
+                comp_empty["sketchup_guid"] = node.guid
+            place_zup(comp_empty, parent_object)
+            own_parent = (comp_empty, world_zup)
+            rep_parent = own_parent
+            stats["groups"] += 1
+
+            if node.mesh_resource_id is not None:
+                smesh = get_component_mesh(node.mesh_resource_id, def_name)
+                own_mobj = bpy.data.objects.new(comp_display_name, smesh)
+                own_mobj["sketchup_definition"] = def_name
+                own_mobj["sketchup_own_geometry"] = True
+                place_zup(own_mobj, own_parent)
+                stats["placements"] += 1
+
+            if node.curve_resource_id is not None:
+                scmesh = get_component_curve_mesh(node.curve_resource_id, def_name)
+                own_cobj = bpy.data.objects.new(f"{comp_display_name} (lines)", scmesh)
+                own_cobj["sketchup_own_geometry"] = True
+                place_zup(own_cobj, own_parent)
+                stats["curve_placements"] += 1
+        else:
+            leaf_mesh_parent = parent_object
+            if node.mesh_resource_id is not None:
+                smesh = get_component_mesh(node.mesh_resource_id, def_name)
+                mobj = bpy.data.objects.new(comp_display_name, smesh)
+                mobj["sketchup_definition"] = def_name
+                mobj["sketchup_is_component"] = True
+                if getattr(node, "guid", ""):
+                    mobj["sketchup_guid"] = node.guid
+                place_zup(mobj, parent_object)
+                leaf_mesh_parent = (mobj, world_zup)
+                rep_parent = leaf_mesh_parent
+                stats["placements"] += 1
+
+            if node.curve_resource_id is not None:
+                scmesh = get_component_curve_mesh(node.curve_resource_id, def_name)
+                cobj = bpy.data.objects.new(f"{comp_display_name} (lines)", scmesh)
+                if getattr(node, "guid", "") and rep_parent is None:
+                    cobj["sketchup_guid"] = node.guid
+                place_zup(cobj, leaf_mesh_parent)
+                if rep_parent is None:
+                    rep_parent = (cobj, world_zup)
+                stats["curve_placements"] += 1
+    else:
+        has_group_empty = bool(keep_hierarchy and node.children)
+        if has_group_empty:
+            group = bpy.data.objects.new(node.name or node.definition_name or "Group", None)
+            group.empty_display_type = "PLAIN_AXES"
+            group.empty_display_size = 0.1
+            group["sketchup_is_group"] = True
+            if node.definition_name:
+                group["sketchup_definition"] = node.definition_name
+            if getattr(node, "guid", ""):
+                group["sketchup_guid"] = node.guid
+            place_zup(group, parent_object)
+            own_parent = (group, world_zup)
+            rep_parent = own_parent
+            stats["groups"] += 1
+
+        if node.mesh_resource_id is not None:
+            gmesh = get_unshared_mesh(node.mesh_resource_id)
+            gobj = bpy.data.objects.new(node.name or node.mesh_resource_id, gmesh)
+            gobj["sketchup_is_group"] = True
+            if has_group_empty:
+                gobj["sketchup_own_geometry"] = True
+            g_def_name = node.definition_name or resources_by_id[node.mesh_resource_id].definition_name
+            if g_def_name:
+                gobj["sketchup_definition"] = g_def_name
+            if getattr(node, "guid", ""):
+                gobj["sketchup_guid"] = node.guid
+            place_zup(gobj, own_parent)
+            if rep_parent is None:
+                rep_parent = (gobj, world_zup)
+            stats["placements"] += 1
+
+        if node.curve_resource_id is not None:
+            gcmesh = get_unshared_curve_mesh(node.curve_resource_id)
+            gcobj = bpy.data.objects.new((node.name or node.curve_resource_id) + " (lines)", gcmesh)
+            gcobj["sketchup_is_group"] = True
+            if has_group_empty:
+                gcobj["sketchup_own_geometry"] = True
+            gc_def_name = node.definition_name or curve_resources_by_id[node.curve_resource_id].definition_name
+            if gc_def_name:
+                gcobj["sketchup_definition"] = gc_def_name
+            if getattr(node, "guid", ""):
+                gcobj["sketchup_guid"] = node.guid
+            place_zup(gcobj, own_parent)
+            if rep_parent is None:
+                rep_parent = (gcobj, world_zup)
+            stats["curve_placements"] += 1
+
+    if node_parents is not None and rep_parent is not None:
+        node_parents[id(node)] = rep_parent
+
+    for child in node.children:
+        _place_node_linked_duplicates(
+            child,
+            world_matrix,
+            resources_by_id,
+            comp_mesh_by_res_id,
+            comp_mesh_by_paint_sig,
+            group_mesh_templates,
+            curve_resources_by_id,
+            comp_curve_by_def_id,
+            group_curve_templates,
+            layer_collection_cache,
+            root_collection,
+            gltf_materials,
+            material_cache,
+            textures,
+            image_cache,
+            stats,
+            node_meta,
+            keep_hierarchy=keep_hierarchy,
+            parent_object=own_parent,
             node_parents=node_parents,
         )
 
@@ -1697,6 +1998,7 @@ def _import_model_annotations(
     keep_hierarchy,
     stats,
     filepath=None,
+    linked_duplicates=False,
 ):
     """Walks the placed SketchUp hierarchy, creating Blender text objects and
     thin-line + measured-value dimension pairs in an 'Annotations' collection
@@ -1737,6 +2039,8 @@ def _import_model_annotations(
     def built_total():
         return stats.get("texts_imported", 0) + stats.get("dimensions_imported", 0)
 
+    parent_annotations = bool(keep_hierarchy or linked_duplicates)
+
     def emit_for_def(defn, world_m13, layer_name, parent_rep, force_hidden):
         texts, dims = annots_by_def.get(id(defn), ((), ()))
         for txt in texts:
@@ -1745,7 +2049,7 @@ def _import_model_annotations(
                 continue
             t_layer = getattr(txt, "layer", "") or layer_name or "Layer0"
             _create_blender_text_annotation(
-                txt, world_m13, coll_getter(t_layer), keep_hierarchy, parent_rep, stats, force_hidden=force_hidden
+                txt, world_m13, coll_getter(t_layer), parent_annotations, parent_rep, stats, force_hidden=force_hidden
             )
         for dim in dims:
             if built_total() >= _MAX_IMPORTED_ANNOTATIONS:
@@ -1753,7 +2057,7 @@ def _import_model_annotations(
                 continue
             d_layer = getattr(dim, "layer", "") or layer_name or "Layer0"
             _create_blender_dimension_annotation(
-                dim, world_m13, coll_getter(d_layer), keep_hierarchy, parent_rep, stats, force_hidden=force_hidden
+                dim, world_m13, coll_getter(d_layer), parent_annotations, parent_rep, stats, force_hidden=force_hidden
             )
 
     def walk_defs(defn, inst_node, world_m13, layer_name, parent_rep, force_hidden, visiting):
@@ -1774,18 +2078,23 @@ def _import_model_annotations(
             child_layer = inst_tag if (inst_tag and inst_tag != "Layer0") else (layer_name or "Layer0")
             child_hidden = force_hidden or bool(skp_inst.hidden)
             child_rep = node_parents.get(id(child_node)) if child_node is not None else None
-            if keep_hierarchy and child_rep is None and built_total() < _MAX_IMPORTED_ANNOTATIONS:
+            allow_synth_empty = keep_hierarchy or (
+                linked_duplicates and not getattr(child_defn, "is_group", False)
+            )
+            if allow_synth_empty and child_rep is None and built_total() < _MAX_IMPORTED_ANNOTATIONS:
                 world_bl = _skp_m13_to_blender(child_m13)
                 grp_name = skp_inst.name or child_defn.name or "Group"
                 grp = bpy.data.objects.new(grp_name, None)
                 grp.empty_display_type = "PLAIN_AXES"
                 grp.empty_display_size = 0.1
                 layer_coll = _get_or_build_layer_collection(child_layer, layer_collection_cache, root_collection)
-                _place_annotation_object(grp, world_bl, layer_coll, True, parent_rep)
+                _place_annotation_object(grp, world_bl, layer_coll, parent_annotations, parent_rep)
                 if child_defn.name:
                     grp["sketchup_definition"] = child_defn.name
                 if skp_inst.guid:
                     grp["sketchup_guid"] = skp_inst.guid
+                if linked_duplicates:
+                    grp["openskp_zup_frame"] = True
                 child_rep = (grp, world_bl)
                 if child_node is not None:
                     node_parents[id(child_node)] = child_rep
@@ -1889,12 +2198,20 @@ def check_bundled_libraries():
         )
 
 
-def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=False):
+def import_skp(
+    filepath,
+    context=None,
+    keep_hierarchy=False,
+    import_annotations=False,
+    linked_duplicates=False,
+):
     """Imports a .skp file into the current (or given) Blender context's
     scene, returning a stats dict. ``keep_hierarchy`` keeps SketchUp's
     group/component nesting as parented Empties (see _place_node).
     ``import_annotations`` imports SketchUp texts and linear dimensions into
-    per-tag 'Annotations' collections (#27)."""
+    per-tag 'Annotations' collections (#27). ``linked_duplicates`` imports
+    component parts as ``MESH`` objects sharing their ``Mesh`` datablock rather
+    than as collection instances (#35)."""
     check_bundled_libraries()
     import openskp
 
@@ -1905,6 +2222,7 @@ def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=
     annot_model = None
     annot_parsed = None
     early_annot_exc = None
+    raw_parsed = None
     with _capture_library_warnings() as library_warnings:
         skp = openskp.SkpFile.open(filepath)
         # A TIFF, TGA or GIF texture is left out of a scene unless asked for (openskp 1.6.0 and newer
@@ -1913,7 +2231,14 @@ def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=
         options = {}
         if "original_textures" in inspect.signature(skp.build_instanced_scene).parameters:
             options["original_textures"] = True
-        scene = skp.build_instanced_scene(**options)
+        if linked_duplicates and type(skp).build_instanced_scene is openskp.SkpFile.build_instanced_scene:
+            from openskp import _core, instanced_scene
+
+            raw_parsed = _core.full_parse(str(skp.path))
+            scene = instanced_scene.build_instanced_scene(raw_parsed, **options)
+        else:
+            scene = skp.build_instanced_scene(**options)
+            raw_parsed = getattr(skp, "_parsed", None)
         # Saved scenes come from InstancedScene.pages (openskp#593) so the file is
         # never parsed twice; older wheels without the attribute leave it off.
         pages = getattr(scene, "pages", None) or []
@@ -1921,6 +2246,8 @@ def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=
             try:
                 annot_model = skp.parse()
                 annot_parsed = getattr(skp, "_parsed", None)
+                if raw_parsed is None:
+                    raw_parsed = annot_parsed
             except Exception as exc:
                 early_annot_exc = exc
     for index, texture in enumerate(getattr(scene, "textures", None) or []):
@@ -1980,38 +2307,67 @@ def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=
     root_collection = bpy.data.collections.new(root_name)
     context.scene.collection.children.link(root_collection)
 
-    # Every unique definition's master mesh/curve object lives in its own
-    # Collection here, not directly in the viewport - each is linked as a
-    # child of THIS collection, which is then excluded from the View
-    # Layer (see _find_layer_collection below): kept out of the
-    # viewport/render at its local-space origin (where it would otherwise
-    # show up duplicated alongside the real, placed instances), while
-    # staying visible and selectable in the Outliner - the standard
-    # Blender pattern for a source/library collection feeding instances.
-    sources_collection = bpy.data.collections.new(f"{root_name} (source geometry)")
-    root_collection.children.link(sources_collection)
+    sources_collection = None
+    if linked_duplicates:
+        root_collection["openskp_imported_root"] = True
+    else:
+        # Every unique definition's master mesh/curve object lives in its own
+        # Collection here, not directly in the viewport - each is linked as a
+        # child of THIS collection, which is then excluded from the View
+        # Layer (see _find_layer_collection below): kept out of the
+        # viewport/render at its local-space origin (where it would otherwise
+        # show up duplicated alongside the real, placed instances), while
+        # staying visible and selectable in the Outliner - the standard
+        # Blender pattern for a source/library collection feeding instances.
+        sources_collection = bpy.data.collections.new(f"{root_name} (source geometry)")
+        root_collection.children.link(sources_collection)
 
     t0 = time.time()
     node_parents = {}
-    _place_node(
-        scene.scene_hierarchy,
-        mathutils.Matrix.Identity(4),
-        resources_by_id,
-        collection_cache,
-        curve_resources_by_id,
-        curve_collection_cache,
-        layer_collection_cache,
-        root_collection,
-        sources_collection,
-        gltf_materials,
-        material_cache,
-        textures,
-        image_cache,
-        stats,
-        keep_hierarchy,
-        is_root=True,
-        node_parents=node_parents,
-    )
+    if linked_duplicates:
+        node_meta = _collect_linked_duplicates_node_meta(scene.scene_hierarchy, raw_parsed)
+        _place_node_linked_duplicates(
+            scene.scene_hierarchy,
+            mathutils.Matrix.Identity(4),
+            resources_by_id,
+            {},
+            {},
+            {},
+            curve_resources_by_id,
+            {},
+            {},
+            layer_collection_cache,
+            root_collection,
+            gltf_materials,
+            material_cache,
+            textures,
+            image_cache,
+            stats,
+            node_meta,
+            keep_hierarchy=keep_hierarchy,
+            is_root=True,
+            node_parents=node_parents,
+        )
+    else:
+        _place_node(
+            scene.scene_hierarchy,
+            mathutils.Matrix.Identity(4),
+            resources_by_id,
+            collection_cache,
+            curve_resources_by_id,
+            curve_collection_cache,
+            layer_collection_cache,
+            root_collection,
+            sources_collection,
+            gltf_materials,
+            material_cache,
+            textures,
+            image_cache,
+            stats,
+            keep_hierarchy,
+            is_root=True,
+            node_parents=node_parents,
+        )
     if import_annotations:
         if early_annot_exc is not None:
             _record_annotation_failure(stats, early_annot_exc)
@@ -2027,6 +2383,7 @@ def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=
                     keep_hierarchy,
                     stats,
                     filepath=filepath,
+                    linked_duplicates=linked_duplicates,
                 )
             except Exception as exc:
                 _record_annotation_failure(stats, exc)
@@ -2103,8 +2460,9 @@ def import_skp(filepath, context=None, keep_hierarchy=False, import_annotations=
             coll.hide_render = True
             stats["hidden_layers"] += 1
 
-    layer_coll = _find_layer_collection(context.view_layer.layer_collection, sources_collection)
-    if layer_coll is not None:
-        layer_coll.exclude = True
+    if sources_collection is not None:
+        layer_coll = _find_layer_collection(context.view_layer.layer_collection, sources_collection)
+        if layer_coll is not None:
+            layer_coll.exclude = True
 
     return stats

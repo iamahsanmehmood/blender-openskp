@@ -25,6 +25,8 @@ jobs:
       BLENDER_DIR: blender-${{ matrix.version }}-linux-x64
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Cache extracted Blender ${{ matrix.version }}
         id: cache-blender
