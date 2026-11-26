@@ -438,6 +438,10 @@ def _reset_clean_scene():
         bpy.data.meshes.remove(mesh)
     for mat in list(bpy.data.materials):
         bpy.data.materials.remove(mat)
+    for ng in list(bpy.data.node_groups):
+        bpy.data.node_groups.remove(ng)
+    for img in list(bpy.data.images):
+        bpy.data.images.remove(img)
     for cam in list(bpy.data.cameras):
         bpy.data.cameras.remove(cam)
 
@@ -1811,6 +1815,89 @@ def test_small_edit_in_scaled_linked_group_is_kept():
     print("test_small_edit_in_scaled_linked_group_is_kept: OK")
 
 
+def test_export_reads_shader_node_group_colours_and_textures():
+    """Verifies ``export_skp`` reads colours, alpha, and replaced texture images
+    from the per-material ``ShaderNodeGroup`` layout (#41) — including edited
+    named groups, recoloured ``openskp_material_0`` fallback groups, and swapped
+    texture images inside a group."""
+    import tempfile
+    import openskp
+
+    import_skp = _load_module("import_skp")
+
+    def mini_png(rgb):
+        import struct
+        import zlib
+
+        raw = b"\x00" + bytes(rgb) * 2 + b"\x00" + bytes(rgb) * 2
+
+        def chunk(kind, body):
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+        ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        red_png = os.path.join(tmp, "red_tex.png")
+        teal_png = os.path.join(tmp, "teal_tex.png")
+        with open(red_png, "wb") as f:
+            f.write(mini_png((200, 30, 30)))
+        with open(teal_png, "wb") as f:
+            f.write(mini_png((20, 170, 180)))
+
+        src = os.path.join(tmp, "group_export_src.skp")
+        b = openskp.create()
+        wall = b.add_material("WallPaint", (180, 120, 60, 255))
+        tex_m = b.add_texture_material("BannerTex", red_png, applied_width=10.0, applied_height=10.0)
+        b.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)], material=wall)
+        b.add_face([(25, 0, 0), (45, 0, 0), (45, 20, 0), (25, 20, 0)], material=tex_m)
+        b.add_face([(50, 0, 0), (70, 0, 0), (70, 20, 0), (50, 20, 0)])  # unpainted
+        with open(src, "wb") as f:
+            f.write(b.to_bytes())
+
+        _reset_clean_scene()
+        import_skp.import_skp(src, bpy.context, keep_hierarchy=False)
+
+        # 1. Edit "WallPaint" node group Base Color + Alpha (without touching Material.diffuse_color)
+        violet_rgb = (140, 50, 210)
+        vlr, vlg, vlb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in violet_rgb))
+        wall_bsdf = bpy.data.node_groups["WallPaint"].nodes["Principled BSDF"]
+        wall_bsdf.inputs["Base Color"].default_value = (vlr, vlg, vlb, 1.0)
+        wall_bsdf.inputs["Alpha"].default_value = 0.65
+
+        # 2. Swap "BannerTex" node group's Image Texture to teal_png
+        new_img = bpy.data.images.load(teal_png)
+        new_img.pack()
+        banner_tex_node = next(n for n in bpy.data.node_groups["BannerTex"].nodes if n.type == "TEX_IMAGE")
+        banner_tex_node.image = new_img
+
+        # 3. Recolour unpainted fallback group "openskp_material_1" via its Principled BSDF
+        unpainted_grp = next(
+            ng for ng in bpy.data.node_groups if ng.name.startswith("openskp_material_") and "WallPaint" not in ng.name
+        )
+        amber_rgb = (230, 160, 20)
+        alr, alg, alb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in amber_rgb))
+        unpainted_grp.nodes["Principled BSDF"].inputs["Base Color"].default_value = (alr, alg, alb, 1.0)
+
+        for o in bpy.context.scene.objects:
+            o.select_set(False)
+        bpy.context.view_layer.update()
+
+        out = os.path.join(tmp, "group_export_out.skp")
+        st = export_skp.export_skp(out, bpy.context)
+        assert st["materials_written"] == 3, st
+        parsed = openskp.SkpFile.open(out).parse()
+        mats = {m.name: m for m in parsed.materials}
+        assert tuple(mats["WallPaint"].color[:3]) == violet_rgb, mats["WallPaint"].color
+        assert abs(mats["WallPaint"].transparency - 0.65) < 1e-2, mats["WallPaint"].transparency
+        assert all(abs(a - b) <= 1 for a, b in zip(mats["BannerTex"].color[:3], (20, 170, 180))), mats["BannerTex"].color
+        unp_exported = next(m for name, m in mats.items() if name.startswith("openskp_material_"))
+        assert tuple(unp_exported.color[:3]) == amber_rgb, unp_exported.color
+
+    _reset_clean_scene()
+    print("test_export_reads_shader_node_group_colours_and_textures: OK")
+
+
 if __name__ == "__main__":
     main()
     test_layer_export()
@@ -1822,3 +1909,4 @@ if __name__ == "__main__":
     test_review_round2_regressions()
     test_linked_duplicates_export_round_trip()
     test_small_edit_in_scaled_linked_group_is_kept()
+    test_export_reads_shader_node_group_colours_and_textures()

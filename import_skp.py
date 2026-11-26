@@ -61,21 +61,19 @@ the exclude-from-View-Layer mechanism sources_collection uses, since a
 hidden layer is still meant to be a normal, working part of the scene,
 just not shown right now.
 
-Materials: each mesh resource's per-triangle material_index (resolved by
-openskp's build_instanced_scene() into InstancedScene.gltf_materials, a
-glTF-style pbrMetallicRoughness list - the same resolution already used
-for openskp's other glTF-shaped exports, just never consumed by this
-addon before now) becomes a real Blender Material per unique color/alpha
-combination (Principled BSDF Base Color + Alpha, cached in
-material_cache so repeated colors across definitions share one Material
-datablock), assigned as a mesh material slot with per-polygon
-material_index set to match - so a component with several differently
-colored faces keeps that per-face variation in Blender, not one flat
-color for the whole object. Materials are named after their SketchUp
-material when openskp provides the name, their colour is converted from
-SketchUp's sRGB to Blender's scene-linear values (srgb_to_linear), a
-single-sided material hides its back side (_hide_back_side), and a
-colorized texture is re-tinted toward its colour (_add_colorize_tint).
+Materials: each unique SketchUp material (and each unpainted fallback colour)
+becomes one ``ShaderNodeTree`` node group named after the SketchUp material,
+holding its texture, colorize tint, solid colour and opacity, and each mesh
+resource's per-triangle material_index (resolved by openskp's
+build_instanced_scene() into InstancedScene.gltf_materials) becomes a Blender
+Material referencing that shared node group (cached in material_cache so
+repeated uses share one Material and one node group across single-sided and
+``Front | Back`` materials), assigned as a mesh material slot with per-polygon
+material_index set to match - so editing a material's node group updates every
+face that uses it across the whole model (#41). Materials are named after their
+SketchUp material when openskp provides the name, their colour is converted
+from SketchUp's sRGB to Blender's scene-linear values (srgb_to_linear), and a
+single-sided material hides its back side (_hide_back_side).
 
 Front and back paint: a SketchUp face whose two sides are painted
 differently comes from openskp as two single-sided copies on the same
@@ -228,21 +226,60 @@ def srgb_to_linear(rgb):
     return tuple(_srgb_to_linear(c) for c in rgb)
 
 
+def _surface_group_key(gltf_mat):
+    """Cache key inside ``material_cache`` identifying one SketchUp material's
+    shader node group (#41). Excludes ``doubleSided`` (which is handled on the
+    enclosing ``bpy.types.Material``) so a SketchUp material that appears both
+    on double-sided faces and inside ``Front | Back`` pairs shares a single
+    ``ShaderNodeTree`` group."""
+    name = gltf_mat.get("name") or ""
+    r, g, b, a = _base_color(gltf_mat)
+    tex_ref = gltf_mat.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+    tex_idx = tex_ref.get("index") if tex_ref is not None else None
+    colorize = (gltf_mat.get("extras") or {}).get("sketchup") or {}
+    colorized = bool(colorize.get("colorized"))
+    colorize_type = int(colorize.get("colorize_type", 0)) if colorized else 0
+    return (
+        "surface_group",
+        name,
+        (float(r), float(g), float(b), float(a)),
+        tex_idx,
+        colorized,
+        colorize_type,
+    )
+
+
+def _get_or_build_surface_group(material_index, gltf_mat, material_cache, textures, image_cache):
+    """Returns ``(group_tree, has_cutout_alpha, is_translucent)`` for one
+    SketchUp material (or unpainted fallback surface), building its
+    ``ShaderNodeTree`` group once per import and naming it after the SketchUp
+    material (#41)."""
+    key = _surface_group_key(gltf_mat)
+    if key in material_cache:
+        return material_cache[key]
+
+    r, g, b, a = _base_color(gltf_mat)
+    group_name = gltf_mat.get("name") or f"openskp_material_{material_index}"
+    group_tree = bpy.data.node_groups.new(name=group_name, type="ShaderNodeTree")
+    group_tree.interface.new_socket(name="BSDF", in_out="OUTPUT", socket_type="NodeSocketShader")
+
+    group_out = group_tree.nodes.new("NodeGroupOutput")
+    group_out.location = (300, 0)
+    bsdf = group_tree.nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.location = (0, 0)
+    group_tree.links.new(bsdf.outputs["BSDF"], group_out.inputs["BSDF"])
+
+    has_cutout_alpha = _populate_surface(group_tree, bsdf, gltf_mat, textures, image_cache)
+    entry = (group_tree, has_cutout_alpha, a < 1.0)
+    material_cache[key] = entry
+    return entry
+
+
 def _get_or_build_material(material_index, gltf_materials, material_cache, textures, image_cache):
     """Returns the Blender Material for gltf_materials[material_index],
-    building it exactly once per unique index and caching it for every
-    later mesh that references the same one - openskp's own
-    get_material_index() (instanced_scene.py) already deduplicates by
-    (color, double_sided, texture, transparency) within one file, so the
-    index alone is a valid, stable cache key here.
-
-    When the material has a baseColorTexture, a real Image Texture node
-    is wired into Base Color (and Alpha, for an image with its own alpha
-    channel) - see _get_or_build_texture_image and this module's own
-    "Textured materials" docstring section. Otherwise (or if the image
-    fails to load) falls back to the resolved solid baseColorFactor,
-    same as before textures existed.
-    """
+    building it once per unique index and wiring it to the shared per-material
+    ``ShaderNodeTree`` group (#41) so editing the group updates every single-
+    and double-sided material and ``Front | Back`` pair that uses it."""
     if material_index in material_cache:
         return material_cache[material_index]
 
@@ -250,16 +287,35 @@ def _get_or_build_material(material_index, gltf_materials, material_cache, textu
     r, g, b, a = _base_color(gltf_mat)
 
     # openskp 1.6+ carries the SketchUp material's own name; older wheels
-    # (and unpainted faces drawn in their layer colour) have none.
+    # (and unpainted faces drawn in their layer/style colour) have none.
     mat = bpy.data.materials.new(name=gltf_mat.get("name") or f"openskp_material_{material_index}")
     mat["openskp_material_index"] = material_index
     mat.use_nodes = True
     lr, lg, lb = srgb_to_linear((r, g, b))
     mat.diffuse_color = (lr, lg, lb, a)  # Solid viewport shading / thumbnails
-    if not gltf_mat.get("name") and not _has_texture(gltf_mat):
-        mat["openskp_initial_diffuse"] = [lr, lg, lb, a]
+    mat["openskp_initial_diffuse"] = [lr, lg, lb, a]
 
-    _populate_surface(mat, mat.node_tree.nodes.get("Principled BSDF"), gltf_mat, textures, image_cache)
+    nt = mat.node_tree
+    default_bsdf = nt.nodes.get("Principled BSDF")
+    if default_bsdf is not None:
+        nt.nodes.remove(default_bsdf)
+
+    group_tree, has_cutout_alpha, is_translucent = _get_or_build_surface_group(
+        material_index, gltf_mat, material_cache, textures, image_cache
+    )
+    if has_cutout_alpha:
+        _use_dithered_alpha(mat)
+    elif is_translucent:
+        mat.surface_render_method = "BLENDED"
+
+    group_node = nt.nodes.new("ShaderNodeGroup")
+    group_node.node_tree = group_tree
+    group_node.name = group_tree.name
+    group_node.label = group_tree.name
+    group_node.location = (0, 300)
+    out = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if out is not None:
+        nt.links.new(group_node.outputs["BSDF"], out.inputs["Surface"])
 
     if gltf_mat.get("doubleSided"):
         mat.use_backface_culling = False
@@ -307,53 +363,77 @@ def _image_has_alpha_cutout(image):
     return has_cutout
 
 
-def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
-    """Fills `bsdf` (a Principled BSDF in `mat`'s node tree) from one
-    openskp material: its texture, tint and alpha, or its solid colour.
-    `uv_map` names a UV layer for the texture to read instead of the active
-    one (the back side of a pair, see _get_or_build_pair_material).
+def _populate_surface(nt, bsdf, gltf_mat, textures, image_cache):
+    """Fills ``bsdf`` (a Principled BSDF inside shader node tree ``nt``) from
+    one openskp material: its texture, colorize tint and alpha, or its solid
+    colour (#41).
 
-    Returns True when the surface takes its transparency from the texture's
-    own alpha channel (a fence, a leaf, a cut-out sign): the material is then
-    set to the Dithered render method (see _use_dithered_alpha)."""
+    For textured materials, adds an optional ``UV`` vector input socket to
+    ``nt`` that defaults to ``Texture Coordinate > UV`` (the mesh's active UV
+    layer) when left unconnected and uses the supplied ``UV`` vector when
+    connected (such as ``UVMap_back`` on the back side of a ``Front | Back``
+    material). Returns ``True`` when the surface takes its transparency from
+    the texture's own alpha channel (a cut-out fence, leaf, or sign)."""
     r, g, b, a = _base_color(gltf_mat)
     texture_alpha = False
     texture_ref = gltf_mat.get("pbrMetallicRoughness", {}).get("baseColorTexture")
     lr, lg, lb = srgb_to_linear((r, g, b))
-    if a < 1.0:
-        mat.surface_render_method = "BLENDED"
+    nt["openskp_initial_rgba"] = [lr, lg, lb, a]
 
     image = None
     if texture_ref is not None and bsdf is not None:
         image = _get_or_build_texture_image(texture_ref.get("index"), textures, image_cache)
 
     if image is not None:
-        tex_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        nt["openskp_initial_image"] = image.name
+        tex_node = nt.nodes.new("ShaderNodeTexImage")
         tex_node.image = image
         tex_node.location = (bsdf.location.x - 300, bsdf.location.y)
         colorize = (gltf_mat.get("extras") or {}).get("sketchup") or {}
         if colorize.get("colorized"):
-            _add_colorize_tint(mat, tex_node, bsdf, image, (r, g, b), colorize.get("colorize_type", 0))
+            _add_colorize_tint(nt, tex_node, bsdf, image, (r, g, b), colorize.get("colorize_type", 0))
         else:
-            mat.node_tree.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
-        if uv_map is not None:
-            uv_node = mat.node_tree.nodes.new("ShaderNodeUVMap")
-            uv_node.uv_map = uv_map
-            uv_node.location = (tex_node.location.x - 220, tex_node.location.y)
-            mat.node_tree.links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
+            nt.links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+
+        uv_sock = nt.interface.new_socket(name="UV", in_out="INPUT", socket_type="NodeSocketVector")
+        uv_sock.default_value = (0.0, 0.0, -1.0)
+        uv_sock.hide_value = True
+        group_in = nt.nodes.new("NodeGroupInput")
+        group_in.location = (tex_node.location.x - 680, tex_node.location.y)
+        tex_coord = nt.nodes.new("ShaderNodeTexCoord")
+        tex_coord.hide = True
+        tex_coord.location = (tex_node.location.x - 680, tex_node.location.y - 120)
+        sep = nt.nodes.new("ShaderNodeSeparateXYZ")
+        sep.hide = True
+        sep.location = (tex_node.location.x - 500, tex_node.location.y + 40)
+        nt.links.new(group_in.outputs["UV"], sep.inputs["Vector"])
+        use_active_uv = nt.nodes.new("ShaderNodeMath")
+        use_active_uv.operation = "LESS_THAN"
+        use_active_uv.inputs[1].default_value = -0.5
+        use_active_uv.hide = True
+        use_active_uv.location = (tex_node.location.x - 350, tex_node.location.y + 40)
+        nt.links.new(sep.outputs["Z"], use_active_uv.inputs[0])
+        choose_uv = nt.nodes.new("ShaderNodeMix")
+        choose_uv.data_type = "VECTOR"
+        choose_uv.hide = True
+        choose_uv.location = (tex_node.location.x - 200, tex_node.location.y)
+        nt.links.new(use_active_uv.outputs["Value"], _input(choose_uv, "Factor", "VALUE"))
+        nt.links.new(group_in.outputs["UV"], _input(choose_uv, "A", "VECTOR"))
+        nt.links.new(tex_coord.outputs["UV"], _input(choose_uv, "B", "VECTOR"))
+        nt.links.new(_output(choose_uv, "Result", "VECTOR"), tex_node.inputs["Vector"])
+
         if "Alpha" in bsdf.inputs and _image_has_alpha_cutout(image):
             if a < 1.0 - 1e-4:
-                mul = mat.node_tree.nodes.new("ShaderNodeMath")
+                mul = nt.nodes.new("ShaderNodeMath")
                 mul.operation = "MULTIPLY"
                 mul.use_clamp = True
                 mul.location = (bsdf.location.x - 140, bsdf.location.y - 180)
                 mul.inputs[1].default_value = a
-                mat.node_tree.links.new(tex_node.outputs["Alpha"], mul.inputs[0])
-                mat.node_tree.links.new(mul.outputs["Value"], bsdf.inputs["Alpha"])
+                nt.links.new(tex_node.outputs["Alpha"], mul.inputs[0])
+                nt.links.new(mul.outputs["Value"], bsdf.inputs["Alpha"])
             else:
-                mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+                nt.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
             texture_alpha = True
-            _use_dithered_alpha(mat)
         elif "Alpha" in bsdf.inputs:
             # A translucent textured material (SketchUp's library glass)
             # with an opaque image still has the material's own opacity.
@@ -401,14 +481,12 @@ def _solid_display_material(front, back):
 
 def _get_or_build_pair_material(front_index, back_index, gltf_materials, material_cache, textures, image_cache):
     """The Blender Material for a polygon with one paint on its front and
-    another on its back: both surfaces live in one node tree and a Mix
-    Shader driven by Geometry > Backfacing picks between them, so the
-    polygon is visible, and correct, from both sides in every render engine
-    (and Solid shading shows the painted side when the other side is just
-    the default, or the front paint when both sides are painted, with no
-    overlapping copy to fight it). The back surface reads its texture from
-    the UVMap_back layer. Cached per (front, back) pair of openskp material
-    indices."""
+    another on its back: two per-material ``ShaderNodeGroup`` nodes mixed on
+    ``Geometry > Backfacing`` (#41), so the polygon is visible and accurate
+    from both sides in every render engine and editing a material's group
+    updates every single-sided and ``Front | Back`` material that uses it. The
+    back group reads ``UVMap_back`` when textured. Cached per ``(front, back)``
+    pair of openskp material indices."""
     key = (front_index, back_index)
     if key in material_cache:
         return material_cache[key]
@@ -428,19 +506,40 @@ def _get_or_build_pair_material(front_index, back_index, gltf_materials, materia
     r, g, b, a = _base_color(_solid_display_material(front, back))
     lr, lg, lb = srgb_to_linear((r, g, b))
     mat.diffuse_color = (lr, lg, lb, a)
-    if not _is_painted(front) and not _is_painted(back):
-        mat["openskp_initial_diffuse"] = [lr, lg, lb, a]
+    mat["openskp_initial_diffuse"] = [lr, lg, lb, a]
 
     nt = mat.node_tree
-    front_bsdf = nt.nodes.get("Principled BSDF")
-    back_bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
-    back_bsdf.location = (front_bsdf.location.x, front_bsdf.location.y - 700)
-    front_alpha = _populate_surface(mat, front_bsdf, front, textures, image_cache)
-    back_alpha = _populate_surface(
-        mat, back_bsdf, back, textures, image_cache, uv_map=_BACK_UV_LAYER if _has_texture(back) else None
+    default_bsdf = nt.nodes.get("Principled BSDF")
+    if default_bsdf is not None:
+        nt.nodes.remove(default_bsdf)
+
+    front_tree, front_alpha, front_trans = _get_or_build_surface_group(
+        front_index, front, material_cache, textures, image_cache
+    )
+    back_tree, back_alpha, back_trans = _get_or_build_surface_group(
+        back_index, back, material_cache, textures, image_cache
     )
     if front_alpha or back_alpha:
         _use_dithered_alpha(mat)  # one render method serves both paints: cut-outs win over flat glass
+    elif front_trans or back_trans:
+        mat.surface_render_method = "BLENDED"
+
+    front_group = nt.nodes.new("ShaderNodeGroup")
+    front_group.node_tree = front_tree
+    front_group.name = front_tree.name
+    front_group.label = front_tree.name
+    front_group.location = (0, 300)
+
+    back_group = nt.nodes.new("ShaderNodeGroup")
+    back_group.node_tree = back_tree
+    back_group.name = back_tree.name
+    back_group.label = back_tree.name
+    back_group.location = (0, 60)
+    if "UV" in back_group.inputs:
+        uv_node = nt.nodes.new("ShaderNodeUVMap")
+        uv_node.uv_map = _BACK_UV_LAYER
+        uv_node.location = (-220, 60)
+        nt.links.new(uv_node.outputs["UV"], back_group.inputs["UV"])
 
     out = next(n for n in nt.nodes if n.type == "OUTPUT_MATERIAL")
     geometry = nt.nodes.new("ShaderNodeNewGeometry")
@@ -450,8 +549,8 @@ def _get_or_build_pair_material(front_index, back_index, gltf_materials, materia
     mix.location = (out.location.x, out.location.y + 150)
     out.location.x += 200
     nt.links.new(geometry.outputs["Backfacing"], mix.inputs["Fac"])
-    nt.links.new(front_bsdf.outputs["BSDF"], mix.inputs[1])
-    nt.links.new(back_bsdf.outputs["BSDF"], mix.inputs[2])
+    nt.links.new(front_group.outputs["BSDF"], mix.inputs[1])
+    nt.links.new(back_group.outputs["BSDF"], mix.inputs[2])
     nt.links.new(mix.outputs["Shader"], out.inputs["Surface"])
     mat.use_backface_culling = False  # both sides are drawn, each with its own paint
 
@@ -516,7 +615,7 @@ def _output(node, name, socket_type):
     return next(s for s in node.outputs if s.name == name and s.type == socket_type)
 
 
-def _add_colorize_tint(mat, tex_node, bsdf, image, color, colorize_type):
+def _add_colorize_tint(nt, tex_node, bsdf, image, color, colorize_type):
     """Re-tints a colorized material's shared image toward its own colour,
     as SketchUp does for its "[Name]1" copies: openskp gives the untinted
     source image plus the target colour (baseColorFactor, sRGB).
@@ -525,7 +624,6 @@ def _add_colorize_tint(mat, tex_node, bsdf, image, color, colorize_type):
     colour - colorize_type 0 (shift) scales the colour image, 1 (tint)
     greyscales it first. Without this, a darkened wood veneer imports with
     the original, much lighter image."""
-    nt = mat.node_tree
     target = srgb_to_linear(color)
     average = _image_average_rgb(image)
     source = tex_node.outputs["Color"]
@@ -538,6 +636,7 @@ def _add_colorize_tint(mat, tex_node, bsdf, image, color, colorize_type):
             luminance = 0.2126 * average[0] + 0.7152 * average[1] + 0.0722 * average[2]
             average = (luminance,) * 3
     scale = tuple(t / max(avg, 1e-4) for t, avg in zip(target, average)) if average else target
+    nt["openskp_initial_tint"] = list(scale)
 
     tint = nt.nodes.new("ShaderNodeMix")
     tint.data_type = "RGBA"

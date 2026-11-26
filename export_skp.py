@@ -202,6 +202,10 @@ def _object_layer_name(
     return None
 
 
+def _srgb_to_linear(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
 def _linear_to_srgb(c):
     return c * 12.92 if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
 
@@ -213,40 +217,185 @@ def _rgba_opacity_from_linear(lin_rgba):
     return rgba, opacity
 
 
-def _material_rgba_opacity(mat):
-    """A Material's solid display color as openskp's writer wants it:
-    (r, g, b) ints 0-255, plus a separate 0.0-1.0 opacity (``None`` when
-    fully opaque). ``diffuse_color`` is scene-linear and SketchUp colours are
-    sRGB, so it is converted on the way out."""
-    return _rgba_opacity_from_linear(mat.diffuse_color)
+def _image_average_linear_rgb(image):
+    """Mean scene-linear RGB of ``image``, or ``None`` when unreadable."""
+    try:
+        import numpy as np
+
+        w, h = image.size
+        if not w or not h or image.channels < 3:
+            return None
+        pixels = np.empty(w * h * image.channels, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+        rgb = pixels.reshape(-1, image.channels)[:, :3]
+        mean = (float(c) for c in rgb.mean(axis=0))
+        return tuple(mean) if image.is_float else tuple(_srgb_to_linear(c) for c in mean)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _surface_node_tree(mat, prefer_back=False):
+    """Returns the shader ``NodeTree`` holding ``mat``'s active surface — either
+    the per-material ``ShaderNodeTree`` inside ``ShaderNodeGroup`` (#41) or
+    ``mat.node_tree`` itself when nodes sit directly on the material."""
+    if not getattr(mat, "use_nodes", False) or getattr(mat, "node_tree", None) is None:
+        return None
+    nt = mat.node_tree
+    out = next(
+        (n for n in nt.nodes if n.type == "OUTPUT_MATERIAL" and getattr(n, "is_active_output", False)),
+        None,
+    ) or next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if out is not None and out.inputs["Surface"].is_linked:
+        node = out.inputs["Surface"].links[0].from_node
+        if node.type == "MIX_SHADER":
+            if "openskp_back_material_index" in mat:
+                sock = node.inputs[2] if prefer_back else node.inputs[1]
+            else:
+                sock = node.inputs[1] if node.inputs[1].is_linked else node.inputs[2]
+            if sock.is_linked:
+                node = sock.links[0].from_node
+        if node.type == "GROUP" and node.node_tree is not None:
+            return node.node_tree
+    groups = [n for n in nt.nodes if n.type == "GROUP" and n.node_tree is not None]
+    if groups:
+        return groups[1].node_tree if (prefer_back and len(groups) > 1) else groups[0].node_tree
+    return nt
+
+
+def _surface_tree_linear_rgba(nt, only_if_edited=False):
+    """Reads scene-linear ``(r, g, b, alpha)`` from a surface ``NodeTree``
+    (either a per-material ``ShaderNodeTree`` group or a material node tree),
+    supporting solid ``Principled BSDF`` colours, ``Image Texture`` nodes, and
+    ``SketchUp colorize`` tint multipliers (#41). When ``only_if_edited`` is
+    ``True``, returns ``None`` if ``nt`` still matches the initial state stored
+    by ``import_skp``."""
+    if nt is None:
+        return None
+    bsdf = nt.nodes.get("Principled BSDF") or next(
+        (n for n in nt.nodes if n.type == "BSDF_PRINCIPLED"), None
+    )
+    alpha = 1.0
+    if bsdf is not None and "Alpha" in bsdf.inputs:
+        a_in = bsdf.inputs["Alpha"]
+        if not a_in.is_linked:
+            alpha = float(a_in.default_value)
+        elif a_in.links[0].from_node.type == "MATH" and a_in.links[0].from_node.operation == "MULTIPLY":
+            alpha = float(a_in.links[0].from_node.inputs[1].default_value)
+
+    init = nt.get("openskp_initial_rgba")
+    init_tup = tuple(float(x) for x in init) if init is not None and len(init) == 4 else None
+
+    if bsdf is not None and "Base Color" in bsdf.inputs:
+        bc_in = bsdf.inputs["Base Color"]
+        if not bc_in.is_linked:
+            bc = bc_in.default_value
+            rgba = (float(bc[0]), float(bc[1]), float(bc[2]), alpha)
+            if only_if_edited:
+                if (
+                    init_tup is not None
+                    and "openskp_initial_image" not in nt
+                    and all(abs(a - b) <= 1e-4 for a, b in zip(rgba, init_tup))
+                ):
+                    return None
+            return rgba
+
+        tex_node = next((n for n in nt.nodes if n.type == "TEX_IMAGE" and n.image is not None), None)
+        src_node = bc_in.links[0].from_node
+        tint_node = src_node if src_node.type == "MIX" else None
+        tint_scale = None
+        if tint_node is not None:
+            b_sock = next((s for s in tint_node.inputs if s.name == "B" and s.type == "RGBA"), None)
+            if b_sock is not None:
+                tint_scale = tuple(float(b_sock.default_value[i]) for i in range(3))
+
+        if only_if_edited and init_tup is not None:
+            init_img = nt.get("openskp_initial_image")
+            init_tint = nt.get("openskp_initial_tint")
+            same_img = tex_node is not None and init_img is not None and tex_node.image.name == init_img
+            same_tint = (tint_scale is None and init_tint is None) or (
+                tint_scale is not None
+                and init_tint is not None
+                and len(init_tint) == 3
+                and all(abs(a - b) <= 1e-4 for a, b in zip(tint_scale, init_tint))
+            )
+            same_alpha = abs(alpha - init_tup[3]) <= 1e-4
+            if same_img and same_tint and same_alpha:
+                return None
+            if same_img and same_tint:
+                return (init_tup[0], init_tup[1], init_tup[2], alpha)
+
+        if tex_node is not None:
+            avg = _image_average_linear_rgb(tex_node.image)
+            if avg is not None:
+                if tint_scale is not None:
+                    is_bw = any(
+                        s.type == "RGBA" and s.is_linked and s.links[0].from_node.type == "RGBTOBW"
+                        for s in tint_node.inputs
+                    )
+                    if is_bw:
+                        lum = 0.2126 * avg[0] + 0.7152 * avg[1] + 0.0722 * avg[2]
+                        avg = (lum, lum, lum)
+                    avg = tuple(min(max(c * sc, 0.0), 1.0) for c, sc in zip(avg, tint_scale))
+                return (avg[0], avg[1], avg[2], alpha)
+    return None
+
+
+def _material_rgba_opacity(mat, prefer_back=False):
+    """A Material's export colour and opacity as openskp's writer wants it:
+    ``(r, g, b)`` ints 0-255, plus a separate 0.0-1.0 opacity (``None`` when
+    fully opaque). Reads edits made inside the per-material ``ShaderNodeGroup``
+    (or direct ``Principled BSDF`` / ``Image Texture``) as well as
+    ``Material.diffuse_color`` (#41)."""
+    dc = tuple(float(x) for x in mat.diffuse_color)
+    init = mat.get("openskp_initial_diffuse")
+    init_dc = tuple(float(x) for x in init) if init is not None and len(init) == 4 else None
+    surf_tree = _surface_node_tree(mat, prefer_back=prefer_back)
+
+    if init_dc is not None:
+        if any(abs(a - b) > 1e-4 for a, b in zip(dc, init_dc)):
+            return _rgba_opacity_from_linear(dc)
+        edited = _surface_tree_linear_rgba(surf_tree, only_if_edited=True)
+        if edited is not None:
+            return _rgba_opacity_from_linear(edited)
+        return _rgba_opacity_from_linear(dc)
+
+    default_dc = (0.8, 0.8, 0.8, 1.0)
+    if any(abs(a - b) > 1e-4 for a, b in zip(dc, default_dc)):
+        return _rgba_opacity_from_linear(dc)
+    surf_rgba = _surface_tree_linear_rgba(surf_tree, only_if_edited=False)
+    if surf_rgba is not None and any(abs(a - b) > 1e-4 for a, b in zip(surf_rgba, default_dc)):
+        return _rgba_opacity_from_linear(surf_rgba)
+    return _rgba_opacity_from_linear(dc)
 
 
 def _recolored_import_slot_rgba_opacity(mat):
     """Checks whether an unnamed ``openskp_material_N`` fallback material created
     by ``import_skp`` was recoloured by the user (via ``diffuse_color`` or via
-    Principled BSDF ``Base Color``/``Alpha``). Returns ``(rgba, opacity)`` when
-    recoloured, or ``None`` when still holding ``import_skp``'s fallback colour."""
+    its ``ShaderNodeGroup`` / ``Principled BSDF`` ``Base Color``/``Alpha``).
+    Returns ``(rgba, opacity)`` when recoloured, or ``None`` when still holding
+    ``import_skp``'s fallback colour."""
     dc = tuple(float(x) for x in mat.diffuse_color)
     init = mat.get("openskp_initial_diffuse")
     init_tup = tuple(float(x) for x in init) if init is not None and len(init) == 4 else None
 
-    bsdf_col = None
-    if getattr(mat, "use_nodes", False) and getattr(mat, "node_tree", None) is not None:
-        bsdf = mat.node_tree.nodes.get("Principled BSDF")
-        if bsdf is not None and "Base Color" in bsdf.inputs and not bsdf.inputs["Base Color"].is_linked:
-            bc = bsdf.inputs["Base Color"].default_value
-            ba = bsdf.inputs["Alpha"].default_value if "Alpha" in bsdf.inputs else 1.0
-            bsdf_col = (float(bc[0]), float(bc[1]), float(bc[2]), float(ba))
-
-    if init_tup is not None:
-        if any(abs(a - b) > 1e-4 for a, b in zip(dc, init_tup)):
-            return _rgba_opacity_from_linear(dc)
-        if bsdf_col is not None and any(abs(a - b) > 1e-4 for a, b in zip(bsdf_col, init_tup)):
-            return _rgba_opacity_from_linear(bsdf_col)
-        return None
-
-    if bsdf_col is not None and any(abs(a - b) > 1e-4 for a, b in zip(dc, bsdf_col)):
+    if init_tup is not None and any(abs(a - b) > 1e-4 for a, b in zip(dc, init_tup)):
         return _rgba_opacity_from_linear(dc)
+
+    sides = (False, True) if "openskp_back_material_index" in mat else (False,)
+    for prefer_back in sides:
+        surf_tree = _surface_node_tree(mat, prefer_back=prefer_back)
+        if surf_tree is None:
+            continue
+        if surf_tree.get("openskp_initial_rgba") is not None:
+            edited = _surface_tree_linear_rgba(surf_tree, only_if_edited=True)
+            if edited is not None:
+                return _rgba_opacity_from_linear(edited)
+        else:
+            bsdf_col = _surface_tree_linear_rgba(surf_tree, only_if_edited=False)
+            if bsdf_col is not None:
+                ref = init_tup if init_tup is not None else dc
+                if any(abs(a - b) > 1e-4 for a, b in zip(bsdf_col, ref)):
+                    return _rgba_opacity_from_linear(bsdf_col if init_tup is not None else dc)
     return None
 
 
@@ -260,6 +409,7 @@ def _material_spec(mat, all_material_names=None):
         all_material_names = bpy.data.materials
     if "openskp_material_index" in mat:
         base = _strip_blender_dup_suffix(mat.name, all_material_names)
+        prefer_back = False
         if "openskp_back_material_index" in mat and " | " in base:
             front_name, back_name = base.split(" | ", 1)
             front_unpainted = bool(_UNPAINTED_SLOT_RE.match(front_name))
@@ -270,7 +420,8 @@ def _material_spec(mat, all_material_names=None):
                     return None
                 rgba, opacity = recol
                 return (f"skp:{front_name}:{rgba}:{opacity}", front_name, rgba, opacity)
-            skp_name = back_name if front_unpainted else front_name
+            prefer_back = front_unpainted and not back_unpainted
+            skp_name = back_name if prefer_back else front_name
         elif _UNPAINTED_SLOT_RE.match(base):
             recol = _recolored_import_slot_rgba_opacity(mat)
             if recol is None:
@@ -279,7 +430,7 @@ def _material_spec(mat, all_material_names=None):
             return (f"skp:{mat.name}:{rgba}:{opacity}", mat.name, rgba, opacity)
         else:
             skp_name = base
-        rgba, opacity = _material_rgba_opacity(mat)
+        rgba, opacity = _material_rgba_opacity(mat, prefer_back=prefer_back)
         return (f"skp:{skp_name}:{rgba}:{opacity}", skp_name, rgba, opacity)
     rgba, opacity = _material_rgba_opacity(mat)
     return (mat.name, mat.name, rgba, opacity)
