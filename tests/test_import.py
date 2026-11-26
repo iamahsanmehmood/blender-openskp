@@ -646,9 +646,11 @@ def check_alpha_materials_use_the_right_render_method():
             self.data, self.mime_type, self.filename = data, "image/png", ""
 
     clear, solid = (255, 255, 255, 0), (255, 255, 255, 255)
+    rgba_opaque = (200, 210, 220, 255)
     textures = [
         Texture(_png(2, 2, [[clear, solid], [solid, clear]])),  # 0: cut-out
-        Texture(_png(2, 2, [[(255, 255, 255)] * 2] * 2)),  # 1: opaque image
+        Texture(_png(2, 2, [[(255, 255, 255)] * 2] * 2)),  # 1: 24-bit opaque RGB image
+        Texture(_png(2, 2, [[rgba_opaque] * 2] * 2)),  # 2: 32-bit RGBA image with A=255 everywhere (#16)
     ]
 
     def painted(name, texture_index=None, alpha=1.0):
@@ -663,6 +665,9 @@ def check_alpha_materials_use_the_right_render_method():
         painted("glass", alpha=0.5),
         painted("flat"),
         painted("glass image", 1, alpha=0.5),
+        painted("rgba opaque", 2),
+        painted("rgba glass", 2, alpha=0.5),
+        painted("translucent cut-out", 0, alpha=0.5),
     ]
 
     def build(index):
@@ -676,12 +681,32 @@ def check_alpha_materials_use_the_right_render_method():
     assert build(4).surface_render_method == "BLENDED", "a translucent material with an opaque image stays Blended"
     assert build(1).surface_render_method == "DITHERED" and build(3).surface_render_method == "DITHERED"
 
-    for front, back in ((0, 2), (2, 0), (0, 4), (4, 0)):
+    # A 32-bit RGBA image whose alpha is 255 on every pixel (such as TestFIleType.skp's TIFF) is
+    # opaque, not a cut-out: it leaves Alpha unlinked and preserves material translucency (#16).
+    rgba_solid_mat = build(5)
+    assert not rgba_solid_mat.node_tree.nodes["Principled BSDF"].inputs["Alpha"].links
+    assert rgba_solid_mat.surface_render_method == "DITHERED"
+    rgba_glass_mat = build(6)
+    rgba_glass_bsdf = rgba_glass_mat.node_tree.nodes["Principled BSDF"]
+    assert not rgba_glass_bsdf.inputs["Alpha"].links, "all-opaque 32-bit image must not override glass Alpha"
+    assert abs(rgba_glass_bsdf.inputs["Alpha"].default_value - 0.5) < 1e-5
+    assert rgba_glass_mat.surface_render_method == "BLENDED", "translucent glass with all-opaque RGBA stays Blended"
+
+    # A cut-out texture whose SketchUp material ALSO carries opacity < 1.0 multiplies both (#16).
+    trans_cutout = build(7)
+    assert trans_cutout.surface_render_method == "DITHERED"
+    tc_links = trans_cutout.node_tree.nodes["Principled BSDF"].inputs["Alpha"].links
+    assert tc_links and tc_links[0].from_node.type == "MATH" and tc_links[0].from_node.operation == "MULTIPLY"
+    assert tc_links[0].from_node.inputs[0].links[0].from_node.type == "TEX_IMAGE"
+    assert abs(tc_links[0].from_node.inputs[1].default_value - 0.5) < 1e-5
+
+    for front, back in ((0, 2), (2, 0), (0, 4), (4, 0), (0, 6), (6, 0)):
         pair = import_skp._get_or_build_pair_material(front, back, gltf, {}, textures, {})
         assert pair.surface_render_method == "DITHERED", f"pair ({front}, {back}) has a cut-out, must be Dithered"
-    glass_pair = import_skp._get_or_build_pair_material(2, 4, gltf, {}, textures, {})
-    assert glass_pair.surface_render_method == "BLENDED", "a pair of flat translucent paints must stay Blended"
-    print("alpha materials: cut-outs Dithered, flat glass Blended, pairs Dithered when either paint cuts out - OK")
+    for a_idx, b_idx in ((2, 4), (2, 6), (4, 6)):
+        glass_pair = import_skp._get_or_build_pair_material(a_idx, b_idx, gltf, {}, textures, {})
+        assert glass_pair.surface_render_method == "BLENDED", "a pair of flat translucent paints must stay Blended"
+    print("alpha materials: cut-outs Dithered, flat/32-bit-opaque glass Blended, translucent cut-outs scaled - OK")
 
 
 def check_vertices_are_welded():
@@ -1724,14 +1749,29 @@ def check_linked_duplicates_off_matches_main():
                 for p in r.primitives
                 if getattr(p, "unpainted_back", False)
             )
+            # Exact (2824800 (verts, edges), current (verts, edges)) for the 6 datablocks
+            # where #16 fixes stacked coplanar polygon vertex sets or welds loose-edge curves:
+            expected_ve_deltas = {
+                ("capilla_quiroz_v17.skp", "ROOT_MODEL"): ((247, 730), (261, 746)),
+                ("capilla_quiroz_v17.skp", "ROOT_MODEL (lines)"): ((10, 5), (9, 5)),
+                ("capilla_quiroz_v17.skp", "puerta (lines)"): ((30, 15), (16, 15)),
+                ("gondola_v20.skp", "(3D)shelf2B (lines)"): ((8176, 4088), (3931, 4088)),
+                ("gondola_v20.skp", "Agrupar#8 (lines)"): ((8, 4), (7, 4)),
+                ("gondola_v20.skp", "ROOT_MODEL (lines)"): ((24, 12), (10, 12)),
+            }
             for kh in (False, True):
                 _reset_empty_scene()
                 st_main = main_mod.import_skp(fpath, keep_hierarchy=kh)
-                snap_main = _scene_snapshot()
+                colls_main, objs_main, meshes_main = _scene_snapshot()
 
                 _reset_empty_scene()
                 st_curr = import_skp.import_skp(fpath, keep_hierarchy=kh)
                 snap_curr = _scene_snapshot()
+
+                _reset_empty_scene()
+                st_explicit = import_skp.import_skp(fpath, keep_hierarchy=kh, linked_duplicates=False)
+                snap_explicit = _scene_snapshot()
+                assert st_explicit == st_curr and snap_explicit == snap_curr, f"{fname} (kh={kh}): explicit False differs"
 
                 expected_st = {
                     k: v
@@ -1740,7 +1780,19 @@ def check_linked_duplicates_off_matches_main():
                 }
                 expected_st["triangles"] -= unpainted_back_tris
                 assert st_curr == expected_st, f"{fname} (kh={kh}): stats {st_curr} != baseline {expected_st}"
-                assert snap_curr == snap_main, f"{fname} (kh={kh}): scene differs from {BASELINE_COMMIT[:12]}"
+
+                expected_meshes = []
+                for m_tup in meshes_main:
+                    delta = expected_ve_deltas.get((fname, m_tup[0]))
+                    if delta is not None:
+                        old_ve, new_ve = delta
+                        assert (m_tup[1], m_tup[2]) == old_ve, f"{fname}/{m_tup[0]}: baseline {(m_tup[1], m_tup[2])} != {old_ve}"
+                        expected_meshes.append((m_tup[0], new_ve[0], new_ve[1], *m_tup[3:]))
+                    else:
+                        expected_meshes.append(m_tup)
+                assert snap_curr == (colls_main, objs_main, expected_meshes), (
+                    f"{fname} (kh={kh}): scene differs from {BASELINE_COMMIT[:12]}"
+                )
                 comparisons += 1
 
         assert comparisons == len(fixture_paths) * 2 and comparisons > 0, comparisons
@@ -2099,6 +2151,231 @@ def check_linked_duplicates_import():
     print("linked_duplicates=True import: sharing, Empties, Select Grouped > Children, groups, mirror/scale, hidden & paint - OK")
 
 
+def check_unpainted_faces_style_and_tag_colours():
+    """Verifies ``unpainted_faces="style"`` (default) vs ``unpainted_faces="tag"`` (#16):
+    - Style mode uses the SketchUp model's front/back style colours on unpainted faces
+      and shares one mesh across placements on differently coloured tags.
+    - Tag mode uses each placement's SketchUp tag colour on both sides of unpainted faces
+      and on the unpainted back of single-sided painted faces, including via the
+      ``import_scene.openskp`` operator and ``linked_duplicates=True``."""
+    import tempfile
+    import openskp
+
+    red_rgb = (240, 30, 30)
+    blue_rgb = (30, 60, 240)
+    gold_rgb = (220, 180, 40)
+
+    def lin_rgba(rgb):
+        return tuple(round(c, 3) for c in (*import_skp.srgb_to_linear(tuple(v / 255 for v in rgb)), 1.0))
+
+    try:
+        import_skp.import_skp(os.path.join(FIXTURES_DIR, "SU_File.skp"), unpainted_faces="bogus")
+    except ValueError as exc:
+        assert "unpainted_faces" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for invalid unpainted_faces")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skp = os.path.join(tmp, "tag_colours.skp")
+        builder = openskp.SkpBuilder()
+        gold = builder.add_material("Gold", (*gold_rgb, 255))
+        red_tag = builder.add_layer("RedTag", color=red_rgb)
+        blue_tag = builder.add_layer("BlueTag", color=blue_rgb)
+        with builder.add_component_definition("Crate") as crate:
+            # Unpainted quad + single-sided Gold quad
+            crate.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)])
+            crate.add_face([(0, 0, 0), (20, 0, 0), (20, 0, 20), (0, 0, 20)], material=gold)
+        builder.add_instance(crate, name="RedCrate1", translation=(0, 0, 0), layer=red_tag)
+        builder.add_instance(crate, name="RedCrate2", translation=(30, 0, 0), layer=red_tag)
+        builder.add_instance(crate, name="BlueCrate", translation=(60, 0, 0), layer=blue_tag)
+        builder.save(skp)
+
+        # 1. Default style mode: one shared mesh using style front/back colours (white / grey-blue)
+        _reset_empty_scene()
+        st_style = import_skp.import_skp(skp)
+        assert st_style["unique_meshes"] == 1 and st_style["placements"] == 3, st_style
+        (style_mesh,) = list(bpy.data.meshes)
+        style_diffuses = {tuple(round(c, 3) for c in m.diffuse_color) for m in style_mesh.materials}
+        assert lin_rgba(red_rgb) not in style_diffuses and lin_rgba(blue_rgb) not in style_diffuses
+        assert lin_rgba(gold_rgb) in style_diffuses
+
+        # 2. Tag mode via operator: RedCrate1 & RedCrate2 share RedTag mesh; BlueCrate gets BlueTag mesh
+        already_registered = hasattr(bpy.types, "IMPORT_SCENE_OT_openskp")
+        addon_pkg = _load_module("__init__")
+        if not already_registered:
+            addon_pkg.register()
+        try:
+            _reset_empty_scene()
+            res = bpy.ops.import_scene.openskp(filepath=skp, unpainted_faces="TAG")
+            assert res == {"FINISHED"}, res
+        finally:
+            if not already_registered:
+                addon_pkg.unregister()
+
+        assert len(bpy.data.meshes) == 2, [m.name for m in bpy.data.meshes]
+        empties = {_base_name(o.name): o for o in bpy.data.objects if o.instance_type == "COLLECTION"}
+        assert empties["RedCrate1"].instance_collection == empties["RedCrate2"].instance_collection
+        assert empties["RedCrate1"].instance_collection != empties["BlueCrate"].instance_collection
+
+        for inst_name, tag_rgb in (("RedCrate1", red_rgb), ("BlueCrate", blue_rgb)):
+            (m_obj,) = list(empties[inst_name].instance_collection.objects)
+            m_mats = list(m_obj.data.materials)
+            unpainted_slot = next(m for m in m_mats if "openskp_back_material_index" not in m)
+            pair_slot = next(m for m in m_mats if "openskp_back_material_index" in m)
+            assert not unpainted_slot.use_backface_culling
+            assert tuple(round(c, 3) for c in unpainted_slot.diffuse_color) == lin_rgba(tag_rgb)
+            assert pair_slot.name.startswith("Gold | ")
+            assert tuple(round(c, 3) for c in pair_slot.diffuse_color) == lin_rgba(gold_rgb)
+            mix = next(n for n in pair_slot.node_tree.nodes if n.type == "MIX_SHADER")
+            back_bsdf = mix.inputs[2].links[0].from_node
+            assert tuple(round(c, 3) for c in back_bsdf.inputs["Base Color"].default_value) == lin_rgba(tag_rgb)
+
+        # 3. Tag mode with linked_duplicates=True: RedTag placements share a Mesh, BlueTag gets its own
+        _reset_empty_scene()
+        st_ld_tag = import_skp.import_skp(skp, linked_duplicates=True, unpainted_faces="tag")
+        assert st_ld_tag["unique_meshes"] == 2 and st_ld_tag["placements"] == 3, st_ld_tag
+        ld_objs = {_base_name(o.name): o for o in bpy.data.objects if o.type == "MESH"}
+        assert ld_objs["RedCrate1"].data is ld_objs["RedCrate2"].data
+        assert ld_objs["RedCrate1"].data is not ld_objs["BlueCrate"].data
+    print("unpainted_faces='style' vs 'tag': style colours, tag colours, operator & linked_duplicates - OK")
+
+
+def check_flat_multi_material_surface_keeps_front_paint():
+    """On a flat multi-material surface, every single-sided painted face shares the
+    unpainted back-colour primitive created by the first face, so every material
+    after the first has ``t_back < t_front`` in ``resource.primitives``. Using
+    ``LocalPrimitive.back_triangles`` keeps SketchUp's front paint, upward normal,
+    and main ``UVMap`` on every face instead of flipping materials 2..N upside down (#16)."""
+    import tempfile
+    import openskp
+
+    with tempfile.TemporaryDirectory() as tmp:
+        img_a = os.path.join(tmp, "carpet.png")
+        img_b = os.path.join(tmp, "poster.png")
+        with open(img_a, "wb") as f:
+            f.write(_png(2, 2, [[(180, 40, 40), (200, 60, 60)], [(160, 30, 30), (190, 50, 50)]]))
+        with open(img_b, "wb") as f:
+            f.write(_png(2, 2, [[(40, 120, 220), (60, 140, 240)], [(30, 100, 200), (50, 130, 230)]]))
+        skp = os.path.join(tmp, "flat_multi_mat.skp")
+        builder = openskp.SkpBuilder()
+        carpet = builder.add_texture_material("Carpet", img_a, 10, 10)
+        poster = builder.add_texture_material("Poster", img_b, 10, 10)
+        trim = builder.add_material("Trim", (30, 180, 90, 255))
+        # Three adjacent coplanar quads at z=0, all wound upward (+Z in SketchUp -> +Y in glTF local mesh):
+        builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)], material=carpet)
+        builder.add_face([(10, 0, 0), (20, 0, 0), (20, 10, 0), (10, 10, 0)], material=poster)
+        builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)], material=poster, back_material=trim)
+        builder.save(skp)
+
+        _reset_empty_scene()
+        import_skp.import_skp(skp)
+        (mesh,) = list(bpy.data.meshes)
+
+    assert len(mesh.polygons) == 6, len(mesh.polygons)
+    slot_names_by_x = {}
+    for poly in mesh.polygons:
+        assert poly.normal.y > 0.99, f"flat quad polygon flipped upside down: normal={tuple(poly.normal)}"
+        band = int(poly.center.x / (10.0 * 0.0254))
+        slot_names_by_x.setdefault(band, set()).add(mesh.materials[poly.material_index].name)
+
+    (m0,) = slot_names_by_x[0]
+    (m1,) = slot_names_by_x[1]
+    (m2,) = slot_names_by_x[2]
+    assert m0.startswith("Carpet | "), m0
+    assert m1.startswith("Poster | "), f"second material on flat surface flipped: {m1}"
+    assert m2 == "Poster | Trim", m2
+    # All textures are on the front side, so UVMap_back is not needed and Solid view on Poster | Trim shows Poster.
+    assert [uv.name for uv in mesh.uv_layers] == ["UVMap"], [uv.name for uv in mesh.uv_layers]
+    print("flat multi-material surface: all faces keep upward normals, front paint, and UVMap - OK")
+
+
+def check_curve_welding_and_stacked_faces_validate():
+    """Verifies the two remaining vertex-welding invariants (#16):
+    1. Every imported mesh and loose-edge curve datablock across all committed
+       fixtures passes ``Mesh.validate() == False`` (0 invalid/deleted polygons
+       or duplicate edges, including ``capilla_quiroz_v17.skp``'s stacked faces),
+       and every ``(lines)`` curve mesh has 0 duplicate vertices under ``remove_doubles``.
+    2. A synthetic Y-junction of loose polylines welds the shared hub vertex, and
+       two stacked coplanar faces with the same double-sided material stay valid."""
+    import tempfile
+    import bmesh
+    import openskp
+
+    fixture_paths = [
+        os.path.join(FIXTURES_DIR, f)
+        for f in sorted(os.listdir(FIXTURES_DIR))
+        if f.endswith(".skp")
+    ]
+    fixture_paths.append(os.path.join(FIXTURES_DIR, "linked_duplicates", "inherited_paint_2021.skp"))
+
+    validated_meshes = 0
+    welded_curves = 0
+    for fpath in fixture_paths:
+        fname = os.path.basename(fpath)
+        _reset_empty_scene()
+        import_skp.import_skp(fpath)
+        for m in list(bpy.data.meshes):
+            mc = m.copy()
+            try:
+                changed = mc.validate()
+            finally:
+                bpy.data.meshes.remove(mc)
+            assert not changed, f"{fname}/{m.name}: Mesh.validate() modified/deleted corrupt geometry"
+            validated_meshes += 1
+            if m.name.endswith(" (lines)"):
+                bm = bmesh.new()
+                bm.from_mesh(m)
+                before = len(bm.verts)
+                bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=1e-5)
+                after = len(bm.verts)
+                bm.free()
+                assert before == after, f"{fname}/{m.name}: {before - after} unwelded curve vertices remain"
+                welded_curves += 1
+    assert validated_meshes > 0 and welded_curves >= 6, (validated_meshes, welded_curves)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Synthetic 3-branch loose-edge junction + two stacked coplanar double-sided quads
+        skp = os.path.join(tmp, "junction_and_stacked.skp")
+        builder = openskp.SkpBuilder()
+        paint = builder.add_material("BothSides", (200, 80, 60, 255))
+        with builder.add_group("StackedGroup") as grp:
+            grp.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)], material=paint, back_material=paint)
+        builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)], material=paint, back_material=paint)
+        builder.add_polyline([(0, 0, 20), (10, 0, 20)])
+        builder.add_polyline([(0, 0, 20), (0, 10, 20)])
+        builder.add_polyline([(0, 0, 20), (0, 0, 30)])
+        builder.save(skp)
+
+        _reset_empty_scene()
+        import_skp.import_skp(skp)
+        line_mesh = next(m for m in bpy.data.meshes if m.name.endswith(" (lines)"))
+        assert len(line_mesh.vertices) == 4 and len(line_mesh.edges) == 3, (
+            len(line_mesh.vertices), len(line_mesh.edges)
+        )
+
+        # Also check _build_mesh_datablock directly with two stacked double-sided quads in one resource:
+        pos = (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0)
+        uvs = (0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0)
+        prim_a = openskp.LocalPrimitive(material_index=0, positions=pos, normals=(0.0, 1.0, 0.0) * 4, uvs=uvs, indices=(0, 1, 2, 0, 2, 3))
+        prim_b = openskp.LocalPrimitive(material_index=0, positions=pos, normals=(0.0, 1.0, 0.0) * 4, uvs=uvs, indices=(0, 1, 2, 0, 2, 3))
+        res = openskp.InstancedMeshResource(
+            id="stacked",
+            definition_id="stacked",
+            definition_name="Stacked",
+            variant_key="",
+            primitives=[prim_a, prim_b],
+        )
+        gltf_mats = [{"name": "BothSides", "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.3, 0.2, 1.0]}, "doubleSided": True}]
+        stacked_mesh = import_skp._build_mesh_datablock("Stacked", res, gltf_mats, {}, [], {})
+        assert len(stacked_mesh.polygons) == 4 and len(stacked_mesh.vertices) == 8, (
+            len(stacked_mesh.polygons), len(stacked_mesh.vertices)
+        )
+        mc = stacked_mesh.copy()
+        assert not mc.validate(), "stacked coplanar quads failed Mesh.validate()"
+        bpy.data.meshes.remove(mc)
+    print(f"curve welding & stacked-face validity: {validated_meshes} fixture datablocks & {welded_curves} curve meshes valid - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -2125,6 +2402,9 @@ def main():
     check_nesting_tree()
     check_linked_duplicates_off_matches_main()
     check_linked_duplicates_import()
+    check_unpainted_faces_style_and_tag_colours()
+    check_flat_multi_material_surface_keeps_front_paint()
+    check_curve_welding_and_stacked_faces_validate()
     print("test_import: all fixtures OK (including source-geometry discoverability and linked duplicates)")
 
 
