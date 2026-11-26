@@ -16,3 +16,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - feat(import): import SketchUp texts and dimensions (#37)
 - feat(import,export): option to import components as linked duplicates and round-trip them as SketchUp components (#39)
 - chore: bundle openskp 1.7.0, enabling scene cameras, 2021+ component annotations, dimension offsets with witness lines, style front/back unpainted face colours (#16), classic instance tags/paint, and canonical component GUIDs
+- fix(import): add tag-colour option for unpainted faces, weld loose-edge curve vertices, keep stacked coplanar faces valid, preserve front paint on flat multi-material surfaces, and ignore all-opaque 32-bit texture alpha (#16)

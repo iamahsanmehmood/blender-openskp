@@ -5,7 +5,7 @@ Registers File > Import > SketchUp (.skp) and File > Export > SketchUp
 this file only wires them into Blender's operator/menu system.
 """
 import bpy
-from bpy.props import BoolProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 
@@ -41,6 +41,26 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
         ),
         default=False,
     )
+    unpainted_faces: EnumProperty(
+        name="Unpainted Faces",
+        description=(
+            "How faces with no material painted on them or their enclosing "
+            "component/group are coloured"
+        ),
+        items=(
+            (
+                "STYLE",
+                "Style Colours",
+                "Use the SketchUp style's front and back face colours",
+            ),
+            (
+                "TAG",
+                "Tag Colour",
+                "Use each placement's SketchUp tag colour on both sides",
+            ),
+        ),
+        default="STYLE",
+    )
 
     def execute(self, context):
         from . import import_skp
@@ -52,6 +72,7 @@ class IMPORT_OT_openskp(bpy.types.Operator, ImportHelper):
                 keep_hierarchy=self.keep_hierarchy,
                 import_annotations=self.import_annotations,
                 linked_duplicates=self.linked_duplicates,
+                unpainted_faces=self.unpainted_faces.lower(),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             self.report({"ERROR"}, f"OpenSKP import failed: {exc}")

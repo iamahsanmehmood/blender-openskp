@@ -279,6 +279,34 @@ def _has_texture(gltf_mat):
     return gltf_mat.get("pbrMetallicRoughness", {}).get("baseColorTexture") is not None
 
 
+def _image_has_alpha_cutout(image):
+    """Whether ``image`` carries a non-opaque alpha channel (at least one pixel
+    below 1.0). Many 32-bit PNG, TIFF and TGA textures store ``A = 255`` on
+    every pixel; treating ``image.depth`` alone as a cut-out wires a constant
+    1.0 into Principled BSDF Alpha, overriding any material translucency and
+    forcing Dithered rendering on translucent glass (#16)."""
+    if image.depth not in (32, 128):
+        return False
+    cached = image.get("openskp_has_alpha_cutout")
+    if cached is not None:
+        return bool(cached)
+    has_cutout = True
+    try:
+        import numpy as np
+
+        w, h = image.size
+        if not w or not h or image.channels < 4:
+            has_cutout = False
+        else:
+            pixels = np.empty(w * h * image.channels, dtype=np.float32)
+            image.pixels.foreach_get(pixels)
+            has_cutout = bool(pixels[3::image.channels].min() < 1.0 - 1e-4)
+    except Exception:  # noqa: BLE001 - fall back to depth check if pixel read fails
+        has_cutout = True
+    image["openskp_has_alpha_cutout"] = has_cutout
+    return has_cutout
+
+
 def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
     """Fills `bsdf` (a Principled BSDF in `mat`'s node tree) from one
     openskp material: its texture, tint and alpha, or its solid colour.
@@ -313,8 +341,17 @@ def _populate_surface(mat, bsdf, gltf_mat, textures, image_cache, uv_map=None):
             uv_node.uv_map = uv_map
             uv_node.location = (tex_node.location.x - 220, tex_node.location.y)
             mat.node_tree.links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
-        if "Alpha" in bsdf.inputs and image.depth in (32, 128):  # has its own alpha channel
-            mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
+        if "Alpha" in bsdf.inputs and _image_has_alpha_cutout(image):
+            if a < 1.0 - 1e-4:
+                mul = mat.node_tree.nodes.new("ShaderNodeMath")
+                mul.operation = "MULTIPLY"
+                mul.use_clamp = True
+                mul.location = (bsdf.location.x - 140, bsdf.location.y - 180)
+                mul.inputs[1].default_value = a
+                mat.node_tree.links.new(tex_node.outputs["Alpha"], mul.inputs[0])
+                mat.node_tree.links.new(mul.outputs["Value"], bsdf.inputs["Alpha"])
+            else:
+                mat.node_tree.links.new(tex_node.outputs["Alpha"], bsdf.inputs["Alpha"])
             texture_alpha = True
             _use_dithered_alpha(mat)
         elif "Alpha" in bsdf.inputs:
@@ -555,7 +592,7 @@ def _find_twin_triangles(verts, tris):
     return twin_of
 
 
-def _choose_front_triangles(verts, tris, twin_of):
+def _choose_front_triangles(verts, tris, twin_of, back_triangles=frozenset()):
     """{kept triangle: dropped twin}. Either copy can carry the pair in EEVEE
     and Cycles, because the Backfacing mix picks the paint by which side is
     seen; the choice decides the polygon normals, which of the two paints uses
@@ -567,10 +604,15 @@ def _choose_front_triangles(verts, tris, twin_of):
     faces outward. Deciding triangle by triangle ("facing away from the mesh's
     centre") is only right for convex shapes: on a torus it turned the faces
     of the inner ring inside out (#33). A surface with no outside, such as a
-    single flat face, keeps the first copy."""
+    single flat face, keeps SketchUp's front copy (the one not listed in
+    ``LocalPrimitive.back_triangles``)."""
     if not twin_of:
         return {}
-    pairs = sorted((t, o) for t, o in twin_of.items() if t < o)
+    raw_pairs = sorted((t, o) for t, o in twin_of.items() if t < o)
+    pairs = [
+        (o, t) if (t in back_triangles and o not in back_triangles) else (t, o)
+        for t, o in raw_pairs
+    ]
 
     # Neighbours: pairs sharing an edge that belongs to exactly two pairs. An
     # edge where more of them meet doesn't say which two form one surface.
@@ -635,8 +677,10 @@ def _build_mesh_datablock(
     verts = []
     vert_uvs = []
     tris = []  # (a, b, c, material_index) per source triangle, in order
+    back_triangles = set()
     for prim in resource.primitives:
         base = len(verts)
+        tri_base = len(tris)
         pos = prim.positions
         uvs = prim.uvs
         for i in range(0, len(pos), 3):
@@ -644,12 +688,16 @@ def _build_mesh_datablock(
         for i in range(0, len(uvs), 2):
             vert_uvs.append((uvs[i], uvs[i + 1]))
         idx = prim.indices
-        for i in range(len(idx) // 3):
+        num_tris = len(idx) // 3
+        for ti in getattr(prim, "back_triangles", None) or ():
+            if 0 <= ti < num_tris:
+                back_triangles.add(tri_base + ti)
+        for i in range(num_tris):
             tris.append((base + idx[i * 3], base + idx[i * 3 + 1], base + idx[i * 3 + 2], prim.material_index))
 
     has_uvs = len(vert_uvs) == len(verts) and bool(vert_uvs)
     twin_of = _find_twin_triangles(verts, tris)
-    base_of_pair = _choose_front_triangles(verts, tris, twin_of)  # pair's kept triangle -> dropped twin
+    base_of_pair = _choose_front_triangles(verts, tris, twin_of, back_triangles)  # pair's kept triangle -> dropped twin
 
     slot_by_key = {}
     mesh_materials = []
@@ -694,18 +742,40 @@ def _build_mesh_datablock(
     # from its neighbours. A triangle with two corners at one point has no
     # area and would become an invalid polygon once welded: leave it out.
     kept = [tri for tri in kept if len({verts[v] for v in tri[:3]}) == 3]
-    welded = {}  # position -> index in out_verts
+    # Blender's Mesh topology forbids two polygons sharing the exact same set
+    # of three vertex indices (Mesh.validate() deletes the second polygon).
+    # Normal neighbours share weld_layers[0]; a coplanar duplicate face stacked
+    # on the exact same 3 coordinates overflows into a secondary weld layer so
+    # both faces stay valid while still welding across their own triangulation.
+    weld_layers = [{}]  # [{position: index in out_verts}, ...]
+    seen_tri_verts = set()
     out_verts = []
     out_tris = []
     for a, b, c, _, _ in kept:
-        corners = []
-        for v in (a, b, c):
-            index = welded.get(verts[v])
-            if index is None:
-                index = welded[verts[v]] = len(out_verts)
-                out_verts.append(verts[v])
-            corners.append(index)
-        out_tris.append(tuple(corners))
+        pts = (verts[a], verts[b], verts[c])
+        for layer in weld_layers:
+            existing = [layer.get(p) for p in pts]
+            if all(idx is not None for idx in existing) and frozenset(existing) in seen_tri_verts:
+                continue
+            corners = []
+            for p, idx in zip(pts, existing):
+                if idx is None:
+                    idx = layer[p] = len(out_verts)
+                    out_verts.append(p)
+                corners.append(idx)
+            seen_tri_verts.add(frozenset(corners))
+            out_tris.append(tuple(corners))
+            break
+        else:
+            layer = {}
+            weld_layers.append(layer)
+            corners = []
+            for p in pts:
+                idx = layer[p] = len(out_verts)
+                out_verts.append(p)
+                corners.append(idx)
+            seen_tri_verts.add(frozenset(corners))
+            out_tris.append(tuple(corners))
 
     if zup_vertices:
         out_verts = [(vx, -vz, vy) for vx, vy, vz in out_verts]
@@ -808,23 +878,39 @@ def _get_or_build_collection(
 
 def _build_curve_datablock(name, resource, zup_vertices=False):
     """Builds one edges-only ``bpy.types.Mesh`` datablock from an
-    ``InstancedCurveResource``."""
-    verts = []
-    edges = []
+    ``InstancedCurveResource``, welding shared endpoints where loose-edge runs
+    meet at junctions."""
+    welded = {}
+    out_verts = []
+    out_edges = []
+    seen_edges = set()
+
+    def vert_index(pt):
+        key = (pt[0], pt[1], pt[2])
+        idx = welded.get(key)
+        if idx is None:
+            idx = welded[key] = len(out_verts)
+            out_verts.append((key[0], -key[2], key[1]) if zup_vertices else key)
+        return idx
+
     for curve in resource.curves:
-        base = len(verts)
         pts = curve.points_m
-        if zup_vertices:
-            verts.extend((px, -pz, py) for px, py, pz in pts)
-        else:
-            verts.extend(pts)
-        for i in range(len(pts) - 1):
-            edges.append((base + i, base + i + 1))
-        if curve.closed and len(pts) > 2:
-            edges.append((base + len(pts) - 1, base))
+        if len(pts) < 2:
+            continue
+        indices = [vert_index(pt) for pt in pts]
+        pairs = [(indices[i], indices[i + 1]) for i in range(len(indices) - 1)]
+        if curve.closed and len(indices) > 2:
+            pairs.append((indices[-1], indices[0]))
+        for u, v in pairs:
+            if u == v:
+                continue
+            edge_key = (u, v) if u < v else (v, u)
+            if edge_key not in seen_edges:
+                seen_edges.add(edge_key)
+                out_edges.append((u, v))
 
     mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(verts, edges, [])
+    mesh.from_pydata(out_verts, out_edges, [])
     mesh.update()
     return mesh
 
@@ -2044,6 +2130,7 @@ def import_skp(
     keep_hierarchy=False,
     import_annotations=False,
     linked_duplicates=False,
+    unpainted_faces="style",
 ):
     """Imports a .skp file into the current (or given) Blender context's
     scene, returning a stats dict. ``keep_hierarchy`` keeps SketchUp's
@@ -2051,7 +2138,12 @@ def import_skp(
     ``import_annotations`` imports SketchUp texts and linear dimensions into
     per-tag 'Annotations' collections (#27). ``linked_duplicates`` imports
     component parts as ``MESH`` objects sharing their ``Mesh`` datablock rather
-    than as collection instances (#35)."""
+    than as collection instances (#35). ``unpainted_faces`` selects whether
+    faces with no paint on them or their enclosing instance use the SketchUp
+    style's front/back face colours (``"style"``, default) or each placement's
+    tag colour (``"tag"``, #16)."""
+    if unpainted_faces not in ("style", "tag"):
+        raise ValueError(f'unpainted_faces must be "style" or "tag", not {unpainted_faces!r}')
     check_bundled_libraries()
     import openskp
 
@@ -2067,7 +2159,7 @@ def import_skp(
         skp = openskp.SkpFile.open(filepath)
         # Keep TIFF, TGA and GIF textures in their source format in the scene so Blender can load
         # TIFF/TGA and report GIF.
-        options = {"original_textures": True}
+        options = {"original_textures": True, "unpainted_faces": unpainted_faces}
         if linked_duplicates and type(skp).build_instanced_scene is openskp.SkpFile.build_instanced_scene:
             from openskp import _core, instanced_scene
 

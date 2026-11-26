@@ -109,13 +109,20 @@ than reimplementing SketchUp's material-inheritance rules here.
 - **Front and back paint**: a face painted differently on its two sides
   is imported as one polygon whose material mixes the two paints on
   Geometry > Backfacing (named `Front | Back`), so EEVEE and Cycles show
-  each side's own paint and nothing overlaps. Unpainted faces and unpainted
-  sides receive the SketchUp model style's front and back face colours (#16).
+  each side's own paint and nothing overlaps. By default (*Unpainted Faces:
+  Style Colours*), unpainted faces and unpainted sides receive the SketchUp
+  model style's front and back face colours (#16); switching *Unpainted Faces*
+  to *Tag Colour* (`unpainted_faces="tag"`) colours them with each placement's
+  SketchUp tag colour instead (per-face tag colours inside one mesh and
+  SketchUp's *Color by Tag* style toggle are not resolved by OpenSKP yet).
   Solid shading cannot read
   node trees, so it shows the painted side's colour when the other side is
   unpainted, and the front paint when both sides are painted (or the style's
   front colour when neither side is painted). A texture on
-  the back side is read from a second UV layer, `UVMap_back`. Export writes
+  the back side is read from a second UV layer, `UVMap_back`. Shared vertices
+  across adjacent faces and loose-edge construction lines are welded on import
+  while preserving per-corner UV seams and keeping coplanar stacked faces valid.
+  Export writes
   the front paint only; the back paint is not exported yet.
 - **Colorized textures** (SketchUp's `[Name]1` copies of a texture
   recoloured in the Materials panel) are re-tinted toward their colour
