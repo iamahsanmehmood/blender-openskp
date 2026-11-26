@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
 - fix(import): show the painted side in Solid view when the other side is unpainted (#25)
 - feat(import): report partial classic .skp reads ahead of other warnings (#30)
 - ci: test on Blender 4.2.4, 4.5.16 and 5.3.0, installing the release zip (#31)
