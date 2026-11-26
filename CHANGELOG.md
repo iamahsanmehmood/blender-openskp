@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- feat(import,export): build one shared shader node group per SketchUp material across single-sided and `Front | Back` materials, and read colours and textures from it on export (#41)
+
 ## [0.4.0] - 2026-11-26
 
 - fix(import): show the painted side in Solid view when the other side is unpainted (#25)

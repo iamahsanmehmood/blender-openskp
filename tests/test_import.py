@@ -345,14 +345,18 @@ def check_front_back_pairs(fixture_name, scene, resource, obj):
         back_gltf = scene.gltf_materials[mat["openskp_back_material_index"]]
         nodes = mat.node_tree.nodes
         assert not mat.use_backface_culling, f"{label}/{mat.name}: both sides must be drawn"
-        assert sum(n.type == "BSDF_PRINCIPLED" for n in nodes) == 2, f"{label}/{mat.name}: expected two surfaces"
+        assert sum(n.type == "GROUP" for n in nodes) == 2, f"{label}/{mat.name}: expected two surface groups"
+        assert sum(n.type == "BSDF_PRINCIPLED" for n in nodes) == 0, f"{label}/{mat.name}: Principled BSDF belongs in group"
         mix = next(n for n in nodes if n.type == "MIX_SHADER")
         assert mix.inputs["Fac"].links[0].from_socket.name == "Backfacing", f"{label}/{mat.name}: mix not on Backfacing"
         out = next(n for n in nodes if n.type == "OUTPUT_MATERIAL")
         assert out.inputs["Surface"].links[0].from_node.name == mix.name
         front_in = mix.inputs[1].links[0].from_node
         back_in = mix.inputs[2].links[0].from_node
-        assert front_in.name != back_in.name and front_in.type == back_in.type == "BSDF_PRINCIPLED"
+        assert front_in.name != back_in.name and front_in.type == back_in.type == "GROUP"
+        assert front_in.node_tree is not None and back_in.node_tree is not None
+        assert any(n.type == "BSDF_PRINCIPLED" for n in front_in.node_tree.nodes)
+        assert any(n.type == "BSDF_PRINCIPLED" for n in back_in.node_tree.nodes)
         front_painted = bool(front_gltf.get("name")) or bool(
             front_gltf.get("pbrMetallicRoughness", {}).get("baseColorTexture")
         )
@@ -367,11 +371,12 @@ def check_front_back_pairs(fixture_name, scene, resource, obj):
         )
         if back_gltf.get("pbrMetallicRoughness", {}).get("baseColorTexture"):
             assert import_skp._BACK_UV_LAYER in mesh.uv_layers, f"{label}: textured back paint but no back UV layer"
-            back_tex = next(n for n in nodes if n.type == "TEX_IMAGE" and n.inputs["Vector"].links)
-            uv_node = back_tex.inputs["Vector"].links[0].from_node
+            assert back_in.inputs["UV"].links, f"{label}/{mat.name}: back group UV input not linked"
+            uv_node = back_in.inputs["UV"].links[0].from_node
             assert uv_node.type == "UVMAP" and uv_node.uv_map == import_skp._BACK_UV_LAYER, (
                 f"{label}/{mat.name}: back texture must read {import_skp._BACK_UV_LAYER}"
             )
+            assert any(n.type == "TEX_IMAGE" and n.inputs["Vector"].links for n in back_in.node_tree.nodes)
     print(
         f"{label}: {len(pairs)} front/back pairs kept as one polygon each, "
         f"{len(pair_materials)} front/back materials, no overlapping copies - OK"
@@ -489,17 +494,27 @@ def check_textures(fixture_name, new_objects):
             back_index = bl_mat.get("openskp_back_material_index")
             roles = [(front_index, False)] + ([(back_index, True)] if back_index is not None else [])
             textured_roles = [(index, is_back) for index, is_back in roles if is_textured(index)]
-            tex_nodes = [n for n in bl_mat.node_tree.nodes if n.type == "TEX_IMAGE"]
-            assert len(tex_nodes) == len(textured_roles), (
+            group_tex_pairs = [
+                (grp, n)
+                for grp in bl_mat.node_tree.nodes
+                if grp.type == "GROUP" and grp.node_tree is not None
+                for n in grp.node_tree.nodes
+                if n.type == "TEX_IMAGE"
+            ]
+            assert len(group_tex_pairs) == len(textured_roles), (
                 f"{fixture_name}/{bl_mat.name}: expected {len(textured_roles)} Image Texture node(s), "
-                f"got {len(tex_nodes)}"
+                f"got {len(group_tex_pairs)}"
             )
             for index, is_back in textured_roles:
                 seen_materials.add(index)
                 texture_index = scene.gltf_materials[index]["pbrMetallicRoughness"]["baseColorTexture"]["index"]
                 expected_size = expected_pixel_size(textures[texture_index].data)
-                # The back paint's texture is the one fed by a UV Map node.
-                tex_node = next(n for n in tex_nodes if bool(n.inputs["Vector"].links) == is_back)
+                # The back paint's group is the one whose UV input is fed by a UV Map node.
+                _, tex_node = next(
+                    (grp, n)
+                    for grp, n in group_tex_pairs
+                    if ("UV" in grp.inputs and bool(grp.inputs["UV"].links)) == is_back
+                )
                 image = tex_node.image
                 assert image is not None, f"{fixture_name}/{bl_mat.name}: Image Texture node has no image assigned"
                 assert tuple(image.size) == expected_size, (
@@ -605,7 +620,8 @@ def check_colorized_texture_is_tinted():
     ]
     for index, colorize_type in enumerate((0, 1)):
         mat = import_skp._get_or_build_material(index, gltf_materials, {}, textures, {})
-        nodes = mat.node_tree.nodes
+        (grp,) = [n for n in mat.node_tree.nodes if n.type == "GROUP"]
+        nodes = grp.node_tree.nodes
         bsdf = nodes["Principled BSDF"]
         tint = bsdf.inputs["Base Color"].links[0].from_node
         assert tint.type == "MIX" and tint.blend_type == "MULTIPLY", f"{mat.name}: Base Color isn't tinted"
@@ -673,8 +689,12 @@ def check_alpha_materials_use_the_right_render_method():
     def build(index):
         return import_skp._get_or_build_material(index, gltf, {}, textures, {})
 
+    def surface_bsdf(mat):
+        (grp,) = [n for n in mat.node_tree.nodes if n.type == "GROUP"]
+        return grp.node_tree.nodes["Principled BSDF"]
+
     cutout = build(0)
-    alpha_links = cutout.node_tree.nodes["Principled BSDF"].inputs["Alpha"].links
+    alpha_links = surface_bsdf(cutout).inputs["Alpha"].links
     assert alpha_links and alpha_links[0].from_node.type == "TEX_IMAGE", "cut-out alpha isn't wired to Alpha"
     assert cutout.surface_render_method == "DITHERED", "a cut-out texture must use the Dithered render method"
     assert build(2).surface_render_method == "BLENDED", "flat translucent glass must stay Blended"
@@ -684,10 +704,10 @@ def check_alpha_materials_use_the_right_render_method():
     # A 32-bit RGBA image whose alpha is 255 on every pixel (such as TestFIleType.skp's TIFF) is
     # opaque, not a cut-out: it leaves Alpha unlinked and preserves material translucency (#16).
     rgba_solid_mat = build(5)
-    assert not rgba_solid_mat.node_tree.nodes["Principled BSDF"].inputs["Alpha"].links
+    assert not surface_bsdf(rgba_solid_mat).inputs["Alpha"].links
     assert rgba_solid_mat.surface_render_method == "DITHERED"
     rgba_glass_mat = build(6)
-    rgba_glass_bsdf = rgba_glass_mat.node_tree.nodes["Principled BSDF"]
+    rgba_glass_bsdf = surface_bsdf(rgba_glass_mat)
     assert not rgba_glass_bsdf.inputs["Alpha"].links, "all-opaque 32-bit image must not override glass Alpha"
     assert abs(rgba_glass_bsdf.inputs["Alpha"].default_value - 0.5) < 1e-5
     assert rgba_glass_mat.surface_render_method == "BLENDED", "translucent glass with all-opaque RGBA stays Blended"
@@ -695,7 +715,7 @@ def check_alpha_materials_use_the_right_render_method():
     # A cut-out texture whose SketchUp material ALSO carries opacity < 1.0 multiplies both (#16).
     trans_cutout = build(7)
     assert trans_cutout.surface_render_method == "DITHERED"
-    tc_links = trans_cutout.node_tree.nodes["Principled BSDF"].inputs["Alpha"].links
+    tc_links = surface_bsdf(trans_cutout).inputs["Alpha"].links
     assert tc_links and tc_links[0].from_node.type == "MATH" and tc_links[0].from_node.operation == "MULTIPLY"
     assert tc_links[0].from_node.inputs[0].links[0].from_node.type == "TEX_IMAGE"
     assert abs(tc_links[0].from_node.inputs[1].default_value - 0.5) < 1e-5
@@ -916,7 +936,13 @@ def check_original_textures_are_loaded():
         shown = [
             mat.name
             for mat in bpy.data.materials
-            if mat.use_nodes and any(node.type == "TEX_IMAGE" and node.image == image for node in mat.node_tree.nodes)
+            if mat.use_nodes
+            and any(
+                grp.type == "GROUP"
+                and grp.node_tree is not None
+                and any(node.type == "TEX_IMAGE" and node.image == image for node in grp.node_tree.nodes)
+                for grp in mat.node_tree.nodes
+            )
         ]
         assert shown, f"{name}: no material shows the loaded image"
     # A GIF is kept by the library but Blender opens it as a movie: no image, and the import says so.
@@ -1089,7 +1115,9 @@ def check_solid_view_shows_painted_side():
     (plus_x_mat,) = plus_x_mats
     assert plus_x_mat.name.endswith("| Metal Aluminum Anodized"), plus_x_mat.name
     mix = next(n for n in plus_x_mat.node_tree.nodes if n.type == "MIX_SHADER")
-    back_bsdf = mix.inputs[2].links[0].from_node
+    back_group = mix.inputs[2].links[0].from_node
+    assert back_group.type == "GROUP" and back_group.node_tree is not None
+    back_bsdf = back_group.node_tree.nodes["Principled BSDF"]
     assert tuple(round(c, 3) for c in back_bsdf.inputs["Base Color"].default_value) == linear_rgba(aluminum_rgb)
 
     # When neither side is painted (two unnamed fallback colours, as openskp#533 will emit for
@@ -1691,6 +1719,8 @@ def _reset_empty_scene():
         bpy.data.curves.remove(crv)
     for img in list(bpy.data.images):
         bpy.data.images.remove(img)
+    for ng in list(bpy.data.node_groups):
+        bpy.data.node_groups.remove(ng)
 
 
 BASELINE_COMMIT = "28248002293a15eee0529ecdc7b88ad9c20c0691"
@@ -2227,7 +2257,9 @@ def check_unpainted_faces_style_and_tag_colours():
             assert pair_slot.name.startswith("Gold | ")
             assert tuple(round(c, 3) for c in pair_slot.diffuse_color) == lin_rgba(gold_rgb)
             mix = next(n for n in pair_slot.node_tree.nodes if n.type == "MIX_SHADER")
-            back_bsdf = mix.inputs[2].links[0].from_node
+            back_group = mix.inputs[2].links[0].from_node
+            assert back_group.type == "GROUP" and back_group.node_tree is not None
+            back_bsdf = back_group.node_tree.nodes["Principled BSDF"]
             assert tuple(round(c, 3) for c in back_bsdf.inputs["Base Color"].default_value) == lin_rgba(tag_rgb)
 
         # 3. Tag mode with linked_duplicates=True: RedTag placements share a Mesh, BlueTag gets its own
@@ -2376,6 +2408,152 @@ def check_curve_welding_and_stacked_faces_validate():
     print(f"curve welding & stacked-face validity: {validated_meshes} fixture datablocks & {welded_curves} curve meshes valid - OK")
 
 
+def check_per_material_shader_node_groups():
+    """Each SketchUp material imports as one shared ``ShaderNodeTree`` group named
+    like the material in SketchUp (#41):
+    - Single-sided / double-sided materials contain only that group (+ Material Output,
+      plus ``Hide back side`` when single-sided).
+    - ``Front | Back`` pair materials contain the two groups mixed on ``Backfacing``.
+    - Editing a group's colour updates BOTH materials that share it (verified via
+      actual Cycles pixel renders and ``export_skp`` round-trip)."""
+    import tempfile
+    import numpy as np
+    import openskp
+
+    export_mod = _load_module("export_skp")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tex_path = os.path.join(tmp, "checker.png")
+        with open(tex_path, "wb") as f:
+            f.write(_png(2, 2, [[(220, 40, 40), (220, 40, 40)], [(40, 60, 220), (40, 60, 220)]]))
+
+        skp = os.path.join(tmp, "shared_groups.skp")
+        builder = openskp.SkpBuilder()
+        crimson = builder.add_material("Crimson", (210, 25, 35, 255))
+        cobalt = builder.add_material("Cobalt", (25, 70, 210, 255))
+        checker = builder.add_texture_material("Checker", tex_path, 20, 20)
+
+        # Left quad (x in [0, 20], z=0 -> Blender XY plane at y=0? Note: SketchUp XY plane z=0 is Blender XY plane z=0!):
+        # Face 1: Crimson on BOTH sides -> single Blender Material "Crimson"
+        builder.add_face([(0, 0, 0), (20, 0, 0), (20, 20, 0), (0, 20, 0)], material=crimson, back_material=crimson)
+        # Face 2: Crimson on front, Cobalt on back -> pair Material "Crimson | Cobalt"
+        builder.add_face([(25, 0, 0), (45, 0, 0), (45, 20, 0), (25, 20, 0)], material=crimson, back_material=cobalt)
+        # Face 3: Checker on both sides + Face 4: Cobalt on front, Checker on back -> shares one "Checker" group
+        builder.add_face([(50, 0, 0), (70, 0, 0), (70, 20, 0), (50, 20, 0)], material=checker, back_material=checker)
+        builder.add_face([(75, 0, 0), (95, 0, 0), (95, 20, 0), (75, 20, 0)], material=cobalt, back_material=checker)
+        builder.save(skp)
+
+        _reset_empty_scene()
+        import_skp.import_skp(skp)
+
+        # 1. Exactly one shader node group per SketchUp material ("Crimson", "Cobalt", "Checker")
+        shader_groups = {ng.name: ng for ng in bpy.data.node_groups if ng.bl_idname == "ShaderNodeTree"}
+        assert set(shader_groups) == {"Crimson", "Cobalt", "Checker"}, sorted(shader_groups)
+
+        mat_single = bpy.data.materials["Crimson"]
+        mat_pair = bpy.data.materials["Crimson | Cobalt"]
+        mat_checker = bpy.data.materials["Checker"]
+        mat_back_checker = bpy.data.materials["Cobalt | Checker"]
+
+        # 2. Single-sided/double-sided material contains ONLY the group + Material Output
+        assert {n.type for n in mat_single.node_tree.nodes} == {"GROUP", "OUTPUT_MATERIAL"}
+        (single_grp,) = [n for n in mat_single.node_tree.nodes if n.type == "GROUP"]
+        assert single_grp.node_tree is shader_groups["Crimson"]
+
+        assert {n.type for n in mat_checker.node_tree.nodes} == {"GROUP", "OUTPUT_MATERIAL"}
+        (checker_grp,) = [n for n in mat_checker.node_tree.nodes if n.type == "GROUP"]
+        assert checker_grp.node_tree is shader_groups["Checker"]
+
+        # 3. Front | Back contains ONLY the two groups mixed on Backfacing (+ UVMap_back when back is textured)
+        assert {n.type for n in mat_pair.node_tree.nodes} == {
+            "GROUP", "NEW_GEOMETRY", "MIX_SHADER", "OUTPUT_MATERIAL",
+        }
+        pair_mix = next(n for n in mat_pair.node_tree.nodes if n.type == "MIX_SHADER")
+        pair_front = pair_mix.inputs[1].links[0].from_node
+        pair_back = pair_mix.inputs[2].links[0].from_node
+        assert pair_front.node_tree is shader_groups["Crimson"]
+        assert pair_back.node_tree is shader_groups["Cobalt"]
+
+        bc_mix = next(n for n in mat_back_checker.node_tree.nodes if n.type == "MIX_SHADER")
+        assert bc_mix.inputs[1].links[0].from_node.node_tree is shader_groups["Cobalt"]
+        assert bc_mix.inputs[2].links[0].from_node.node_tree is shader_groups["Checker"]
+        assert bc_mix.inputs[2].links[0].from_node.inputs["UV"].links[0].from_node.uv_map == import_skp._BACK_UV_LAYER
+
+        # 4. Editing Crimson's node group colour changes BOTH "Crimson" and "Crimson | Cobalt" in Cycles & on export!
+        scene = bpy.context.scene
+        scene.render.engine = "CYCLES"
+        scene.cycles.device = "CPU"
+        scene.cycles.samples = 16
+        scene.cycles.use_adaptive_sampling = False
+        scene.cycles.use_denoising = False
+        scene.view_settings.view_transform = "Standard"
+        scene.render.resolution_x = 128
+        scene.render.resolution_y = 64
+        scene.render.image_settings.file_format = "PNG"
+
+        world = bpy.data.worlds.new("FlatWhite")
+        world.use_nodes = True
+        bg = world.node_tree.nodes.get("Background") or next(n for n in world.node_tree.nodes if n.type == "BACKGROUND")
+        bg.inputs[0].default_value = (1.0, 1.0, 1.0, 1.0)
+        bg.inputs[1].default_value = 1.0
+        scene.world = world
+
+        # Ortho camera looking straight down at Face 1 (x in [0, 0.508]) and Face 2 (x in [0.635, 1.143])
+        cam_data = bpy.data.cameras.new("TopOrtho")
+        cam_data.type = "ORTHO"
+        cam_data.ortho_scale = 1.25
+        cam_obj = bpy.data.objects.new("TopOrtho", cam_data)
+        cam_obj.location = (0.5715, 0.254, 2.0)
+        cam_obj.rotation_euler = (0.0, 0.0, 0.0)
+        scene.collection.objects.link(cam_obj)
+        scene.camera = cam_obj
+
+        def render_rgb(tag):
+            out_png = os.path.join(tmp, f"{tag}.png")
+            scene.render.filepath = out_png
+            bpy.ops.render.render(write_still=True)
+            img = bpy.data.images.load(out_png)
+            try:
+                arr = np.empty(128 * 64 * img.channels, dtype=np.float32)
+                img.pixels.foreach_get(arr)
+                grid = arr.reshape(64, 128, img.channels)
+                # Average 24x24 interior patches on Face 1 (cols 20..44) and Face 2 (cols 84..108)
+                f1 = grid[20:44, 20:44, :3].mean(axis=(0, 1))
+                f2 = grid[20:44, 84:108, :3].mean(axis=(0, 1))
+                return tuple(float(c) for c in f1), tuple(float(c) for c in f2)
+            finally:
+                bpy.data.images.remove(img)
+
+        before_f1, before_f2 = render_rgb("before")
+        assert before_f1[0] > before_f1[1] + 0.35 and before_f1[0] > before_f1[2] + 0.35, before_f1
+        assert before_f2[0] > before_f2[1] + 0.35 and before_f2[0] > before_f2[2] + 0.35, before_f2
+        assert all(abs(a - b) < 0.02 for a, b in zip(before_f1, before_f2)), (before_f1, before_f2)
+
+        # Edit ONLY the shared "Crimson" node group to emerald green (30, 200, 60):
+        emerald_srgb = (30, 200, 60)
+        elr, elg, elb = import_skp.srgb_to_linear(tuple(c / 255.0 for c in emerald_srgb))
+        shader_groups["Crimson"].nodes["Principled BSDF"].inputs["Base Color"].default_value = (elr, elg, elb, 1.0)
+
+        after_f1, after_f2 = render_rgb("after")
+        assert after_f1[1] > after_f1[0] + 0.35 and after_f1[1] > after_f1[2] + 0.25, after_f1
+        assert after_f2[1] > after_f2[0] + 0.35 and after_f2[1] > after_f2[2] + 0.25, after_f2
+        assert all(abs(a - b) < 0.02 for a, b in zip(after_f1, after_f2)), (after_f1, after_f2)
+
+        # Export reads the edited group colour back into the .skp file:
+        rt_skp = os.path.join(tmp, "edited_group_rt.skp")
+        for o in bpy.data.objects:
+            o.select_set(False)
+        bpy.context.view_layer.update()
+        export_mod.export_skp(rt_skp, bpy.context)
+        exported = {m.name: tuple(m.color[:3]) for m in openskp.SkpFile.open(rt_skp).parse().materials}
+        assert exported["Crimson"] == emerald_srgb, exported
+        assert exported["Cobalt"] == (25, 70, 210), exported
+        assert "Checker" in exported, exported
+
+        bpy.data.worlds.remove(world)
+    print("per-material shader node groups (#41): shared group, Front | Back 2 groups, live edit & export - OK")
+
+
 def main():
     check_missing_bundled_library_is_a_clear_error()
     checked = 0
@@ -2405,6 +2583,7 @@ def main():
     check_unpainted_faces_style_and_tag_colours()
     check_flat_multi_material_surface_keeps_front_paint()
     check_curve_welding_and_stacked_faces_validate()
+    check_per_material_shader_node_groups()
     print("test_import: all fixtures OK (including source-geometry discoverability and linked duplicates)")
 
 
