@@ -269,7 +269,7 @@ def _material_spec(mat, all_material_names=None):
                 if recol is None:
                     return None
                 rgba, opacity = recol
-                return (f"skp:{mat.name}:{rgba}:{opacity}", mat.name, rgba, opacity)
+                return (f"skp:{front_name}:{rgba}:{opacity}", front_name, rgba, opacity)
             skp_name = back_name if front_unpainted else front_name
         elif _UNPAINTED_SLOT_RE.match(base):
             recol = _recolored_import_slot_rgba_opacity(mat)

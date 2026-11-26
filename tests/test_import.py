@@ -44,26 +44,23 @@ EXPECTED = {
     "capilla_quiroz_v17.skp": (3, 4, 871, 2, 2, 20, 1, 0, 3),
     # OpenSKP's own nesting fixture: groups Outer > Shelf > Inner, each with faces.
     "nesting_2021.skp": (3, 3, 6, 0, 0, 0, 1, 0, 0),
-    # One face each with a TIFF, TGA or GIF textured material. The last number, textures_loaded, is
-    # 0 with an openskp that leaves such a texture out (before 1.6.0, which is bundled now) and, with one that
-    # keeps it, 1 for TIFF and TGA but still 0 for GIF, which Blender cannot use as an image
-    # (_UNLOADABLE_TEXTURES); check() sets it from the library in use. See
-    # check_original_textures_are_loaded.
-    "texture_tiff_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
-    "texture_tga_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
+    # One face each with a TIFF, TGA or GIF textured material: TIFF and TGA load as packed
+    # images (1), while GIF is skipped with a warning because Blender opens GIF as a movie (0).
+    "texture_tiff_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 1),
+    "texture_tga_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 1),
     "texture_gif_2021.skp": (1, 1, 4, 0, 0, 0, 1, 0, 0),
-    # Scene camera fixtures (#26): gondola_v20.skp (1 parallel scene "Cena1")
-    # and two_scenes_2021.skp (SDK-written: perspective + parallel scenes).
-    "gondola_v20.skp": (12, 81, 3663, 4, 18, 4105, 1, 0, 0),
+    # Scene camera fixtures (#26): gondola_v20.skp (1 parallel scene "Cena1",
+    # 2 layers: Layer0 + Gondulas Laterais via openskp#615) and two_scenes_2021.skp
+    # (SDK-written: perspective + parallel scenes).
+    "gondola_v20.skp": (12, 81, 3663, 4, 18, 4105, 2, 0, 0),
     "two_scenes_2021.skp": (1, 1, 12, 0, 0, 0, 1, 0, 0),
     # 3-level nested components (Bolt -> Bracket -> Frame) across 4 tags (#28).
     "nested_components_2021.skp": (4, 15, 8, 0, 0, 0, 4, 0, 0),
     # Annotations fixtures (#27): 36x12" root slab + 24x6" Beam component on
     # Framing, 1 leader text, 1 screen text, and 2 linear dimensions (2017 & 2021).
-    "annotations_2017.skp": (2, 2, 4, 0, 0, 0, 1, 0, 0),
+    "annotations_2017.skp": (2, 2, 4, 0, 0, 0, 2, 0, 0),
     "annotations_2021.skp": (2, 2, 4, 0, 0, 0, 2, 0, 0),
 }
-TEXTURE_FIXTURES = ("texture_tiff_2021.skp", "texture_tga_2021.skp", "texture_gif_2021.skp")
 
 
 def check(fixture_name):
@@ -110,13 +107,6 @@ def check(fixture_name):
     )
     print(f"{fixture_name}: {got}")
     expected = EXPECTED.get(fixture_name)
-    if fixture_name in TEXTURE_FIXTURES:
-        loaded = 1 if _library_keeps_original_textures() and fixture_name != "texture_gif_2021.skp" else 0
-        expected = expected[:8] + (loaded,)
-    elif fixture_name == "annotations_2017.skp":
-        sh = openskp.SkpFile.open(path).build_instanced_scene().scene_hierarchy
-        expected_layers = len({n.layer or "Layer0" for n in [sh, *sh.children]})
-        expected = expected[:6] + (expected_layers,) + expected[7:]
     if expected is not None:
         assert got == expected, f"{fixture_name}: expected {expected}, got {got}"
     if stats["unique_meshes"]:
@@ -840,68 +830,57 @@ def check_partial_read_warning_is_reported():
         assert stats["unread_root_entities"] == 4, stats
         assert len(stats["warnings"]) == 1 and "read only in part" in stats["warnings"][0], stats
 
-        # 3. End-to-end check once a post-openskp#552 wheel is bundled.
+        # 3. End-to-end check on a truncated classic .skp file (openskp#552).
         openskp.SkpFile.build_instanced_scene = orig_build
         root_logger.setLevel(saved_root_level)
-        if hasattr(openskp.SkpModel, "unread_root_entities"):
-            builder = openskp.create()
-            builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
-            builder.add_text("First", (0, 0, 0))
-            builder.add_text("Broken", (5, 0, 0))
-            builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)])
-            raw = bytearray(builder.to_bytes())
-            at = raw.find(b"\x01\xff\xfe\xff\x06B\x00")
-            assert at >= 0
-            raw[at : at + 4] = b"\x00\x00\x00\x00"
-            with tempfile.TemporaryDirectory() as tmp:
-                broken = os.path.join(tmp, "partial.skp")
-                with open(broken, "wb") as f:
-                    f.write(raw)
-                stats = import_skp.import_skp(broken)
-                assert stats["unread_root_entities"] > 0, stats
-                assert stats["warnings"] and "read only in part" in stats["warnings"][0], stats
+        builder = openskp.create()
+        builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
+        builder.add_text("First", (0, 0, 0))
+        builder.add_text("Broken", (5, 0, 0))
+        builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)])
+        raw = bytearray(builder.to_bytes())
+        at = raw.find(b"\x01\xff\xfe\xff\x06B\x00")
+        assert at >= 0
+        raw[at : at + 4] = b"\x00\x00\x00\x00"
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = os.path.join(tmp, "partial.skp")
+            with open(broken, "wb") as f:
+                f.write(raw)
+            stats = import_skp.import_skp(broken)
+            assert stats["unread_root_entities"] > 0, stats
+            assert stats["warnings"] and "read only in part" in stats["warnings"][0], stats
     finally:
         openskp.SkpFile.build_instanced_scene = orig_build
         root_logger.setLevel(saved_root_level)
     print("partial-read warning: captured, ordered first, unread count recorded - OK")
 
 
-def _library_keeps_original_textures():
-    """Whether the openskp library in use can keep a TIFF, TGA or GIF texture in a scene (1.6.0 and
-    newer, which is what this add-on bundles); the texture fixtures import differently without it."""
-    import inspect
-
+def check_a_skipped_texture_is_reported_by_the_import():
+    """When openskp leaves out a texture (original_textures=False), the import
+    surfaces openskp's warning to the user (blender-openskp#17)."""
+    import functools
     import openskp
 
-    return "original_textures" in inspect.signature(openskp.SkpFile.build_instanced_scene).parameters
+    orig_build = openskp.SkpFile.build_instanced_scene
+    try:
+        @functools.wraps(orig_build)
+        def build_without_original_textures(self, *args, **kwargs):
+            kwargs.pop("original_textures", None)
+            return orig_build(self, *args, original_textures=False, **kwargs)
 
-
-def check_a_skipped_texture_is_reported_by_the_import():
-    """With an openskp that logs a texture it leaves out but cannot keep it (a build between 1.5.0
-    and 1.6.0; the bundled library is past that), a TIFF-textured material comes in without its texture and the import says
-    so (blender-openskp#17). Neither an older library (nothing logged) nor a newer one (which
-    keeps the texture, see check_original_textures_are_loaded) has anything to check here."""
-    import openskp.scene
-
-    if not hasattr(openskp.scene, "_warn_skipped_texture"):
-        print("skipped-texture warning: the bundled openskp does not log it yet - not checked")
-        return
-    if _library_keeps_original_textures():
-        print("skipped-texture warning: this openskp keeps the texture instead - not checked")
-        return
-    stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "texture_tiff_2021.skp"))
-    assert stats["textures_loaded"] == 0
-    assert len(stats["warnings"]) == 1, stats["warnings"]
-    assert "Tex_TIF" in stats["warnings"][0] and "TIFF" in stats["warnings"][0], stats["warnings"]
+        openskp.SkpFile.build_instanced_scene = build_without_original_textures
+        stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, "texture_tiff_2021.skp"))
+        assert stats["textures_loaded"] == 0
+        assert len(stats["warnings"]) == 1, stats["warnings"]
+        assert "Tex_TIF" in stats["warnings"][0] and "TIFF" in stats["warnings"][0], stats["warnings"]
+    finally:
+        openskp.SkpFile.build_instanced_scene = orig_build
     print("a TIFF texture: skipped, and the import reports it - OK")
 
 
 def check_original_textures_are_loaded():
     """A TIFF or TGA texture comes in as a real, packed Blender image wired into the material,
-    where it used to be dropped (blender-openskp#17). Needs an openskp that can keep it."""
-    if not _library_keeps_original_textures():
-        print("original textures: the bundled openskp cannot keep them yet - not checked")
-        return
+    where it used to be dropped (blender-openskp#17)."""
     for name in ("texture_tiff_2021.skp", "texture_tga_2021.skp"):
         before = set(bpy.data.images)
         stats = import_skp.import_skp(os.path.join(FIXTURES_DIR, name))
@@ -1170,23 +1149,17 @@ def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
     """Cross-validates imported Blender Camera objects against SkpModel.pages
     for every fixture (#26): position, view direction (-Z), up vector (+Y),
     perspective vertical FOV vs orthographic vertical height, 'Scenes'
-    collection membership, and active scene camera.
-
-    When the bundled openskp wheel does not yet expose ``InstancedScene.pages``
-    (openskp <= 1.6.0, before openskp#593), verifies that ``import_skp()`` left
-    ``scenes_imported == 0`` without parsing twice, then passes
-    ``SkpFile.parse().pages`` to ``_import_scene_cameras`` directly so the
-    camera construction stays covered today."""
+    collection membership, and active scene camera."""
     import math
     import mathutils
     import openskp
 
     path = os.path.join(FIXTURES_DIR, fixture_name)
-    has_scene_pages = hasattr(openskp.SkpFile.open(path).build_instanced_scene(), "pages")
     pages = openskp.SkpFile.open(path).parse().pages
     valid_pages = [
         p for p in pages
-        if p.eye is not None and p.target is not None
+        if getattr(p, "use_camera", True) is not False
+        and p.eye is not None and p.target is not None
         and (mathutils.Vector(p.target) - mathutils.Vector(p.eye)).length > 1e-12
     ]
 
@@ -1194,22 +1167,14 @@ def check_scene_cameras_for_fixture(fixture_name, new_objects, stats):
     root_coll = bpy.data.collections.get(root_name)
     assert root_coll is not None
 
-    if has_scene_pages:
-        assert stats["scenes_imported"] == len(valid_pages), (
-            f"{fixture_name}: scenes_imported={stats['scenes_imported']}, expected {len(valid_pages)}"
-        )
-        cam_objs = [o for o in new_objects if o.type == "CAMERA"]
-    else:
-        assert stats["scenes_imported"] == 0, (
-            f"{fixture_name}: bundled scene has no .pages, expected scenes_imported=0, got {stats['scenes_imported']}"
-        )
-        assert not [o for o in new_objects if o.type == "CAMERA"], (
-            f"{fixture_name}: unexpected cameras created without InstancedScene.pages"
-        )
-        before_direct = set(bpy.data.objects)
-        created = import_skp._import_scene_cameras(pages, root_coll, bpy.context)
-        assert created == len(valid_pages), (fixture_name, created, len(valid_pages))
-        cam_objs = [o for o in (set(bpy.data.objects) - before_direct) if o.type == "CAMERA"]
+    assert stats["scenes_imported"] == len(valid_pages), (
+        f"{fixture_name}: scenes_imported={stats['scenes_imported']}, expected {len(valid_pages)}"
+    )
+    if fixture_name == "gondola_v20.skp":
+        assert stats["scenes_imported"] == 1
+    elif fixture_name == "two_scenes_2021.skp":
+        assert stats["scenes_imported"] == 2
+    cam_objs = [o for o in new_objects if o.type == "CAMERA"]
 
     scenes_colls = [c for c in root_coll.children if re.sub(r"\.\d{3}$", "", c.name) == "Scenes"]
 
@@ -1278,6 +1243,14 @@ def check_cameraless_page_is_skipped():
     assert import_skp._build_camera_from_page(no_cam, 0) is None
     coincident = openskp.model.Page(name="Degenerate", eye=(10.0, 10.0, 10.0), target=(10.0, 10.0, 10.0))
     assert import_skp._build_camera_from_page(coincident, 0) is None
+    flag_off = openskp.model.Page(
+        name="ShadowsOnly",
+        eye=(100.0, -100.0, 50.0),
+        target=(0.0, 0.0, 0.0),
+        capture_flags=0x004,
+    )
+    assert flag_off.use_camera is False
+    assert import_skp._build_camera_from_page(flag_off, 0) is None
 
     path = os.path.join(FIXTURES_DIR, "two_scenes_2021.skp")
     expected_pages = openskp.SkpFile.open(path).parse().pages
@@ -1370,8 +1343,6 @@ def check_annotations_import():
     _scan_fixture_no_private_paths(path)
     _scan_fixture_no_private_paths(path_2021)
 
-    has_offset_vec = "offset_vector" in getattr(openskp.model.Dimension, "__dataclass_fields__", {})
-
     # 1. Hierarchy mode (keep_hierarchy=True, import_annotations=True)
     colls_before = set(bpy.data.collections)
     objs_before = set(bpy.data.objects)
@@ -1427,10 +1398,9 @@ def check_annotations_import():
     d1, d2 = _spline_world_endpoints(root_line, 0)
     assert abs((d2 - d1).length - 0.9144) < 1e-5, ((d2 - d1).length,)
     want_root_mid = mathutils.Vector((18.0 * 0.0254, 0.0, 0.0))
-    if not has_offset_vec:
-        assert len(root_line.data.splines) == 1
-        assert (root_line.matrix_world.translation - want_root_mid).length < 1e-5, tuple(root_line.matrix_world.translation)
-        assert (root_val.matrix_world.translation - want_root_mid).length < 1e-5, tuple(root_val.matrix_world.translation)
+    assert len(root_line.data.splines) == 1
+    assert (root_line.matrix_world.translation - want_root_mid).length < 1e-5, tuple(root_line.matrix_world.translation)
+    assert (root_val.matrix_world.translation - want_root_mid).length < 1e-5, tuple(root_val.matrix_world.translation)
 
     # Component 24" (0.6096 m) linear dimension inside "Beam" placed at (40, 10, 0)" on Framing
     fr_dim_lines = [o for o in fr_objs if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"]
@@ -1444,11 +1414,10 @@ def check_annotations_import():
     bd1, bd2 = _spline_world_endpoints(beam_line, 0)
     assert abs((bd2 - bd1).length - 0.6096) < 1e-5, ((bd2 - bd1).length,)
     want_beam_mid = mathutils.Vector((52.0 * 0.0254, 10.0 * 0.0254, 0.0))
-    if not has_offset_vec:
-        assert (beam_line.matrix_world.translation - want_beam_mid).length < 1e-5, (
-            tuple(beam_line.matrix_world.translation), tuple(want_beam_mid)
-        )
-        assert (beam_val.matrix_world.translation - want_beam_mid).length < 1e-5
+    assert (beam_line.matrix_world.translation - want_beam_mid).length < 1e-5, (
+        tuple(beam_line.matrix_world.translation), tuple(want_beam_mid)
+    )
+    assert (beam_val.matrix_world.translation - want_beam_mid).length < 1e-5
 
     # Follows component hierarchy: parented to the "Beam 1" placement Empty and moves with it
     beam_empty = next(o for o in new_objs if o.type == "EMPTY" and _base_name(o.name) == "Beam 1")
@@ -1473,38 +1442,27 @@ def check_annotations_import():
         and abs(o["sketchup_distance_inches"] - 24.0) < 1e-4
     )
     assert flat_beam_line.parent is None
-    if not has_offset_vec:
-        assert (flat_beam_line.matrix_world.translation - want_beam_mid).length < 1e-5
+    assert (flat_beam_line.matrix_world.translation - want_beam_mid).length < 1e-5
 
     # 3. Real SDK-saved SketchUp 2021 fixture (annotations_2021.skp, zero parse() monkeypatching)
-    has_623 = "layer" in getattr(openskp.model.Dimension, "__dataclass_fields__", {})
     objs_before = set(bpy.data.objects)
     stats_2021 = import_skp.import_skp(path_2021, keep_hierarchy=True, import_annotations=True)
     objs_2021 = set(bpy.data.objects) - objs_before
     bpy.context.view_layer.update()
     lines_2021 = [o for o in objs_2021 if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"]
-    if has_623:
-        assert stats_2021["dimensions_imported"] == 2 and stats_2021["texts_imported"] == 1, stats_2021
-        assert stats_2021["texts_skipped_no_position"] == 1, stats_2021
-        assert len(lines_2021) == 2
-    else:
-        assert stats_2021["dimensions_imported"] == 1, stats_2021
-        assert stats_2021["vff_component_dimensions_skipped"] == 1, stats_2021
-        assert stats_2021["vff_texts_skipped"] == 2, stats_2021
-        assert any("2021+ component dimension" in w for w in stats_2021["warnings"]), stats_2021["warnings"]
-        assert len(lines_2021) == 1
-        assert abs(lines_2021[0]["sketchup_distance_inches"] - 36.0) < 1e-4
-        assert (lines_2021[0].matrix_world.translation - want_root_mid).length < 1e-5
+    assert stats_2021["dimensions_imported"] == 2 and stats_2021["texts_imported"] == 1, stats_2021
+    assert stats_2021["texts_skipped_no_position"] == 1, stats_2021
+    assert len(lines_2021) == 2
 
-    # 3b. Axis-constrained 5BD1 VFF dimensions:
-    # - axis=1 (plane X = (1,0,0), parallel to a=(0,0,0)..b=(36,0,0)): kept & imported!
-    # - axis=2 (plane Y = (0,1,0), perpendicular to a-b): skipped & counted!
+    # 3b. Axis-constrained 5BD1 VFF dimensions (patches root 36" dim; Beam's 24" dim stays unconstrained):
+    # - axis=1 (plane X = (1,0,0), parallel to a=(0,0,0)..b=(36,0,0)): both 2 dimensions imported!
+    # - axis=2 (plane Y = (0,1,0), perpendicular to a-b): root dimension skipped & counted, 1 imported!
     with tempfile.TemporaryDirectory() as tmp:
         import io
 
         raw_2021 = open(path_2021, "rb").read()
         pk_off = raw_2021.index(b"PK\x03\x04")
-        for axis_code, want_imp, want_skip in ((1, 1, 0), (2, 0, 1)):
+        for axis_code, want_imp, want_skip in ((1, 2, 0), (2, 1, 1)):
             zbuf = io.BytesIO()
             with zipfile.ZipFile(path_2021, "r") as zin, zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
@@ -1518,31 +1476,26 @@ def check_annotations_import():
             constrained_vff = os.path.join(tmp, f"constrained_axis{axis_code}_2021.skp")
             with open(constrained_vff, "wb") as f:
                 f.write(raw_2021[:pk_off] + zbuf.getvalue())
-            if not has_623:
-                st_con = import_skp.import_skp(constrained_vff, keep_hierarchy=True, import_annotations=True)
-                assert st_con["dimensions_imported"] == want_imp, (axis_code, st_con)
-                assert st_con["constrained_dimensions_skipped"] == want_skip, (axis_code, st_con)
-                if want_skip:
-                    assert any("axis-constrained" in w for w in st_con["warnings"]), st_con["warnings"]
+            st_con = import_skp.import_skp(constrained_vff, keep_hierarchy=True, import_annotations=True)
+            assert st_con["dimensions_imported"] == want_imp, (axis_code, st_con)
+            assert st_con["constrained_dimensions_skipped"] == want_skip, (axis_code, st_con)
+            if want_skip:
+                assert any("axis-constrained" in w for w in st_con["warnings"]), st_con["warnings"]
 
-    # 4. capilla_quiroz_v17.skp: with openskp 1.6.0, all 26 dimensions sit directly on a-b (zero offset)
+    # 4. capilla_quiroz_v17.skp: 1 positioned leaderless text (openskp#604) and 26 dimensions
+    # (20 carrying offset_vector with 3 splines: dimension line + 2 witness lines, openskp#621)
     cap_path = os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp")
     objs_before = set(bpy.data.objects)
     stats_cap = import_skp.import_skp(cap_path, keep_hierarchy=True, import_annotations=True)
     cap_objs = set(bpy.data.objects) - objs_before
     bpy.context.view_layer.update()
-    if stats_cap["texts_skipped_no_position"]:
-        cap_leader_txts = [
-            o for o in cap_objs if o.type == "FONT" and o.get("sketchup_annotation") != "dimension_text"
-        ]
-        assert not cap_leader_txts, cap_leader_txts
+    assert stats_cap["texts_imported"] == 1 and stats_cap["texts_skipped_no_position"] == 0, stats_cap
     assert stats_cap["dimensions_imported"] == 26, stats_cap
-    if not has_offset_vec:
-        for dline in (o for o in cap_objs if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"):
-            s_m = mathutils.Vector(tuple(dline["sketchup_start_m"]))
-            e_m = mathutils.Vector(tuple(dline["sketchup_end_m"]))
-            assert len(dline.data.splines) == 1
-            assert (dline.matrix_world.translation - (s_m + e_m) * 0.5).length < 1e-5
+    assert stats_cap["dimensions_skipped_unresolved"] == 2, stats_cap
+    cap_dlines = [o for o in cap_objs if o.type == "CURVE" and o.get("sketchup_annotation") == "dimension_line"]
+    assert sum(1 for dline in cap_dlines if len(dline.data.splines) == 3) == 20, [
+        len(dline.data.splines) for dline in cap_dlines
+    ]
 
     # Explicit offset_vector (openskp #621/#623) is applied when present; scalar offset alone gives 0
     dim_scalar_only = import_skp._tag_dimension(
@@ -1569,34 +1522,10 @@ def check_annotations_import():
     # openskp#623 TextEntity contract: placed texts from real files carry
     # screen_position=(0.0, 0.0) and leader_type=2, while screen texts carry
     # point=(0,0,0), label_point=(0,0,0), screen_position=(u,v), leader_type=0.
-    from dataclasses import dataclass
-
-    @dataclass
-    class _Real623TextEntity:
-        text: str = ""
-        hidden: bool = False
-        layer: str = ""
-        point: object = None
-        label_point: object = None
-        screen_position: object = (0.0, 0.0)
-        leader_type: int = 2
-        arrow_type: int = 3
-        display_leader: bool = True
-
     parsed_2017 = openskp.SkpFile.open(path).parse()
-    real_texts_623 = [
-        _Real623TextEntity(
-            text=t.text,
-            hidden=t.hidden,
-            point=t.point if t.point is not None else (0.0, 0.0, 0.0),
-            label_point=t.label_point if t.label_point is not None else (0.0, 0.0, 0.0),
-            screen_position=(0.0, 0.0) if t.point is not None else (0.15, 0.85),
-            leader_type=2 if t.point is not None else 0,
-        )
-        for t in parsed_2017.root.texts
-    ]
+    assert [t.leader_type for t in parsed_2017.root.texts] == [2, 0], parsed_2017.root.texts
     st_scr = {"texts_imported": 0, "texts_skipped_no_position": 0}
-    for rt in real_texts_623:
+    for rt in parsed_2017.root.texts:
         import_skp._create_blender_text_annotation(rt, None, lambda: layer0_annots[0], False, None, st_scr)
     assert st_scr["texts_imported"] == 1 and st_scr["texts_skipped_no_position"] == 1, st_scr
 
@@ -1773,9 +1702,28 @@ def check_linked_duplicates_off_matches_main():
         assert os.path.isfile(ld_fixture), ld_fixture
         fixture_paths.append(ld_fixture)
 
+        import openskp
+
         comparisons = 0
         for fpath in fixture_paths:
             fname = os.path.basename(fpath)
+            sc_ref = openskp.SkpFile.open(fpath).build_instanced_scene(original_textures=True)
+            placed_rids = set()
+
+            def _collect_rids(nd):
+                if nd.mesh_resource_id is not None:
+                    placed_rids.add(nd.mesh_resource_id)
+                for ch in nd.children:
+                    _collect_rids(ch)
+
+            _collect_rids(sc_ref.scene_hierarchy)
+            unpainted_back_tris = sum(
+                len(p.indices) // 3
+                for r in sc_ref.mesh_resources
+                if r.id in placed_rids
+                for p in r.primitives
+                if getattr(p, "unpainted_back", False)
+            )
             for kh in (False, True):
                 _reset_empty_scene()
                 st_main = main_mod.import_skp(fpath, keep_hierarchy=kh)
@@ -1785,7 +1733,13 @@ def check_linked_duplicates_off_matches_main():
                 st_curr = import_skp.import_skp(fpath, keep_hierarchy=kh)
                 snap_curr = _scene_snapshot()
 
-                assert st_curr == st_main, f"{fname} (kh={kh}): stats {st_curr} != baseline {st_main}"
+                expected_st = {
+                    k: v
+                    for k, v in st_main.items()
+                    if k not in ("vff_component_dimensions_skipped", "vff_texts_skipped")
+                }
+                expected_st["triangles"] -= unpainted_back_tris
+                assert st_curr == expected_st, f"{fname} (kh={kh}): stats {st_curr} != baseline {expected_st}"
                 assert snap_curr == snap_main, f"{fname} (kh={kh}): scene differs from {BASELINE_COMMIT[:12]}"
                 comparisons += 1
 
